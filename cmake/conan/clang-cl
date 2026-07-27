@@ -1,0 +1,2 @@
+[conf]
+tools.cmake.cmaketoolchain:extra_variables={'AWS_SDK_WARNINGS_ARE_ERRORS': False}

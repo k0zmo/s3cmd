@@ -1,0 +1,13 @@
+EXPORTS
+    FsInitW
+    FsFindFirstW
+    FsFindNextW
+    FsFindClose
+    FsStatusInfoW
+    FsGetFileW
+    FsPutFileW
+    FsDeleteFileW
+    FsMkDirW
+    FsRemoveDirW
+    FsRenMovFileW
+    FsGetDefRootName

@@ -1,0 +1,230 @@
+{
+    "version": 3,
+    "configurePresets": [
+        {
+            "name": ":base",
+            "hidden": true,
+            "binaryDir": "${sourceDir}/build/${presetName}",
+            "installDir": "${sourceDir}/install/${presetName}",
+            "generator": "Ninja",
+            "cacheVariables": {
+                "CMAKE_EXPORT_COMPILE_COMMANDS": "ON",
+                "CMAKE_COLOR_DIAGNOSTICS": "ON"
+            }
+        },
+        {
+            "name": ":conan",
+            "hidden": true,
+            "cacheVariables": {
+                "CMAKE_PROJECT_TOP_LEVEL_INCLUDES": "${sourceDir}/cmake/conan_provider.cmake",
+                "CONAN_INSTALL_ARGS": "--build=missing"
+            }
+        },
+        {
+            "name": ":vcpkg",
+            "hidden": true,
+            "toolchainFile": "$env{VCPKG_ROOT}/scripts/buildsystems/vcpkg.cmake"
+        },
+        {
+            "name": ":windows",
+            "hidden": true,
+            "inherits": [":base", ":conan"],
+            "condition": { "type": "equals", "lhs": "${hostSystemName}", "rhs": "Windows" }
+        },
+        {
+            "name": ":linux",
+            "hidden": true,
+            "inherits": [":base"],
+            "condition": { "type": "equals", "lhs": "${hostSystemName}", "rhs": "Linux" },
+            "vendor": {
+                "microsoft.com/VisualStudioRemoteSettings/CMake/1.0": {
+                    "sourceDir": "$env{HOME}/.vs/$ms{projectDirName}",
+                    "copySourcesOptions": {
+                        "exclusionList": [
+                            ".vs",
+                            ".vscode",
+                            ".git",
+                            ".cache",
+                            "build",
+                            "install",
+                            "out"
+                        ]
+                    }
+                }
+            }
+        },
+        {
+            "name": ":msvc",
+            "hidden": true,
+            "cacheVariables": {
+                "CMAKE_CXX_COMPILER": "cl",
+                "CMAKE_PROJECT_INCLUDE_BEFORE": "${sourceDir}/cmake/compilers/msvc.cmake"
+            }
+        },
+        {
+            "name": ":gcc",
+            "hidden": true,
+            "cacheVariables": {
+                "CMAKE_PROJECT_INCLUDE_BEFORE": "${sourceDir}/cmake/compilers/gcc.cmake"
+            }
+        },
+        {
+            "name": ":clang",
+            "hidden": true,
+            "cacheVariables": {
+                "CMAKE_PROJECT_INCLUDE_BEFORE": "${sourceDir}/cmake/compilers/clang.cmake",
+                "CMAKE_PCH_INSTANTIATE_TEMPLATES": "ON"
+            }
+        },
+        {
+            "name": ":debug",
+            "hidden": true,
+            "cacheVariables": {
+                "CMAKE_BUILD_TYPE": "Debug"
+            }
+        },
+        {
+            "name": ":release",
+            "hidden": true,
+            "cacheVariables": {
+                "CMAKE_BUILD_TYPE": "Release",
+                "CMAKE_INTERPROCEDURAL_OPTIMIZATION": "ON"
+            }
+        },
+        {
+            "name": ":coverage",
+            "hidden": true,
+            "cacheVariables": {
+                "CMAKE_BUILD_TYPE": "Coverage"
+            }
+        },
+        {
+            "name": ":asan",
+            "hidden": true,
+            "cacheVariables": {
+                "CMAKE_BUILD_TYPE": "ASan"
+            }
+        },
+        {
+            "name": ":tsan",
+            "hidden": true,
+            "cacheVariables": {
+                "CMAKE_BUILD_TYPE": "TSan"
+            }
+        },
+        {
+            "name": ":ubsan",
+            "hidden": true,
+            "cacheVariables": {
+                "CMAKE_BUILD_TYPE": "UBSan"
+            }
+        },
+        {
+            "name": ":msan",
+            "description": "This is Clang-only configuration",
+            "hidden": true,
+            "cacheVariables": {
+                "CMAKE_BUILD_TYPE": "MSan"
+            }
+        },
+        {
+            "name": ":x64-arch-external",
+            "hidden": true,
+            "architecture": { "strategy": "external", "value": "x64" },
+            "toolset":      { "strategy": "external", "value": "host=x64" }
+        },
+        {
+            "name": ":x64-arch-set",
+            "hidden": true,
+            "architecture": { "strategy": "set", "value": "x64" },
+            "toolset":      { "strategy": "set", "value": "host=x64" }
+        },
+        {
+            "name": "gcc-debug",
+            "inherits": [":linux", ":gcc", ":debug"]
+        },
+        {
+            "name": "gcc-release",
+            "inherits": [":linux", ":gcc", ":release"]
+        },
+        {
+            "name": "gcc-coverage",
+            "inherits": [":linux", ":gcc", ":coverage"]
+        },
+        {
+            "name": "gcc-asan",
+            "inherits": [":linux", ":gcc", ":asan"]
+        },
+        {
+            "name": "gcc-tsan",
+            "inherits": [":linux", ":gcc", ":tsan"]
+        },
+        {
+            "name": "gcc-ubsan",
+            "inherits": [":linux", ":gcc", ":ubsan"]
+        },
+        {
+            "name": "clang-debug",
+            "inherits": [":linux", ":clang", ":debug"]
+        },
+        {
+            "name": "clang-release",
+            "inherits": [":linux", ":clang", ":release"]
+        },
+        {
+            "name": "clang-asan",
+            "inherits": [":linux", ":clang", ":asan"]
+        },
+        {
+            "name": "clang-ubsan",
+            "inherits": [":linux", ":clang", ":ubsan"]
+        },
+        {
+            "name": "msvc-debug",
+            "inherits": [":windows", ":msvc", ":x64-arch-external", ":debug"]
+        },
+        {
+            "name": "msvc-release",
+            "inherits": [":windows", ":msvc", ":x64-arch-external", ":release"]
+        },
+        {
+            "name": "msvc-asan",
+            "inherits": [":windows", ":msvc", ":x64-arch-external", ":asan"]
+        },
+        {
+            "name": "clang-windows-debug",
+            "inherits": [":windows", ":clang", ":x64-arch-external", ":debug"],
+            "cacheVariables": {
+                "CONAN_HOST_PROFILE": "default;auto-cmake;${sourceDir}/cmake/conan/clang-cl",
+                "CONAN_COMPILER_RUNTIME_VERSION": "v145"
+            }
+        },
+        {
+            "name": "clang-windows-release",
+            "inherits": [":windows", ":clang", ":x64-arch-external", ":release"],
+            "cacheVariables": {
+                "CONAN_HOST_PROFILE": "default;auto-cmake;${sourceDir}/cmake/conan/clang-cl",
+                "CONAN_COMPILER_RUNTIME_VERSION": "v145"
+            }
+        },
+        {
+            "name": "clang-windows-asan",
+            "inherits": [":windows", ":clang", ":x64-arch-external", ":asan"],
+            "cacheVariables": {
+                "CONAN_HOST_PROFILE": "default;auto-cmake;${sourceDir}/cmake/conan/clang-cl",
+                "CONAN_COMPILER_RUNTIME_VERSION": "v145",
+                "CMAKE_MSVC_RUNTIME_LIBRARY": "MultiThreaded"
+            }
+        },
+        {
+            "name": "vs2022",
+            "inherits": [":windows", ":msvc", ":x64-arch-set"],
+            "generator": "Visual Studio 17 2022"
+        },
+        {
+            "name": "vs2026",
+            "inherits": [":windows", ":msvc", ":x64-arch-set"],
+            "generator": "Visual Studio 18 2026"
+        }
+    ]
+}

@@ -1,0 +1,16 @@
+[requires]
+aws-sdk-cpp/1.11.692
+
+[options]
+*:fPIC=False
+aws-sdk-cpp/*:access-management=False
+aws-sdk-cpp/*:identity-management=False
+aws-sdk-cpp/*:queues=False
+aws-sdk-cpp/*:s3=True
+aws-sdk-cpp/*:s3-encryption=False
+aws-sdk-cpp/*:text-to-speech=False
+aws-sdk-cpp/*:transfer=False
+aws-sdk-cpp/*:monitoring=False
+
+[generators]
+CMakeConfigDeps
