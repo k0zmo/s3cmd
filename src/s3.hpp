@@ -37,6 +37,8 @@ std::set<std::string> hidden_buckets(const std::filesystem::path& file, std::str
 BucketMap cached_bucket_regions(const std::filesystem::path& file, std::string_view profile);
 bool cache_bucket_regions(const std::filesystem::path& file, std::string_view profile,
                           const BucketMap& buckets);
+std::string bucket_region(const std::filesystem::path& file, std::string_view profile,
+                          std::string_view bucket);
 bool register_bucket(const std::filesystem::path& file, std::string_view profile,
                      std::string_view bucket, std::string_view region);
 bool unregister_bucket(const std::filesystem::path& file, std::string_view profile,
@@ -57,5 +59,7 @@ BOOL remove_directory(wchar_t* remote_name);
 int rename_or_move(wchar_t* old_name, wchar_t* new_name, BOOL move, BOOL overwrite,
                    RemoteInfoStruct* info);
 void get_default_root_name(char* name, int max_length);
+int content_get_supported_field(int field_index, char* field_name, char* units, int max_length);
+int content_get_value(wchar_t* file_name, int field_index, void* field_value, int max_length);
 
 } // namespace s3cmd

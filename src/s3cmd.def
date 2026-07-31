@@ -11,3 +11,5 @@ EXPORTS
     FsRemoveDirW
     FsRenMovFileW
     FsGetDefRootName
+    FsContentGetSupportedField
+    FsContentGetValueW

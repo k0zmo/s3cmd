@@ -333,20 +333,9 @@ Aws::S3::S3Client make_client(const RemotePath& path)
     Aws::S3::S3ClientConfiguration configuration(path.profile.c_str());
     if (!path.bucket.empty())
     {
-        const auto registry_file = bucket_registry_file();
-        const auto registered = registered_buckets(registry_file, path.profile);
-        auto bucket = registered.find(path.bucket);
-        if (bucket != registered.end() && !bucket->second.region.empty())
-        {
-            configuration.region = bucket->second.region.c_str();
-        }
-        else
-        {
-            const auto cached = cached_bucket_regions(registry_file, path.profile);
-            bucket = cached.find(path.bucket);
-            if (bucket != cached.end() && !bucket->second.region.empty())
-                configuration.region = bucket->second.region.c_str();
-        }
+        const auto region = bucket_region(bucket_registry_file(), path.profile, path.bucket);
+        if (!region.empty())
+            configuration.region = region.c_str();
     }
 
     Aws::Client::ClientConfiguration::CredentialProviderConfiguration credentials_configuration;
@@ -662,8 +651,8 @@ int copy_or_move(const wchar_t* old_name, const wchar_t* new_name, bool move, bo
     if (info && info->SizeHigh == 0xFFFFFFFF)
         return FS_FILE_NOTSUPPORTED;
     const auto size = info ? (static_cast<std::uint64_t>(info->SizeHigh) << 32) | info->SizeLow : 0;
-    // ponytail: CopyObject is the useful one-call path; multipart copy belongs
-    // here only when objects above 5 GiB are required.
+    // ponytail: CopyObject is limited to 5 GiB and only reports 0%/100%; use
+    // multipart copy when larger objects or intermediate progress are needed.
     if (size > max_single_part_size)
         return FS_FILE_NOTSUPPORTED;
     if (report_progress(old_name, new_name, 0))
@@ -753,6 +742,20 @@ bool cache_bucket_regions(const std::filesystem::path& file, std::string_view pr
                           const BucketMap& buckets)
 {
     return cache_bucket_regions_impl(file, profile, buckets);
+}
+
+std::string bucket_region(const std::filesystem::path& file, std::string_view profile,
+                          std::string_view bucket)
+{
+    const std::string bucket_name(bucket);
+    const auto registered = registered_buckets(file, profile);
+    if (const auto found = registered.find(bucket_name); found != registered.end())
+        return found->second.region;
+
+    const auto cached = cached_bucket_regions(file, profile);
+    if (const auto found = cached.find(bucket_name); found != cached.end())
+        return found->second.region;
+    return {};
 }
 
 bool register_bucket(const std::filesystem::path& file, std::string_view profile,
@@ -1022,6 +1025,45 @@ void get_default_root_name(char* name, int max_length)
     const auto length = std::min(root_name.size(), static_cast<std::size_t>(max_length - 1));
     std::memcpy(name, root_name.data(), length);
     name[length] = '\0';
+}
+
+int content_get_supported_field(int field_index, char* field_name, char* units, int max_length)
+{
+    if (field_index != 0)
+        return ft_nomorefields;
+    if (!field_name || !units || max_length <= 0)
+        return ft_nomorefields;
+
+    constexpr std::string_view name = "Region";
+    const auto length = std::min(name.size(), static_cast<std::size_t>(max_length - 1));
+    std::memcpy(field_name, name.data(), length);
+    field_name[length] = '\0';
+    units[0] = '\0';
+    return ft_string;
+}
+
+int content_get_value(wchar_t* file_name, int field_index, void* field_value, int max_length)
+{
+    if (field_index != 0)
+        return ft_nosuchfield;
+    if (!file_name || !field_value || max_length < static_cast<int>(sizeof(wchar_t)))
+        return ft_fileerror;
+
+    const auto path = parse_remote_path(file_name);
+    if (path.profile.empty() || path.bucket.empty() || !path.key.empty())
+        return ft_fieldempty;
+
+    const auto region = bucket_region(bucket_registry_file(), path.profile, path.bucket);
+    if (region.empty())
+        return ft_fieldempty;
+
+    const auto value = utf8_to_wide(region);
+    auto* output = static_cast<wchar_t*>(field_value);
+    const auto capacity = static_cast<std::size_t>(max_length) / sizeof(wchar_t);
+    const auto length = std::min(value.size(), capacity - 1);
+    std::copy_n(value.data(), length, output);
+    output[length] = L'\0';
+    return ft_stringw;
 }
 
 } // namespace s3cmd

@@ -64,3 +64,15 @@ WFX_EXPORT void __stdcall FsGetDefRootName(char* name, int max_length)
 {
     s3cmd::get_default_root_name(name, max_length);
 }
+
+WFX_EXPORT int __stdcall FsContentGetSupportedField(int field_index, char* field_name, char* units,
+                                                    int max_length)
+{
+    return s3cmd::content_get_supported_field(field_index, field_name, units, max_length);
+}
+
+WFX_EXPORT int __stdcall FsContentGetValueW(wchar_t* file_name, int field_index, int, void* value,
+                                            int max_length, int)
+{
+    return s3cmd::content_get_value(file_name, field_index, value, max_length);
+}
