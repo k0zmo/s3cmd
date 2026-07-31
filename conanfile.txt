@@ -1,6 +1,9 @@
 [requires]
 aws-sdk-cpp/1.11.692
 
+[test_requires]
+catch2/3.14.0
+
 [options]
 *:fPIC=False
 aws-sdk-cpp/*:access-management=False

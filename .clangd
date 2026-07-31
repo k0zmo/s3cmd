@@ -1,6 +1,6 @@
 Diagnostics:
   UnusedIncludes: Strict
-  MissingIncludes: Strict
+  MissingIncludes: None
 Index:
   StandardLibrary: Yes
 Hover:
