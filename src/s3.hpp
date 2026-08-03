@@ -39,6 +39,7 @@ bool cache_bucket_regions(const std::filesystem::path& file, std::string_view pr
                           const BucketMap& buckets);
 std::string bucket_region(const std::filesystem::path& file, std::string_view profile,
                           std::string_view bucket);
+std::string discover_bucket_region(std::string_view profile, std::string_view bucket);
 bool register_bucket(const std::filesystem::path& file, std::string_view profile,
                      std::string_view bucket, std::string_view region);
 bool unregister_bucket(const std::filesystem::path& file, std::string_view profile,

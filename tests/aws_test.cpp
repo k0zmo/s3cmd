@@ -117,6 +117,17 @@ TEST_CASE("ListBuckets matches the declared AWS permission", "[integration]")
     }
 }
 
+TEST_CASE("a bucket region can be discovered from its name", "[integration]")
+{
+    const auto profile = environment("S3CMD_TEST_PROFILE");
+    const auto bucket = environment("S3CMD_TEST_BUCKET");
+    const auto region = environment("S3CMD_TEST_REGION");
+    if (!profile || !bucket || !region)
+        SKIP("Set S3CMD_TEST_PROFILE, S3CMD_TEST_BUCKET, and S3CMD_TEST_REGION");
+
+    CHECK(s3cmd::discover_bucket_region(*profile, *bucket) == *region);
+}
+
 TEST_CASE("a bucket can be entered using its own region", "[integration]")
 {
     const auto profile = environment("S3CMD_TEST_PROFILE");

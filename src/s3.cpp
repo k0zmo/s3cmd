@@ -16,6 +16,7 @@
 #include <aws/s3/S3ClientConfiguration.h>
 #include <aws/s3/model/CopyObjectRequest.h>
 #include <aws/s3/model/DeleteObjectRequest.h>
+#include <aws/s3/model/GetBucketLocationRequest.h>
 #include <aws/s3/model/GetObjectRequest.h>
 #include <aws/s3/model/HeadObjectRequest.h>
 #include <aws/s3/model/ListBucketsRequest.h>
@@ -758,6 +759,27 @@ std::string bucket_region(const std::filesystem::path& file, std::string_view pr
     return {};
 }
 
+std::string discover_bucket_region(std::string_view profile, std::string_view bucket)
+{
+    AwsSession session;
+    auto client = make_client({std::string(profile), {}, {}});
+    Aws::S3::Model::GetBucketLocationRequest request;
+    request.SetBucket(std::string(bucket).c_str());
+    const auto outcome = client.GetBucketLocation(request);
+    if (!outcome.IsSuccess())
+        return {};
+
+    const auto location = outcome.GetResult().GetLocationConstraint();
+    if (location == Aws::S3::Model::BucketLocationConstraint::NOT_SET)
+        return "us-east-1";
+    if (location == Aws::S3::Model::BucketLocationConstraint::EU)
+        return "eu-west-1";
+    const auto region =
+        Aws::S3::Model::BucketLocationConstraintMapper::GetNameForBucketLocationConstraint(
+            location);
+    return {region.data(), region.size()};
+}
+
 bool register_bucket(const std::filesystem::path& file, std::string_view profile,
                      std::string_view bucket, std::string_view region)
 {
@@ -915,13 +937,17 @@ BOOL make_directory(wchar_t* remote_name)
 
         if (path.key.empty())
         {
-            std::string region;
+            auto region = discover_bucket_region(path.profile, path.bucket);
+            if (region.empty())
             {
-                AwsSession session;
-                region = profile_region(path.profile);
+                {
+                    AwsSession session;
+                    region = profile_region(path.profile);
+                }
+                if (!request_region(path.profile, region))
+                    return FALSE;
             }
-            return request_region(path.profile, region) &&
-                   register_bucket(bucket_registry_file(), path.profile, path.bucket, region);
+            return register_bucket(bucket_registry_file(), path.profile, path.bucket, region);
         }
 
         AwsSession session;
