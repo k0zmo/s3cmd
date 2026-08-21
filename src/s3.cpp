@@ -31,6 +31,7 @@
 #include <cstring>
 #include <exception>
 #include <filesystem>
+#include <format>
 #include <fstream>
 #include <ios>
 #include <map>
@@ -186,6 +187,11 @@ std::filesystem::path bucket_registry_file()
         throw std::runtime_error("Cannot read APPDATA");
     app_data.resize(written);
     return std::filesystem::path(std::move(app_data)) / L"s3cmd" / L"buckets.ini";
+}
+
+bool dry_run()
+{
+    return GetPrivateProfileIntW(L"settings", L"DryRun", 0, bucket_registry_file().c_str()) != 0;
 }
 
 std::wstring bucket_section(std::string_view profile)
@@ -372,6 +378,14 @@ void log_unexpected(std::string_view operation, const std::exception& error)
     log_error(operation, error.what());
 }
 
+void log_dry_run(std::string_view operation, const RemotePath& path)
+{
+    const auto message =
+        std::format(L"[s3cmd dry-run] {} profile={} bucket={} key={}\n", utf8_to_wide(operation),
+                    utf8_to_wide(path.profile), utf8_to_wide(path.bucket), utf8_to_wide(path.key));
+    OutputDebugStringW(message.c_str());
+}
+
 void fill_find_data(const FindEntry& entry, WIN32_FIND_DATAW* data)
 {
     *data = {};
@@ -416,6 +430,15 @@ std::vector<FindEntry> list_entries(const RemotePath& path)
         const auto registry_file = bucket_registry_file();
         auto registered = registered_buckets(registry_file, path.profile);
         const auto hidden = hidden_buckets(registry_file, path.profile);
+        if (dry_run())
+        {
+            log_dry_run("ListBuckets", path);
+            const auto buckets = merge_buckets(std::move(registered), hidden, {});
+            for (const auto& [name, bucket] : buckets)
+                append_entry(entries, name, true, 0, bucket.created);
+            return entries;
+        }
+
         BucketMap discovered;
         auto client = make_client(path);
         Aws::S3::Model::ListBucketsRequest request;
@@ -458,8 +481,14 @@ std::vector<FindEntry> list_entries(const RemotePath& path)
         return entries;
     }
 
-    auto client = make_client(path);
     const auto prefix = directory_prefix(path);
+    if (dry_run())
+    {
+        log_dry_run("ListObjectsV2", {path.profile, path.bucket, prefix});
+        return entries;
+    }
+
+    auto client = make_client(path);
     Aws::S3::Model::ListObjectsV2Request request;
     request.SetBucket(path.bucket.c_str());
     request.SetDelimiter("/");
@@ -555,6 +584,13 @@ int download_file(const wchar_t* remote_name, const wchar_t* local_name, int cop
     if (path.profile.empty() || path.bucket.empty() || path.key.empty())
         return FS_FILE_NOTFOUND;
 
+    if (dry_run())
+    {
+        log_dry_run("GetObject", path);
+        report_progress(remote_name, local_name, 100);
+        return FS_FILE_OK;
+    }
+
     const auto local = std::filesystem::path(local_name);
     wchar_t temporary[MAX_PATH];
     if (GetTempFileNameW(local.parent_path().c_str(), L"s3c", 0, temporary) == 0)
@@ -617,6 +653,13 @@ int upload_file(const wchar_t* local_name, const wchar_t* remote_name, int copy_
     if (path.profile.empty() || path.bucket.empty() || path.key.empty())
         return FS_FILE_WRITEERROR;
 
+    if (dry_run())
+    {
+        log_dry_run("PutObject", path);
+        report_progress(local_name, remote_name, 100);
+        return FS_FILE_OK;
+    }
+
     AwsSession session;
     auto client = make_client(path);
 
@@ -664,6 +707,19 @@ int copy_or_move(const wchar_t* old_name, const wchar_t* new_name, bool move, bo
     if (source.profile.empty() || source.bucket.empty() || source.key.empty() ||
         target.profile.empty() || target.bucket.empty() || target.key.empty())
         return FS_FILE_NOTFOUND;
+
+    if (dry_run())
+    {
+        if (!overwrite)
+            log_dry_run("HeadObject", target);
+        log_dry_run(
+            "CopyObject source=" + source.profile + "/" + source.bucket + "/" + source.key,
+            target);
+        if (move)
+            log_dry_run("DeleteObject", source);
+        report_progress(old_name, new_name, 100);
+        return FS_FILE_OK;
+    }
 
     AwsSession session;
     auto target_client = make_client(target);
@@ -761,6 +817,12 @@ std::string bucket_region(const std::filesystem::path& file, std::string_view pr
 
 std::string discover_bucket_region(std::string_view profile, std::string_view bucket)
 {
+    if (dry_run())
+    {
+        log_dry_run("GetBucketLocation", {std::string(profile), std::string(bucket), {}});
+        return {};
+    }
+
     AwsSession session;
     auto client = make_client({std::string(profile), {}, {}});
     Aws::S3::Model::GetBucketLocationRequest request;
@@ -910,6 +972,12 @@ BOOL delete_file(wchar_t* remote_name)
         if (path.profile.empty() || path.bucket.empty() || path.key.empty())
             return FALSE;
 
+        if (dry_run())
+        {
+            log_dry_run("DeleteObject", path);
+            return TRUE;
+        }
+
         AwsSession session;
         auto client = make_client(path);
         Aws::S3::Model::DeleteObjectRequest request;
@@ -948,6 +1016,12 @@ BOOL make_directory(wchar_t* remote_name)
                     return FALSE;
             }
             return register_bucket(bucket_registry_file(), path.profile, path.bucket, region);
+        }
+
+        if (dry_run())
+        {
+            log_dry_run("PutObject", {path.profile, path.bucket, directory_prefix(path)});
+            return TRUE;
         }
 
         AwsSession session;
@@ -990,6 +1064,14 @@ BOOL remove_directory(wchar_t* remote_name)
             return unregister_bucket(bucket_registry_file(), path.profile, path.bucket);
 
         const auto prefix = directory_prefix(path);
+
+        if (dry_run())
+        {
+            const RemotePath marker{path.profile, path.bucket, prefix};
+            log_dry_run("ListObjectsV2", marker);
+            log_dry_run("DeleteObject", marker);
+            return TRUE;
+        }
 
         AwsSession session;
         auto client = make_client(path);

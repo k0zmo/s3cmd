@@ -162,3 +162,24 @@ TEST_CASE("discovery adds visible buckets and preserves registered regions", "[u
     CHECK(visible.at("private-bucket").created.dwLowDateTime == 123);
     CHECK(visible.at("private-bucket").created.dwHighDateTime == 456);
 }
+
+TEST_CASE("runtime dry run completes S3 operations without side effects", "[unit]")
+{
+    TemporaryIni ini;
+    std::filesystem::create_directories(ini.path.parent_path());
+    REQUIRE(WritePrivateProfileStringW(L"settings", L"DryRun", L"1", ini.path.c_str()));
+
+    wchar_t object[] = L"\\work\\bucket\\file.txt";
+    wchar_t directory[] = L"\\work\\bucket\\folder";
+    wchar_t copy[] = L"\\work\\bucket\\copy.txt";
+    const auto local = std::filesystem::temp_directory_path() /
+                       (L"s3cmd-dry-run-" + std::to_wstring(GetCurrentProcessId()));
+    auto local_name = local.wstring();
+
+    CHECK(s3cmd::get_file(object, local_name.data(), 0, nullptr) == FS_FILE_OK);
+    CHECK_FALSE(std::filesystem::exists(local));
+    CHECK(s3cmd::delete_file(object));
+    CHECK(s3cmd::make_directory(directory));
+    CHECK(s3cmd::rename_or_move(object, copy, TRUE, FALSE, nullptr) == FS_FILE_OK);
+    CHECK(s3cmd::discover_bucket_region("work", "bucket").empty());
+}
