@@ -5,86 +5,150 @@
 // Total Commander file-system plugin interface, version 2.1 (27.April.2010).
 // The comments below are embedded from the corresponding pages in docs/.
 
-// ids for FsGetFile
+// File was copied successfully.
 #define FS_FILE_OK 0
+// Destination file already exists and resume is not supported.
 #define FS_FILE_EXISTS 1
+// Source file could not be found or opened.
 #define FS_FILE_NOTFOUND 2
+// Error reading from the source file.
 #define FS_FILE_READERROR 3
+// Error writing to the destination file, for example because the disk is full.
 #define FS_FILE_WRITEERROR 4
+// Transfer was aborted by the user through ProgressProc.
 #define FS_FILE_USERABORT 5
+// Requested operation, such as resume, is not supported.
 #define FS_FILE_NOTSUPPORTED 6
+// Destination file already exists and resume is supported.
 #define FS_FILE_EXISTSRESUMEALLOWED 7
 
+// Command was executed successfully by the plugin.
 #define FS_EXEC_OK 0
+// Command execution failed.
 #define FS_EXEC_ERROR 1
+// Total Commander should download the file and execute it locally.
 #define FS_EXEC_YOURSELF -1
+// RemoteName contains the target directory of a symbolic link or .lnk file.
 #define FS_EXEC_SYMLINK -2
 
+// Overwrite an existing destination file without asking.
 #define FS_COPYFLAGS_OVERWRITE 1
+// Resume an aborted or failed transfer.
 #define FS_COPYFLAGS_RESUME 2
+// Delete the source file after a successful transfer.
 #define FS_COPYFLAGS_MOVE 4
+// The remote file exists with the same letter case as the local file.
 #define FS_COPYFLAGS_EXISTS_SAMECASE 8
+// The remote file exists with different letter case than the local file.
 #define FS_COPYFLAGS_EXISTS_DIFFERENTCASE 16
 
-// flags for tRequestProc
+// Requested string is none of the predefined types.
 #define RT_Other 0
+// Ask for a user name, for example for a connection.
 #define RT_UserName 1
+// Ask for a password using masked input.
 #define RT_Password 2
+// Ask for an account, as required by some FTP servers.
 #define RT_Account 3
+// Ask for a firewall user name.
 #define RT_UserNameFirewall 4
+// Ask for a firewall password.
 #define RT_PasswordFirewall 5
+// Ask for a local directory and show a browse button.
 #define RT_TargetDir 6
+// Ask for a URL.
 #define RT_URL 7
+// Show a message box with an OK button.
 #define RT_MsgOK 8
+// Show a message box with Yes and No buttons.
 #define RT_MsgYesNo 9
+// Show a message box with OK and Cancel buttons.
 #define RT_MsgOKCancel 10
 
-// flags for tLogProc
+// Connected to a file system that requires an explicit disconnect.
 #define MSGTYPE_CONNECT 1
+// Disconnected successfully.
 #define MSGTYPE_DISCONNECT 2
+// Nonessential detail, such as a directory change.
 #define MSGTYPE_DETAILS 3
+// A file transfer completed successfully.
 #define MSGTYPE_TRANSFERCOMPLETE 4
+// Reserved; currently unused.
 #define MSGTYPE_CONNECTCOMPLETE 5
+// An important error occurred.
 #define MSGTYPE_IMPORTANTERROR 6
+// An operation other than a file transfer completed.
 #define MSGTYPE_OPERATIONCOMPLETE 7
 
-// flags for FsStatusInfo
+// Operation is starting; allocate required resources.
 #define FS_STATUS_START 0
+// Operation has ended; release resources and flush caches.
 #define FS_STATUS_END 1
 
+// Retrieve a directory listing.
 #define FS_STATUS_OP_LIST 1
+// Download a single file from the plugin file system.
 #define FS_STATUS_OP_GET_SINGLE 2
+// Download multiple files, possibly including subdirectories.
 #define FS_STATUS_OP_GET_MULTI 3
+// Upload a single file to the plugin file system.
 #define FS_STATUS_OP_PUT_SINGLE 4
+// Upload multiple files, possibly including subdirectories.
 #define FS_STATUS_OP_PUT_MULTI 5
+// Rename, move, or remotely copy a single file.
 #define FS_STATUS_OP_RENMOV_SINGLE 6
+// Rename or move multiple files, possibly including subdirectories.
 #define FS_STATUS_OP_RENMOV_MULTI 7
+// Delete multiple files, possibly including subdirectories.
 #define FS_STATUS_OP_DELETE 8
+// Change attributes or times, possibly including subdirectories.
 #define FS_STATUS_OP_ATTRIB 9
+// Create a single directory.
 #define FS_STATUS_OP_MKDIR 10
+// Start a remote item or execute a command line.
 #define FS_STATUS_OP_EXEC 11
+// Calculate a subdirectory's size.
 #define FS_STATUS_OP_CALCSIZE 12
+// Search for file names.
 #define FS_STATUS_OP_SEARCH 13
+// Search file contents, including calls to FsGetFile.
 #define FS_STATUS_OP_SEARCH_TEXT 14
+// Scan subdirectories for directory synchronization.
 #define FS_STATUS_OP_SYNC_SEARCH 15
+// Download files during directory synchronization.
 #define FS_STATUS_OP_SYNC_GET 16
+// Upload files during directory synchronization.
 #define FS_STATUS_OP_SYNC_PUT 17
+// Delete files during directory synchronization.
 #define FS_STATUS_OP_SYNC_DELETE 18
+// Download multiple files in a background thread.
 #define FS_STATUS_OP_GET_MULTI_THREAD 19
+// Upload multiple files in a background thread.
 #define FS_STATUS_OP_PUT_MULTI_THREAD 20
 
+// Request the small 16x16 icon.
 #define FS_ICONFLAG_SMALL 1
+// FsExtractCustomIcon is being called from a background thread.
 #define FS_ICONFLAG_BACKGROUND 2
 
+// No icon was returned; use the default icon for the file type.
 #define FS_ICON_USEDEFAULT 0
+// TheIcon must not be destroyed by the caller.
 #define FS_ICON_EXTRACTED 1
+// TheIcon must be destroyed by the caller.
 #define FS_ICON_EXTRACTED_DESTROY 2
+// Show a default icon and request the actual icon later in a background thread.
 #define FS_ICON_DELAYED 3
 
+// No preview bitmap is available.
 #define FS_BITMAP_NONE 0
+// ReturnedBitmap contains the extracted preview bitmap.
 #define FS_BITMAP_EXTRACTED 1
+// RemoteName contains a local file path from which the caller should extract the image.
 #define FS_BITMAP_EXTRACT_YOURSELF 2
+// Extract from the local path in RemoteName, then delete that temporary file.
 #define FS_BITMAP_EXTRACT_YOURSELF_ANDDELETE 3
+// Add to a return value when the caller should cache the image.
 #define FS_BITMAP_CACHE 256
 
 // Save a password to the secure password store.
