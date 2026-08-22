@@ -54,7 +54,7 @@ int find_close(HANDLE handle);
 void status_info(wchar_t* remote_directory, int start_end, int operation);
 int get_file(wchar_t* remote_name, wchar_t* local_name, int copy_flags, RemoteInfoStruct* info);
 int put_file(wchar_t* local_name, wchar_t* remote_name, int copy_flags);
-BOOL delete_file(wchar_t* remote_name);
+BOOL delete_file(const wchar_t* remote_name);
 BOOL make_directory(wchar_t* remote_name);
 BOOL remove_directory(wchar_t* remote_name);
 int rename_or_move(wchar_t* old_name, wchar_t* new_name, BOOL move, BOOL overwrite,

@@ -659,6 +659,8 @@ int download_file(const wchar_t* remote_name, const wchar_t* local_name, int cop
         std::filesystem::remove(partial, ignored);
         return FS_FILE_WRITEERROR;
     }
+    if ((copy_flags & FS_COPYFLAGS_MOVE) != 0 && !delete_file(remote_name))
+        return FS_FILE_WRITEERROR;
 
     report_progress(remote_name, local_name, 100);
     return FS_FILE_OK;
@@ -691,29 +693,41 @@ int upload_file(const wchar_t* local_name, const wchar_t* remote_name, int copy_
         return FS_FILE_OK;
     }
 
-    AwsSession session;
-    auto client = make_client(path);
-
-    auto body = Aws::MakeShared<std::fstream>("s3cmd", std::filesystem::path(local_name),
-                                              std::ios::in | std::ios::binary);
-    if (!body->is_open())
-        return FS_FILE_READERROR;
-
-    Aws::S3::Model::PutObjectRequest request;
-    request.SetBucket(path.bucket.c_str());
-    request.SetKey(path.key.c_str());
-    request.SetBody(body);
-    request.SetContentLength(static_cast<long long>(size));
-    if ((copy_flags & FS_COPYFLAGS_OVERWRITE) == 0)
-        request.SetIfNoneMatch("*");
-    const auto outcome = client.PutObject(request);
-    if (!outcome.IsSuccess())
     {
-        log_aws_error("PutObject", outcome.GetError());
-        return outcome.GetError().GetResponseCode() ==
-                       Aws::Http::HttpResponseCode::PRECONDITION_FAILED
-                   ? FS_FILE_EXISTS
-                   : FS_FILE_WRITEERROR;
+        AwsSession session;
+        auto client = make_client(path);
+
+        auto body = Aws::MakeShared<std::fstream>("s3cmd", std::filesystem::path(local_name),
+                                                  std::ios::in | std::ios::binary);
+        if (!body->is_open())
+            return FS_FILE_READERROR;
+
+        Aws::S3::Model::PutObjectRequest request;
+        request.SetBucket(path.bucket.c_str());
+        request.SetKey(path.key.c_str());
+        request.SetBody(body);
+        request.SetContentLength(static_cast<long long>(size));
+        if ((copy_flags & FS_COPYFLAGS_OVERWRITE) == 0)
+            request.SetIfNoneMatch("*");
+        const auto outcome = client.PutObject(request);
+        if (!outcome.IsSuccess())
+        {
+            log_aws_error("PutObject", outcome.GetError());
+            return outcome.GetError().GetResponseCode() ==
+                           Aws::Http::HttpResponseCode::PRECONDITION_FAILED
+                       ? FS_FILE_EXISTS
+                       : FS_FILE_WRITEERROR;
+        }
+    }
+
+    if ((copy_flags & FS_COPYFLAGS_MOVE) != 0)
+    {
+        std::filesystem::remove(local_name, error);
+        if (error)
+        {
+            log_error("Delete local source", std::format("error {}", error.value()));
+            return FS_FILE_READERROR;
+        }
     }
 
     report_progress(local_name, remote_name, 100);
@@ -998,7 +1012,7 @@ int put_file(wchar_t* local_name, wchar_t* remote_name, int copy_flags)
     }
 }
 
-BOOL delete_file(wchar_t* remote_name)
+BOOL delete_file(const wchar_t* remote_name)
 {
     try
     {

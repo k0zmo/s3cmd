@@ -226,9 +226,18 @@ TEST_CASE("runtime dry run completes S3 operations without side effects", "[unit
     const auto local = std::filesystem::temp_directory_path() /
                        (L"s3cmd-dry-run-" + std::to_wstring(GetCurrentProcessId()));
     auto local_name = local.wstring();
+    const auto upload = ini.root / L"upload.txt";
+    {
+        std::ofstream file(upload);
+        REQUIRE(file);
+        file << "move source";
+    }
+    auto upload_name = upload.wstring();
 
-    CHECK(s3cmd::get_file(object, local_name.data(), 0, nullptr) == FS_FILE_OK);
+    CHECK(s3cmd::get_file(object, local_name.data(), FS_COPYFLAGS_MOVE, nullptr) == FS_FILE_OK);
     CHECK_FALSE(std::filesystem::exists(local));
+    CHECK(s3cmd::put_file(upload_name.data(), object, FS_COPYFLAGS_MOVE) == FS_FILE_OK);
+    CHECK(std::filesystem::exists(upload));
     CHECK(s3cmd::delete_file(object));
     CHECK(s3cmd::make_directory(directory));
     CHECK(s3cmd::rename_or_move(object, copy, TRUE, FALSE, nullptr) == FS_FILE_OK);
