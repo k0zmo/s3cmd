@@ -81,6 +81,18 @@ struct AwsSession
     Aws::SDKOptions options;
 };
 
+class SsoLoginRequired : public std::runtime_error
+{
+public:
+    explicit SsoLoginRequired(std::string_view profile)
+        : std::runtime_error(std::format(
+              "AWS SSO credentials for profile '{}' are unavailable or expired.\n\nRun:\naws "
+              "sso login --profile {}\n\nThen retry the operation.",
+              profile, profile))
+    {
+    }
+};
+
 struct FindEntry
 {
     std::wstring name;
@@ -350,6 +362,25 @@ Aws::S3::S3Client make_client(const RemotePath& path)
     credentials_configuration.region = configuration.region;
     auto credentials = Aws::MakeShared<Aws::Auth::DefaultAWSCredentialsProviderChain>(
         "s3cmd", credentials_configuration);
+
+    const auto profile = Aws::Config::GetCachedConfigProfile(path.profile.c_str());
+    const auto uses_sso = profile.IsSsoSessionSet() || !profile.GetSsoStartUrl().empty();
+    if (uses_sso)
+    {
+        if (credentials->GetAWSCredentials().IsEmpty())
+        {
+            const SsoLoginRequired error(path.profile);
+            if (request_proc)
+            {
+                auto title = std::wstring(L"Amazon S3");
+                auto message = utf8_to_wide(error.what());
+                std::array<wchar_t, 1> ignored{};
+                request_proc(plugin_number, RT_MsgOK, title.data(), message.data(), ignored.data(),
+                             static_cast<int>(ignored.size()));
+            }
+            throw error;
+        }
+    }
     return Aws::S3::S3Client(credentials, nullptr, configuration);
 }
 
@@ -894,6 +925,12 @@ HANDLE find_first(wchar_t* path, WIN32_FIND_DATAW* find_data)
         fill_find_data(state->entries.front(), find_data);
         state->next = 1;
         return state.release();
+    }
+    catch (const SsoLoginRequired& error)
+    {
+        log_unexpected("FsFindFirstW", error);
+        SetLastError(ERROR_LOGON_FAILURE);
+        return INVALID_HANDLE_VALUE;
     }
     catch (const std::exception& error)
     {

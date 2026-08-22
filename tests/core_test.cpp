@@ -2,12 +2,63 @@
 
 #include <catch2/catch_test_macros.hpp>
 
+#include <cstdlib>
 #include <filesystem>
+#include <fstream>
 #include <stdexcept>
 #include <string>
 #include <system_error>
 
 namespace {
+
+int request_count{};
+int request_type{};
+std::wstring request_text;
+std::wstring log_text;
+
+BOOL __stdcall capture_request(int, int type, wchar_t*, wchar_t* text, wchar_t*, int)
+{
+    ++request_count;
+    request_type = type;
+    request_text = text ? text : L"";
+    return TRUE;
+}
+
+void __stdcall capture_log(int, int type, wchar_t* text)
+{
+    if (type == MSGTYPE_IMPORTANTERROR)
+        log_text = text ? text : L"";
+}
+
+struct TemporaryEnvironment
+{
+    TemporaryEnvironment(const char* variable_name, const char* value) : name(variable_name)
+    {
+        char* previous{};
+        std::size_t size{};
+        if (_dupenv_s(&previous, &size, name.c_str()) != 0)
+            throw std::runtime_error("Cannot read environment variable");
+        if (previous)
+        {
+            old = previous;
+            std::free(previous);
+            existed = true;
+        }
+        if (_putenv_s(name.c_str(), value ? value : "") != 0)
+            throw std::runtime_error("Cannot set environment variable");
+    }
+
+    ~TemporaryEnvironment() { _putenv_s(name.c_str(), existed ? old.c_str() : ""); }
+
+    std::string name;
+    std::string old;
+    bool existed{};
+};
+
+struct ResetCallbacks
+{
+    ~ResetCallbacks() { s3cmd::initialize(0, nullptr, nullptr, nullptr); }
+};
 
 struct TemporaryIni
 {
@@ -182,4 +233,53 @@ TEST_CASE("runtime dry run completes S3 operations without side effects", "[unit
     CHECK(s3cmd::make_directory(directory));
     CHECK(s3cmd::rename_or_move(object, copy, TRUE, FALSE, nullptr) == FS_FILE_OK);
     CHECK(s3cmd::discover_bucket_region("work", "bucket").empty());
+}
+
+TEST_CASE("expired SSO session reports the login command on every attempt", "[unit]")
+{
+    TemporaryIni ini;
+    const auto config = ini.root / L"config";
+    const auto credentials = ini.root / L"credentials";
+    {
+        std::ofstream file(config);
+        REQUIRE(file);
+        file << "[profile expired]\n"
+                "sso_session = expired\n"
+                "sso_account_id = 111122223333\n"
+                "sso_role_name = ReadOnly\n"
+                "region = eu-central-1\n"
+                "[sso-session expired]\n"
+                "sso_start_url = https://example.awsapps.com/start\n"
+                "sso_region = eu-central-1\n"
+                "sso_registration_scopes = sso:account:access\n";
+    }
+    std::ofstream(credentials).close();
+
+    const auto config_name = config.string();
+    const auto credentials_name = credentials.string();
+    TemporaryEnvironment config_file("AWS_CONFIG_FILE", config_name.c_str());
+    TemporaryEnvironment credentials_file("AWS_SHARED_CREDENTIALS_FILE", credentials_name.c_str());
+    TemporaryEnvironment access_key("AWS_ACCESS_KEY_ID", nullptr);
+    TemporaryEnvironment secret_key("AWS_SECRET_ACCESS_KEY", nullptr);
+    TemporaryEnvironment session_token("AWS_SESSION_TOKEN", nullptr);
+    TemporaryEnvironment disable_metadata("AWS_EC2_METADATA_DISABLED", "true");
+
+    request_count = 0;
+    request_type = 0;
+    request_text.clear();
+    log_text.clear();
+    s3cmd::initialize(7, nullptr, capture_log, capture_request);
+    ResetCallbacks reset;
+
+    wchar_t path[] = L"\\expired";
+    WIN32_FIND_DATAW entry{};
+    CHECK(s3cmd::find_first(path, &entry) == INVALID_HANDLE_VALUE);
+    CHECK(GetLastError() == ERROR_LOGON_FAILURE);
+    CHECK(request_count == 1);
+    CHECK(request_type == RT_MsgOK);
+    CHECK(request_text.find(L"aws sso login --profile expired") != std::wstring::npos);
+    CHECK(log_text.find(L"aws sso login --profile expired") != std::wstring::npos);
+
+    CHECK(s3cmd::find_first(path, &entry) == INVALID_HANDLE_VALUE);
+    CHECK(request_count == 2);
 }
