@@ -8,7 +8,6 @@
 #include <aws/core/config/ConfigAndCredentialsCacheManager.h>
 #include <aws/core/http/HttpResponse.h>
 #include <aws/core/utils/DateTime.h>
-#include <aws/core/utils/StringUtils.h>
 #include <aws/core/utils/memory/AWSMemory.h>
 #include <aws/core/utils/memory/stl/AWSAllocator.h>
 #include <aws/core/utils/memory/stl/AWSString.h>
@@ -745,8 +744,8 @@ int copy_or_move(const wchar_t* old_name, const wchar_t* new_name, bool move, bo
     Aws::S3::Model::CopyObjectRequest copy;
     copy.SetBucket(target.bucket.c_str());
     copy.SetKey(target.key.c_str());
-    auto copy_source =
-        std::format("{}/{}", source.bucket, Aws::Utils::StringUtils::URLEncode(source.key.c_str()));
+    // CopyObjectRequest URL-encodes this value when serializing the header.
+    auto copy_source = std::format("{}/{}", source.bucket, source.key);
     copy.SetCopySource(std::move(copy_source));
     const auto copy_outcome = target_client.CopyObject(copy);
     if (!copy_outcome.IsSuccess())
