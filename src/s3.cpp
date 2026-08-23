@@ -35,7 +35,6 @@
 #include <format>
 #include <fstream>
 #include <ios>
-#include <map>
 #include <memory>
 #include <mutex>
 #include <set>
@@ -67,17 +66,23 @@ enum class DeleteMode
 
 thread_local DeleteMode delete_mode = DeleteMode::normal;
 
+// FIXME: The current state is creating and destroying these for each operation,
+//        and on top of that, not reusing the client
 struct AwsSession
 {
-    AwsSession() : lock(aws_mutex) { Aws::InitAPI(options); }
+    AwsSession() : lock(aws_mutex)
+    {
+        Aws::InitAPI(options);
+    }
 
-    ~AwsSession() { Aws::ShutdownAPI(options); }
+    ~AwsSession()
+    {
+        Aws::ShutdownAPI(options);
+    }
 
     AwsSession(const AwsSession&) = delete;
     AwsSession& operator=(const AwsSession&) = delete;
 
-    // ponytail: serialized SDK sessions avoid unsafe overlapping global
-    // InitAPI/ShutdownAPI calls; keep one process session if concurrency matters.
     std::unique_lock<std::mutex> lock;
     Aws::SDKOptions options;
 };
@@ -107,6 +112,19 @@ struct FindState
     std::vector<FindEntry> entries;
     std::size_t next{};
 };
+
+const std::filesystem::path bucket_registry_file = [] {
+    const auto size = GetEnvironmentVariableW(L"APPDATA", nullptr, 0);
+    if (size == 0)
+        throw std::runtime_error("APPDATA is not set");
+
+    std::wstring app_data(size, L'\0');
+    const auto written = GetEnvironmentVariableW(L"APPDATA", app_data.data(), size);
+    if (written == 0 || written >= size)
+        throw std::runtime_error("Cannot read APPDATA");
+    app_data.resize(written);
+    return std::filesystem::path(std::move(app_data)) / L"s3cmd" / L"buckets.ini";
+}();
 
 RemotePath parse_remote_path_impl(std::wstring_view path)
 {
@@ -152,20 +170,7 @@ bool valid_entry_name(const std::wstring& name)
            name.size() < MAX_PATH;
 }
 
-const std::filesystem::path bucket_registry_file = [] {
-    const auto size = GetEnvironmentVariableW(L"APPDATA", nullptr, 0);
-    if (size == 0)
-        throw std::runtime_error("APPDATA is not set");
-
-    std::wstring app_data(size, L'\0');
-    const auto written = GetEnvironmentVariableW(L"APPDATA", app_data.data(), size);
-    if (written == 0 || written >= size)
-        throw std::runtime_error("Cannot read APPDATA");
-    app_data.resize(written);
-    return std::filesystem::path(std::move(app_data)) / L"s3cmd" / L"buckets.ini";
-}();
-
-bool dry_run()
+bool is_dry_run()
 {
     return GetPrivateProfileIntW(L"settings", L"DryRun", 0, bucket_registry_file.c_str()) != 0;
 }
@@ -575,7 +580,7 @@ int download_file(const wchar_t* remote_name, const wchar_t* local_name, int cop
     if (path.profile.empty() || path.bucket.empty() || path.key.empty())
         return FS_FILE_NOTFOUND;
 
-    const auto is_dry = dry_run();
+    const auto is_dry = is_dry_run();
     log_operation("GetObject", path, is_dry);
     if (is_dry)
     {
@@ -649,7 +654,7 @@ int upload_file(const wchar_t* local_name, const wchar_t* remote_name, int copy_
     if (path.profile.empty() || path.bucket.empty() || path.key.empty())
         return FS_FILE_WRITEERROR;
 
-    const auto is_dry = dry_run();
+    const auto is_dry = is_dry_run();
     log_operation("PutObject", path, is_dry);
     if (is_dry)
     {
@@ -725,7 +730,7 @@ int copy_or_move(const wchar_t* old_name, const wchar_t* new_name, bool move, bo
     if (!overwrite && remote_exists(target_client, target))
         return FS_FILE_EXISTS;
 
-    const auto is_dry = dry_run();
+    const auto is_dry = is_dry_run();
     const auto copy_operation =
         std::format("CopyObject source={}/{}/{}", source.profile, source.bucket, source.key);
     log_operation(copy_operation, target, is_dry);
@@ -976,7 +981,7 @@ BOOL delete_file(const wchar_t* remote_name)
         if (path.profile.empty() || path.bucket.empty() || path.key.empty())
             return FALSE;
 
-        const auto is_dry = dry_run();
+        const auto is_dry = is_dry_run();
         log_operation("DeleteObject", path, is_dry);
         if (is_dry)
         {
@@ -1020,7 +1025,7 @@ BOOL make_directory(wchar_t* remote_name)
                 if (!request_region(path.profile, region))
                     return FALSE;
             }
-            const auto is_dry = dry_run();
+            const auto is_dry = is_dry_run();
             log_operation("RegisterBucket", path, is_dry);
             if (is_dry)
             {
@@ -1030,7 +1035,7 @@ BOOL make_directory(wchar_t* remote_name)
         }
 
         const RemotePath marker{path.profile, path.bucket, directory_prefix(path)};
-        const auto is_dry = dry_run();
+        const auto is_dry = is_dry_run();
         log_operation("PutObject", marker, is_dry);
         if (is_dry)
         {
@@ -1072,7 +1077,7 @@ BOOL remove_directory(wchar_t* remote_name)
         {
             if (!path.key.empty())
                 return TRUE;
-            const auto is_dry = dry_run();
+            const auto is_dry = is_dry_run();
             log_operation("UnregisterBucket", path, is_dry);
             if (is_dry)
             {
@@ -1083,7 +1088,7 @@ BOOL remove_directory(wchar_t* remote_name)
 
         if (path.key.empty())
         {
-            const auto is_dry = dry_run();
+            const auto is_dry = is_dry_run();
             log_operation("UnregisterBucket", path, is_dry);
             if (is_dry)
             {
@@ -1119,7 +1124,7 @@ BOOL remove_directory(wchar_t* remote_name)
             return TRUE;
 
         const RemotePath marker{path.profile, path.bucket, prefix};
-        const auto is_dry = dry_run();
+        const auto is_dry = is_dry_run();
         log_operation("DeleteObject", marker, is_dry);
         if (is_dry)
         {
