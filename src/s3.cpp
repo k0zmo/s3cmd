@@ -152,8 +152,7 @@ bool valid_entry_name(const std::wstring& name)
            name.size() < MAX_PATH;
 }
 
-std::filesystem::path bucket_registry_file()
-{
+const std::filesystem::path bucket_registry_file = [] {
     const auto size = GetEnvironmentVariableW(L"APPDATA", nullptr, 0);
     if (size == 0)
         throw std::runtime_error("APPDATA is not set");
@@ -164,11 +163,11 @@ std::filesystem::path bucket_registry_file()
         throw std::runtime_error("Cannot read APPDATA");
     app_data.resize(written);
     return std::filesystem::path(std::move(app_data)) / L"s3cmd" / L"buckets.ini";
-}
+}();
 
 bool dry_run()
 {
-    return GetPrivateProfileIntW(L"settings", L"DryRun", 0, bucket_registry_file().c_str()) != 0;
+    return GetPrivateProfileIntW(L"settings", L"DryRun", 0, bucket_registry_file.c_str()) != 0;
 }
 
 std::wstring bucket_section(std::string_view profile)
@@ -317,7 +316,7 @@ Aws::S3::S3Client make_client(const RemotePath& path)
     Aws::S3::S3ClientConfiguration configuration(path.profile.c_str());
     if (!path.bucket.empty())
     {
-        const auto region = bucket_region(bucket_registry_file(), path.profile, path.bucket);
+        const auto region = bucket_region(bucket_registry_file, path.profile, path.bucket);
         if (!region.empty())
             configuration.region = region.c_str();
     }
@@ -431,9 +430,8 @@ std::vector<FindEntry> list_entries(const RemotePath& path)
 
     if (path.bucket.empty())
     {
-        const auto registry_file = bucket_registry_file();
-        auto registered = registered_buckets(registry_file, path.profile);
-        const auto hidden = hidden_buckets(registry_file, path.profile);
+        auto registered = registered_buckets(bucket_registry_file, path.profile);
+        const auto hidden = hidden_buckets(bucket_registry_file, path.profile);
 
         BucketMap discovered;
         auto client = make_client(path);
@@ -469,7 +467,7 @@ std::vector<FindEntry> list_entries(const RemotePath& path)
             request.SetContinuationToken(result.GetContinuationToken());
         }
 
-        if (discovery_succeeded && !cache_bucket_regions(registry_file, path.profile, discovered))
+        if (discovery_succeeded && !cache_bucket_regions(bucket_registry_file, path.profile, discovered))
             log_error("ListBuckets", "Cannot cache bucket regions");
 
         const auto buckets = merge_buckets(std::move(registered), hidden, discovered);
@@ -1028,7 +1026,7 @@ BOOL make_directory(wchar_t* remote_name)
             {
                 return TRUE;
             }
-            return register_bucket(bucket_registry_file(), path.profile, path.bucket, region);
+            return register_bucket(bucket_registry_file, path.profile, path.bucket, region);
         }
 
         const RemotePath marker{path.profile, path.bucket, directory_prefix(path)};
@@ -1080,7 +1078,7 @@ BOOL remove_directory(wchar_t* remote_name)
             {
                 return TRUE;
             }
-            return unregister_bucket(bucket_registry_file(), path.profile, path.bucket);
+            return unregister_bucket(bucket_registry_file, path.profile, path.bucket);
         }
 
         if (path.key.empty())
@@ -1091,7 +1089,7 @@ BOOL remove_directory(wchar_t* remote_name)
             {
                 return TRUE;
             }
-            return unregister_bucket(bucket_registry_file(), path.profile, path.bucket);
+            return unregister_bucket(bucket_registry_file, path.profile, path.bucket);
         }
 
         const auto prefix = directory_prefix(path);
@@ -1193,7 +1191,7 @@ int content_get_value(wchar_t* file_name, int field_index, void* field_value, in
     if (path.profile.empty() || path.bucket.empty() || !path.key.empty())
         return ft_fieldempty;
 
-    const auto region = bucket_region(bucket_registry_file(), path.profile, path.bucket);
+    const auto region = bucket_region(bucket_registry_file, path.profile, path.bucket);
     if (region.empty())
         return ft_fieldempty;
 
