@@ -223,6 +223,7 @@ TEST_CASE("runtime dry run completes S3 operations without side effects", "[unit
     wchar_t object[] = L"\\work\\bucket\\file.txt";
     wchar_t directory[] = L"\\work\\bucket\\folder";
     wchar_t copy[] = L"\\work\\bucket\\copy.txt";
+    wchar_t registered_bucket[] = L"\\work\\registered-bucket";
     const auto local = std::filesystem::temp_directory_path() /
                        (L"s3cmd-dry-run-" + std::to_wstring(GetCurrentProcessId()));
     auto local_name = local.wstring();
@@ -240,8 +241,10 @@ TEST_CASE("runtime dry run completes S3 operations without side effects", "[unit
     CHECK(std::filesystem::exists(upload));
     CHECK(s3cmd::delete_file(object));
     CHECK(s3cmd::make_directory(directory));
-    CHECK(s3cmd::rename_or_move(object, copy, TRUE, FALSE, nullptr) == FS_FILE_OK);
-    CHECK(s3cmd::discover_bucket_region("work", "bucket").empty());
+    CHECK(s3cmd::rename_or_move(object, copy, TRUE, TRUE, nullptr) == FS_FILE_OK);
+    REQUIRE(s3cmd::register_bucket(ini.path, "work", "registered-bucket", "eu-central-1"));
+    CHECK(s3cmd::remove_directory(registered_bucket));
+    CHECK(s3cmd::registered_buckets(ini.path, "work").contains("registered-bucket"));
 }
 
 TEST_CASE("expired SSO session reports the login command on every attempt", "[unit]")

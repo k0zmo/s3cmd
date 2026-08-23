@@ -388,6 +388,7 @@ void log_message(int type, std::wstring message)
 {
     if (log_proc)
         log_proc(plugin_number, type, message.data());
+    OutputDebugStringW(std::format(L"[s3cmd] {}", message).c_str());
 }
 
 void log_error(std::string_view operation, std::string_view message)
@@ -409,11 +410,18 @@ void log_unexpected(std::string_view operation, const std::exception& error)
     log_error(operation, error.what());
 }
 
-void log_dry_run(std::string_view operation, const RemotePath& path)
+void log_operation(std::string_view operation, const RemotePath& path, bool dry)
 {
-    const auto message =
-        std::format(L"[s3cmd dry-run] {} profile={} bucket={} key={}\n", utf8_to_wide(operation),
-                    utf8_to_wide(path.profile), utf8_to_wide(path.bucket), utf8_to_wide(path.key));
+    const auto message = std::format(L"[s3cmd] operation={} dry={} profile={} bucket={} key={}\n",
+                                     utf8_to_wide(operation), dry, utf8_to_wide(path.profile),
+                                     utf8_to_wide(path.bucket), utf8_to_wide(path.key));
+    OutputDebugStringW(message.c_str());
+}
+
+void log_local_operation(std::string_view operation, const wchar_t* path, bool dry)
+{
+    const auto message = std::format(L"[s3cmd] operation={} dry={} path={}\n",
+                                     utf8_to_wide(operation), dry, path);
     OutputDebugStringW(message.c_str());
 }
 
@@ -461,19 +469,12 @@ std::vector<FindEntry> list_entries(const RemotePath& path)
         const auto registry_file = bucket_registry_file();
         auto registered = registered_buckets(registry_file, path.profile);
         const auto hidden = hidden_buckets(registry_file, path.profile);
-        if (dry_run())
-        {
-            log_dry_run("ListBuckets", path);
-            const auto buckets = merge_buckets(std::move(registered), hidden, {});
-            for (const auto& [name, bucket] : buckets)
-                append_entry(entries, name, true, 0, bucket.created);
-            return entries;
-        }
 
         BucketMap discovered;
         auto client = make_client(path);
         Aws::S3::Model::ListBucketsRequest request;
         request.SetMaxBuckets(10'000);
+        log_operation("ListBuckets", path, false);
         bool discovery_succeeded = true;
         for (;;)
         {
@@ -513,17 +514,12 @@ std::vector<FindEntry> list_entries(const RemotePath& path)
     }
 
     const auto prefix = directory_prefix(path);
-    if (dry_run())
-    {
-        log_dry_run("ListObjectsV2", {path.profile, path.bucket, prefix});
-        return entries;
-    }
-
     auto client = make_client(path);
     Aws::S3::Model::ListObjectsV2Request request;
     request.SetBucket(path.bucket.c_str());
     request.SetDelimiter("/");
     request.SetPrefix(prefix.c_str());
+    log_operation("ListObjectsV2", {path.profile, path.bucket, prefix}, false);
 
     for (;;)
     {
@@ -564,6 +560,7 @@ std::vector<FindEntry> list_entries(const RemotePath& path)
 
 bool remote_exists(Aws::S3::S3Client& client, const RemotePath& path)
 {
+    log_operation("HeadObject", path, false);
     Aws::S3::Model::HeadObjectRequest request;
     request.SetBucket(path.bucket.c_str());
     request.SetKey(path.key.c_str());
@@ -593,7 +590,7 @@ bool request_region(std::string_view profile, std::string& region)
                 value.data());
 
     std::wstring title = L"Register S3 bucket";
-    std::wstring prompt = L"Region for AWS profile '" + utf8_to_wide(profile) + L"':";
+    std::wstring prompt = std::format(L"Region for AWS profile '{}:", utf8_to_wide(profile));
     if (!request_proc(plugin_number, RT_Other, title.data(), prompt.data(), value.data(),
                       static_cast<int>(value.size())))
         return false;
@@ -615,9 +612,12 @@ int download_file(const wchar_t* remote_name, const wchar_t* local_name, int cop
     if (path.profile.empty() || path.bucket.empty() || path.key.empty())
         return FS_FILE_NOTFOUND;
 
-    if (dry_run())
+    const auto is_dry = dry_run();
+    log_operation("GetObject", path, is_dry);
+    if (is_dry)
     {
-        log_dry_run("GetObject", path);
+        if ((copy_flags & FS_COPYFLAGS_MOVE) != 0)
+            log_operation("DeleteObject", path, true);
         report_progress(remote_name, local_name, 100);
         return FS_FILE_OK;
     }
@@ -686,9 +686,12 @@ int upload_file(const wchar_t* local_name, const wchar_t* remote_name, int copy_
     if (path.profile.empty() || path.bucket.empty() || path.key.empty())
         return FS_FILE_WRITEERROR;
 
-    if (dry_run())
+    const auto is_dry = dry_run();
+    log_operation("PutObject", path, is_dry);
+    if (is_dry)
     {
-        log_dry_run("PutObject", path);
+        if ((copy_flags & FS_COPYFLAGS_MOVE) != 0)
+            log_local_operation("DeleteLocalFile", local_name, true);
         report_progress(local_name, remote_name, 100);
         return FS_FILE_OK;
     }
@@ -722,6 +725,7 @@ int upload_file(const wchar_t* local_name, const wchar_t* remote_name, int copy_
 
     if ((copy_flags & FS_COPYFLAGS_MOVE) != 0)
     {
+        log_local_operation("DeleteLocalFile", local_name, false);
         std::filesystem::remove(local_name, error);
         if (error)
         {
@@ -753,29 +757,28 @@ int copy_or_move(const wchar_t* old_name, const wchar_t* new_name, bool move, bo
         target.profile.empty() || target.bucket.empty() || target.key.empty())
         return FS_FILE_NOTFOUND;
 
-    if (dry_run())
-    {
-        if (!overwrite)
-            log_dry_run("HeadObject", target);
-        log_dry_run(
-            "CopyObject source=" + source.profile + "/" + source.bucket + "/" + source.key,
-            target);
-        if (move)
-            log_dry_run("DeleteObject", source);
-        report_progress(old_name, new_name, 100);
-        return FS_FILE_OK;
-    }
-
     AwsSession session;
     auto target_client = make_client(target);
     if (!overwrite && remote_exists(target_client, target))
         return FS_FILE_EXISTS;
 
+    const auto is_dry = dry_run();
+    const auto copy_operation =
+        std::format("CopyObject source={}/{}/{}", source.profile, source.bucket, source.key);
+    log_operation(copy_operation, target, is_dry);
+    if (is_dry)
+    {
+        if (move)
+            log_operation("DeleteObject", source, true);
+        report_progress(old_name, new_name, 100);
+        return FS_FILE_OK;
+    }
+
     Aws::S3::Model::CopyObjectRequest copy;
     copy.SetBucket(target.bucket.c_str());
     copy.SetKey(target.key.c_str());
-    auto copy_source = Aws::String(source.bucket.c_str()) + "/" +
-                       Aws::Utils::StringUtils::URLEncode(source.key.c_str());
+    auto copy_source =
+        std::format("{}/{}", source.bucket, Aws::Utils::StringUtils::URLEncode(source.key.c_str()));
     copy.SetCopySource(std::move(copy_source));
     const auto copy_outcome = target_client.CopyObject(copy);
     if (!copy_outcome.IsSuccess())
@@ -789,6 +792,7 @@ int copy_or_move(const wchar_t* old_name, const wchar_t* new_name, bool move, bo
     if (move)
     {
         auto source_client = make_client(source);
+        log_operation("DeleteObject", source, false);
         Aws::S3::Model::DeleteObjectRequest remove;
         remove.SetBucket(source.bucket.c_str());
         remove.SetKey(source.key.c_str());
@@ -862,16 +866,12 @@ std::string bucket_region(const std::filesystem::path& file, std::string_view pr
 
 std::string discover_bucket_region(std::string_view profile, std::string_view bucket)
 {
-    if (dry_run())
-    {
-        log_dry_run("GetBucketLocation", {std::string(profile), std::string(bucket), {}});
-        return {};
-    }
-
+    const RemotePath path{std::string(profile), std::string(bucket), {}};
     AwsSession session;
     auto client = make_client({std::string(profile), {}, {}});
     Aws::S3::Model::GetBucketLocationRequest request;
     request.SetBucket(std::string(bucket).c_str());
+    log_operation("GetBucketLocation", path, false);
     const auto outcome = client.GetBucketLocation(request);
     if (!outcome.IsSuccess())
         return {};
@@ -1023,9 +1023,10 @@ BOOL delete_file(const wchar_t* remote_name)
         if (path.profile.empty() || path.bucket.empty() || path.key.empty())
             return FALSE;
 
-        if (dry_run())
+        const auto is_dry = dry_run();
+        log_operation("DeleteObject", path, is_dry);
+        if (is_dry)
         {
-            log_dry_run("DeleteObject", path);
             return TRUE;
         }
 
@@ -1066,12 +1067,20 @@ BOOL make_directory(wchar_t* remote_name)
                 if (!request_region(path.profile, region))
                     return FALSE;
             }
+            const auto is_dry = dry_run();
+            log_operation("RegisterBucket", path, is_dry);
+            if (is_dry)
+            {
+                return TRUE;
+            }
             return register_bucket(bucket_registry_file(), path.profile, path.bucket, region);
         }
 
-        if (dry_run())
+        const RemotePath marker{path.profile, path.bucket, directory_prefix(path)};
+        const auto is_dry = dry_run();
+        log_operation("PutObject", marker, is_dry);
+        if (is_dry)
         {
-            log_dry_run("PutObject", {path.profile, path.bucket, directory_prefix(path)});
             return TRUE;
         }
 
@@ -1107,22 +1116,30 @@ BOOL remove_directory(wchar_t* remote_name)
         if (delete_mode == DeleteMode::protect_profiles)
             return TRUE;
         if (delete_mode == DeleteMode::unregister_buckets)
-            return path.key.empty()
-                       ? unregister_bucket(bucket_registry_file(), path.profile, path.bucket)
-                       : TRUE;
+        {
+            if (!path.key.empty())
+                return TRUE;
+            const auto is_dry = dry_run();
+            log_operation("UnregisterBucket", path, is_dry);
+            if (is_dry)
+            {
+                return TRUE;
+            }
+            return unregister_bucket(bucket_registry_file(), path.profile, path.bucket);
+        }
 
         if (path.key.empty())
+        {
+            const auto is_dry = dry_run();
+            log_operation("UnregisterBucket", path, is_dry);
+            if (is_dry)
+            {
+                return TRUE;
+            }
             return unregister_bucket(bucket_registry_file(), path.profile, path.bucket);
+        }
 
         const auto prefix = directory_prefix(path);
-
-        if (dry_run())
-        {
-            const RemotePath marker{path.profile, path.bucket, prefix};
-            log_dry_run("ListObjectsV2", marker);
-            log_dry_run("DeleteObject", marker);
-            return TRUE;
-        }
 
         AwsSession session;
         auto client = make_client(path);
@@ -1130,6 +1147,7 @@ BOOL remove_directory(wchar_t* remote_name)
         list.SetBucket(path.bucket.c_str());
         list.SetPrefix(prefix.c_str());
         list.SetMaxKeys(2);
+        log_operation("ListObjectsV2", {path.profile, path.bucket, prefix}, false);
         const auto listed = client.ListObjectsV2(list);
         if (!listed.IsSuccess())
         {
@@ -1146,6 +1164,14 @@ BOOL remove_directory(wchar_t* remote_name)
         }
         if (!marker_exists)
             return TRUE;
+
+        const RemotePath marker{path.profile, path.bucket, prefix};
+        const auto is_dry = dry_run();
+        log_operation("DeleteObject", marker, is_dry);
+        if (is_dry)
+        {
+            return TRUE;
+        }
 
         Aws::S3::Model::DeleteObjectRequest remove;
         remove.SetBucket(path.bucket.c_str());
