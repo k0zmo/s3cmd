@@ -27,6 +27,8 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
+#include <charconv>
 #include <cstdint>
 #include <cstring>
 #include <exception>
@@ -546,6 +548,81 @@ bool report_progress(const wchar_t* source, const wchar_t* target, int percent)
                                           const_cast<wchar_t*>(target), percent) != 0;
 }
 
+class TransferProgress
+{
+public:
+    TransferProgress(const wchar_t* source, const wchar_t* target,
+                     Aws::S3::Model::GetObjectRequest& request)
+        : TransferProgress{source, target, 0, request}
+    {
+        request.SetHeadersReceivedEventHandler(
+            [this](const Aws::Http::HttpRequest*, Aws::Http::HttpResponse* response) {
+                const auto& length = response->GetHeader(Aws::Http::CONTENT_LENGTH_HEADER);
+                std::from_chars(length.data(), length.data() + length.size(), total_);
+            });
+        request.SetDataReceivedEventHandler([this](const Aws::Http::HttpRequest*,
+                                                   Aws::Http::HttpResponse*,
+                                                   long long bytes) { add(bytes); });
+    }
+
+    TransferProgress(const wchar_t* source, const wchar_t* target,
+                     Aws::S3::Model::PutObjectRequest& request)
+        : TransferProgress{source, target,
+                           static_cast<std::uint64_t>(request.GetContentLength()),
+                           request}
+    {
+        request.SetDataSentEventHandler(
+            [this](const Aws::Http::HttpRequest*, long long bytes) { add(bytes); });
+    }
+
+    bool is_canceled() const { return canceled_.load(); }
+
+private:
+    template <typename Request>
+    TransferProgress(const wchar_t* source, const wchar_t* target,
+                     std::uint64_t total, Request& request)
+        : source_{source}, target_{target}, total_{total}
+    {
+        set_common_handlers(request);
+    }
+
+    template <typename Request>
+    void set_common_handlers(Request& request)
+    {
+        request.SetRequestRetryHandler(
+            [this](const Aws::AmazonWebServiceRequest&) { transferred_ = 0; });
+        request.SetContinueRequestHandler(
+            [this](const Aws::Http::HttpRequest*) { return !canceled_.load(); });
+    }
+
+    int transfer_percent(std::uint64_t transferred, std::uint64_t total)
+    {
+        return total == 0
+                   ? 0
+                   : std::min(99, static_cast<int>(std::min(transferred, total) * 100 / total));
+    }
+
+    void add(long long bytes)
+    {
+        if (bytes > 0)
+            transferred_ += static_cast<std::uint64_t>(bytes);
+        const auto next = transfer_percent(transferred_, total_);
+        if (next > percent_)
+        {
+            percent_ = next;
+            if (report_progress(source_, target_, percent_))
+                canceled_ = true;
+        }
+    }
+
+    const wchar_t* source_;
+    const wchar_t* target_;
+    std::uint64_t total_{};
+    std::uint64_t transferred_{};
+    int percent_{};
+    std::atomic<bool> canceled_{};
+};
+
 bool request_region(std::string_view profile, std::string& region)
 {
     if (!request_proc)
@@ -607,10 +684,13 @@ int download_file(const wchar_t* remote_name, const wchar_t* local_name, int cop
                                           std::ios::out | std::ios::binary | std::ios::trunc);
         });
 
+        TransferProgress progress{remote_name, local_name, request};
         const auto outcome = client.GetObject(request);
         if (!outcome.IsSuccess())
         {
             std::filesystem::remove(partial, ignored);
+            if (progress.is_canceled())
+                return FS_FILE_USERABORT;
             log_aws_error("GetObject", outcome.GetError());
             return outcome.GetError().GetResponseCode() == Aws::Http::HttpResponseCode::NOT_FOUND
                        ? FS_FILE_NOTFOUND
@@ -679,9 +759,13 @@ int upload_file(const wchar_t* local_name, const wchar_t* remote_name, int copy_
         request.SetContentLength(static_cast<long long>(size));
         if ((copy_flags & FS_COPYFLAGS_OVERWRITE) == 0)
             request.SetIfNoneMatch("*");
+
+        TransferProgress progress{local_name, remote_name, request};
         const auto outcome = client.PutObject(request);
         if (!outcome.IsSuccess())
         {
+            if (progress.is_canceled())
+                return FS_FILE_USERABORT;
             log_aws_error("PutObject", outcome.GetError());
             return outcome.GetError().GetResponseCode() ==
                            Aws::Http::HttpResponseCode::PRECONDITION_FAILED
