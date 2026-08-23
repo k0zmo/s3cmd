@@ -55,9 +55,15 @@ struct TemporaryEnvironment
     bool existed{};
 };
 
-struct ResetCallbacks
+struct PluginSession
 {
-    ~ResetCallbacks() { s3cmd::initialize(0, nullptr, nullptr, nullptr); }
+    PluginSession(int number = 0, tProgressProcW progress = nullptr, tLogProcW log = nullptr,
+                  tRequestProcW request = nullptr)
+    {
+        s3cmd::initialize(number, progress, log, request);
+    }
+
+    ~PluginSession() { s3cmd::shutdown(); }
 };
 
 struct TemporaryIni
@@ -95,6 +101,15 @@ struct TemporaryIni
 };
 
 } // namespace
+
+TEST_CASE("AWS SDK lifecycle is idempotent on its owner thread", "[unit]")
+{
+    s3cmd::initialize(0, nullptr, nullptr, nullptr);
+    s3cmd::initialize(0, nullptr, nullptr, nullptr);
+    s3cmd::shutdown();
+    s3cmd::shutdown();
+    SUCCEED();
+}
 
 TEST_CASE("remote paths identify profile, bucket, and object", "[unit]")
 {
@@ -280,8 +295,7 @@ TEST_CASE("expired SSO session reports the login command on every attempt", "[un
     request_type = 0;
     request_text.clear();
     log_text.clear();
-    s3cmd::initialize(7, nullptr, capture_log, capture_request);
-    ResetCallbacks reset;
+    PluginSession session(7, nullptr, capture_log, capture_request);
 
     wchar_t path[] = L"\\expired";
     WIN32_FIND_DATAW entry{};

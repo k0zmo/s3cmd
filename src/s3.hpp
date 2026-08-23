@@ -46,6 +46,7 @@ BucketMap merge_buckets(BucketMap registered, const std::set<std::string>& hidde
                         const BucketMap& discovered);
 
 int initialize(int number, tProgressProcW progress, tLogProcW log, tRequestProcW request);
+void shutdown();
 HANDLE find_first(wchar_t* path, WIN32_FIND_DATAW* find_data);
 BOOL find_next(HANDLE handle, WIN32_FIND_DATAW* find_data);
 int find_close(HANDLE handle);

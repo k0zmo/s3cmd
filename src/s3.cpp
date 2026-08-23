@@ -28,9 +28,11 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <cassert>
 #include <charconv>
 #include <cstdint>
 #include <cstring>
+#include <debugapi.h>
 #include <exception>
 #include <filesystem>
 #include <format>
@@ -38,6 +40,7 @@
 #include <ios>
 #include <memory>
 #include <mutex>
+#include <shared_mutex>
 #include <set>
 #include <stdexcept>
 #include <string>
@@ -55,8 +58,12 @@ tProgressProcW progress_proc{};
 tLogProcW log_proc{};
 tRequestProcW request_proc{};
 
-std::mutex aws_mutex;
+std::shared_mutex aws_lifecycle_mutex;
+std::mutex client_mutex;
 std::mutex registry_mutex;
+Aws::SDKOptions aws_options;
+DWORD aws_init_thread_id{};
+bool aws_initialized{};
 
 enum class DeleteMode
 {
@@ -67,25 +74,22 @@ enum class DeleteMode
 
 thread_local DeleteMode delete_mode = DeleteMode::normal;
 
-// FIXME: The current state is creating and destroying these for each operation,
-//        and on top of that, not reusing the client
-struct AwsSession
+// AwsLease has two jobs:
+// 1. Verify the SDK is initialized.
+// 2. Hold a shared lifecycle lock for the entire AWS operation.
+// Multiple operations can hold it concurrently, but shutdown() needs the exclusive lock.
+struct AwsLease
 {
-    AwsSession() : lock(aws_mutex)
+    AwsLease() : lock(aws_lifecycle_mutex)
     {
-        Aws::InitAPI(options);
+        if (!aws_initialized)
+            throw std::runtime_error("AWS SDK is not initialized");
     }
 
-    ~AwsSession()
-    {
-        Aws::ShutdownAPI(options);
-    }
+    AwsLease(const AwsLease&) = delete;
+    AwsLease& operator=(const AwsLease&) = delete;
 
-    AwsSession(const AwsSession&) = delete;
-    AwsSession& operator=(const AwsSession&) = delete;
-
-    std::unique_lock<std::mutex> lock;
-    Aws::SDKOptions options;
+    std::shared_lock<std::shared_mutex> lock;
 };
 
 class SsoLoginRequired : public std::runtime_error
@@ -113,6 +117,16 @@ struct FindState
     std::vector<FindEntry> entries;
     std::size_t next{};
 };
+
+struct ClientEntry
+{
+    std::shared_ptr<Aws::Auth::AWSCredentialsProvider> credentials;
+    std::shared_ptr<Aws::S3::S3Client> client;
+    bool uses_sso{};
+};
+
+using ClientKey = std::pair<std::string, std::string>; // (profile, region)
+std::map<ClientKey, std::shared_ptr<ClientEntry>> clients;
 
 const std::filesystem::path bucket_registry_file = [] {
     const auto size = GetEnvironmentVariableW(L"APPDATA", nullptr, 0);
@@ -317,7 +331,7 @@ std::string profile_region(std::string_view profile)
     return {configuration.region.data(), configuration.region.size()};
 }
 
-Aws::S3::S3Client make_client(const RemotePath& path)
+std::shared_ptr<Aws::S3::S3Client> get_client(const RemotePath& path)
 {
     Aws::S3::S3ClientConfiguration configuration(path.profile.c_str());
     if (!path.bucket.empty())
@@ -327,31 +341,48 @@ Aws::S3::S3Client make_client(const RemotePath& path)
             configuration.region = region.c_str();
     }
 
-    Aws::Client::ClientConfiguration::CredentialProviderConfiguration credentials_configuration;
-    credentials_configuration.profile = path.profile.c_str();
-    credentials_configuration.region = configuration.region;
-    auto credentials = Aws::MakeShared<Aws::Auth::DefaultAWSCredentialsProviderChain>(
-        "s3cmd", credentials_configuration);
-
-    const auto profile = Aws::Config::GetCachedConfigProfile(path.profile.c_str());
-    const auto uses_sso = profile.IsSsoSessionSet() || !profile.GetSsoStartUrl().empty();
-    if (uses_sso)
+    const ClientKey key{path.profile, {configuration.region.data(), configuration.region.size()}};
+    std::shared_ptr<ClientEntry> entry;
     {
-        if (credentials->GetAWSCredentials().IsEmpty())
-        {
-            const SsoLoginRequired error(path.profile);
-            if (request_proc)
-            {
-                auto title = std::wstring(L"Amazon S3");
-                auto message = utf8_to_wide(error.what());
-                std::array<wchar_t, 1> ignored{};
-                request_proc(plugin_number, RT_MsgOK, title.data(), message.data(), ignored.data(),
-                             static_cast<int>(ignored.size()));
-            }
-            throw error;
-        }
+        std::scoped_lock lock(client_mutex);
+        if (const auto found = clients.find(key); found != clients.end())
+            entry = found->second;
     }
-    return Aws::S3::S3Client(credentials, nullptr, configuration);
+
+    if (!entry)
+    {
+        Aws::Client::ClientConfiguration::CredentialProviderConfiguration credentials_configuration;
+        credentials_configuration.profile = path.profile.c_str();
+        credentials_configuration.region = configuration.region;
+        auto credentials = Aws::MakeShared<Aws::Auth::DefaultAWSCredentialsProviderChain>(
+            "s3cmd", credentials_configuration);
+
+        const auto profile = Aws::Config::GetCachedConfigProfile(path.profile.c_str());
+        auto candidate = std::make_shared<ClientEntry>(
+            credentials,
+            Aws::MakeShared<Aws::S3::S3Client>("s3cmd", credentials, nullptr, configuration),
+            profile.IsSsoSessionSet() || !profile.GetSsoStartUrl().empty()
+        );
+
+        std::scoped_lock lock(client_mutex);
+        entry = clients.try_emplace(key, std::move(candidate)).first->second;
+    }
+
+    if (entry->uses_sso && entry->credentials->GetAWSCredentials().IsEmpty())
+    {
+        // Expired SSO credentials
+        const SsoLoginRequired error(path.profile);
+        if (request_proc)
+        {
+            auto title = std::wstring(L"Amazon S3");
+            auto message = utf8_to_wide(error.what());
+            std::array<wchar_t, 1> ignored{};
+            request_proc(plugin_number, RT_MsgOK, title.data(), message.data(), ignored.data(),
+                         static_cast<int>(ignored.size()));
+        }
+        throw error;
+    }
+    return entry->client;
 }
 
 void log_message(int type, std::wstring message)
@@ -416,7 +447,7 @@ void append_entry(std::vector<FindEntry>& entries, std::string_view name, bool d
 
 std::vector<FindEntry> list_entries(const RemotePath& path)
 {
-    AwsSession session;
+    AwsLease lease;
     std::vector<FindEntry> entries;
 
     if (path.profile.empty())
@@ -440,14 +471,14 @@ std::vector<FindEntry> list_entries(const RemotePath& path)
         const auto hidden = hidden_buckets(bucket_registry_file, path.profile);
 
         BucketMap discovered;
-        auto client = make_client(path);
+        auto client = get_client(path);
         Aws::S3::Model::ListBucketsRequest request;
         request.SetMaxBuckets(10'000);
         log_operation("ListBuckets", path, false);
         bool discovery_succeeded = true;
         for (;;)
         {
-            const auto outcome = client.ListBuckets(request);
+            const auto outcome = client->ListBuckets(request);
             if (!outcome.IsSuccess())
             {
                 discovery_succeeded = false;
@@ -483,7 +514,7 @@ std::vector<FindEntry> list_entries(const RemotePath& path)
     }
 
     const auto prefix = directory_prefix(path);
-    auto client = make_client(path);
+    auto client = get_client(path);
     Aws::S3::Model::ListObjectsV2Request request;
     request.SetBucket(path.bucket.c_str());
     request.SetDelimiter("/");
@@ -492,7 +523,7 @@ std::vector<FindEntry> list_entries(const RemotePath& path)
 
     for (;;)
     {
-        const auto outcome = client.ListObjectsV2(request);
+        const auto outcome = client->ListObjectsV2(request);
         if (!outcome.IsSuccess())
         {
             log_aws_error("ListObjectsV2", outcome.GetError());
@@ -674,8 +705,8 @@ int download_file(const wchar_t* remote_name, const wchar_t* local_name, int cop
     std::error_code ignored;
 
     {
-        AwsSession session;
-        auto client = make_client(path);
+        AwsLease lease;
+        auto client = get_client(path);
         Aws::S3::Model::GetObjectRequest request;
         request.SetBucket(path.bucket.c_str());
         request.SetKey(path.key.c_str());
@@ -685,7 +716,7 @@ int download_file(const wchar_t* remote_name, const wchar_t* local_name, int cop
         });
 
         TransferProgress progress{remote_name, local_name, request};
-        const auto outcome = client.GetObject(request);
+        const auto outcome = client->GetObject(request);
         if (!outcome.IsSuccess())
         {
             std::filesystem::remove(partial, ignored);
@@ -744,8 +775,8 @@ int upload_file(const wchar_t* local_name, const wchar_t* remote_name, int copy_
     }
 
     {
-        AwsSession session;
-        auto client = make_client(path);
+        AwsLease lease;
+        auto client = get_client(path);
 
         auto body = Aws::MakeShared<std::fstream>("s3cmd", std::filesystem::path(local_name),
                                                   std::ios::in | std::ios::binary);
@@ -761,7 +792,7 @@ int upload_file(const wchar_t* local_name, const wchar_t* remote_name, int copy_
             request.SetIfNoneMatch("*");
 
         TransferProgress progress{local_name, remote_name, request};
-        const auto outcome = client.PutObject(request);
+        const auto outcome = client->PutObject(request);
         if (!outcome.IsSuccess())
         {
             if (progress.is_canceled())
@@ -808,11 +839,6 @@ int copy_or_move(const wchar_t* old_name, const wchar_t* new_name, bool move, bo
         target.profile.empty() || target.bucket.empty() || target.key.empty())
         return FS_FILE_NOTFOUND;
 
-    AwsSession session;
-    auto target_client = make_client(target);
-    if (!overwrite && remote_exists(target_client, target))
-        return FS_FILE_EXISTS;
-
     const auto is_dry = is_dry_run();
     const auto copy_operation =
         std::format("CopyObject source={}/{}/{}", source.profile, source.bucket, source.key);
@@ -825,13 +851,18 @@ int copy_or_move(const wchar_t* old_name, const wchar_t* new_name, bool move, bo
         return FS_FILE_OK;
     }
 
+    AwsLease lease;
+    auto target_client = get_client(target);
+    if (!overwrite && remote_exists(*target_client, target))
+        return FS_FILE_EXISTS;
+
     Aws::S3::Model::CopyObjectRequest copy;
     copy.SetBucket(target.bucket.c_str());
     copy.SetKey(target.key.c_str());
     // CopyObjectRequest URL-encodes this value when serializing the header.
     auto copy_source = std::format("{}/{}", source.bucket, source.key);
     copy.SetCopySource(std::move(copy_source));
-    const auto copy_outcome = target_client.CopyObject(copy);
+    const auto copy_outcome = target_client->CopyObject(copy);
     if (!copy_outcome.IsSuccess())
     {
         log_aws_error("CopyObject", copy_outcome.GetError());
@@ -842,12 +873,12 @@ int copy_or_move(const wchar_t* old_name, const wchar_t* new_name, bool move, bo
 
     if (move)
     {
-        auto source_client = make_client(source);
+        auto source_client = get_client(source);
         log_operation("DeleteObject", source, false);
         Aws::S3::Model::DeleteObjectRequest remove;
         remove.SetBucket(source.bucket.c_str());
         remove.SetKey(source.key.c_str());
-        const auto delete_outcome = source_client.DeleteObject(remove);
+        const auto delete_outcome = source_client->DeleteObject(remove);
         if (!delete_outcome.IsSuccess())
         {
             log_aws_error("DeleteObject", delete_outcome.GetError());
@@ -908,12 +939,12 @@ std::string bucket_region(const std::filesystem::path& file, std::string_view pr
 std::string discover_bucket_region(std::string_view profile, std::string_view bucket)
 {
     const RemotePath path{std::string(profile), std::string(bucket), {}};
-    AwsSession session;
-    auto client = make_client({std::string(profile), {}, {}});
+    AwsLease lease;
+    auto client = get_client({std::string(profile), {}, {}});
     Aws::S3::Model::GetBucketLocationRequest request;
     request.SetBucket(std::string(bucket).c_str());
     log_operation("GetBucketLocation", path, false);
-    const auto outcome = client.GetBucketLocation(request);
+    const auto outcome = client->GetBucketLocation(request);
     if (!outcome.IsSuccess())
         return {};
 
@@ -958,11 +989,43 @@ BucketMap merge_buckets(BucketMap registered, const std::set<std::string>& hidde
 
 int initialize(int number, tProgressProcW progress, tLogProcW log, tRequestProcW request)
 {
+    std::unique_lock lock(aws_lifecycle_mutex);
+    if (!aws_initialized)
+    {
+        Aws::InitAPI(aws_options);
+        aws_init_thread_id = GetCurrentThreadId();
+        aws_initialized = true;
+    }
+    else
+    {
+        assert(aws_init_thread_id == GetCurrentThreadId());
+    }
+
     plugin_number = number;
     progress_proc = progress;
     log_proc = log;
     request_proc = request;
     return 0;
+}
+
+void shutdown()
+{
+    std::unique_lock lock(aws_lifecycle_mutex);
+    if (!aws_initialized)
+        return;
+
+    const auto same_thread = aws_init_thread_id == GetCurrentThreadId();
+    assert(same_thread);
+    if (!same_thread)
+        return;
+
+    {
+        std::scoped_lock clients_lock(client_mutex);
+        clients.clear();
+    }
+    Aws::ShutdownAPI(aws_options);
+    aws_initialized = false;
+    aws_init_thread_id = 0;
 }
 
 HANDLE find_first(wchar_t* path, WIN32_FIND_DATAW* find_data)
@@ -1071,12 +1134,12 @@ BOOL delete_file(const wchar_t* remote_name)
             return TRUE;
         }
 
-        AwsSession session;
-        auto client = make_client(path);
+        AwsLease lease;
+        auto client = get_client(path);
         Aws::S3::Model::DeleteObjectRequest request;
         request.SetBucket(path.bucket.c_str());
         request.SetKey(path.key.c_str());
-        const auto outcome = client.DeleteObject(request);
+        const auto outcome = client->DeleteObject(request);
         if (!outcome.IsSuccess())
             log_aws_error("DeleteObject", outcome.GetError());
         return outcome.IsSuccess();
@@ -1102,7 +1165,7 @@ BOOL make_directory(wchar_t* remote_name)
             if (region.empty())
             {
                 {
-                    AwsSession session;
+                    AwsLease lease;
                     region = profile_region(path.profile);
                 }
                 if (!request_region(path.profile, region))
@@ -1125,14 +1188,14 @@ BOOL make_directory(wchar_t* remote_name)
             return TRUE;
         }
 
-        AwsSession session;
-        auto client = make_client(path);
+        AwsLease lease;
+        auto client = get_client(path);
         Aws::S3::Model::PutObjectRequest request;
         request.SetBucket(path.bucket.c_str());
         request.SetKey(directory_prefix(path).c_str());
         request.SetBody(Aws::MakeShared<Aws::StringStream>("s3cmd"));
         request.SetContentLength(0);
-        const auto outcome = client.PutObject(request);
+        const auto outcome = client->PutObject(request);
         if (!outcome.IsSuccess())
             log_aws_error("PutObject directory marker", outcome.GetError());
         return outcome.IsSuccess();
@@ -1182,14 +1245,14 @@ BOOL remove_directory(wchar_t* remote_name)
 
         const auto prefix = directory_prefix(path);
 
-        AwsSession session;
-        auto client = make_client(path);
+        AwsLease lease;
+        auto client = get_client(path);
         Aws::S3::Model::ListObjectsV2Request list;
         list.SetBucket(path.bucket.c_str());
         list.SetPrefix(prefix.c_str());
         list.SetMaxKeys(2);
         log_operation("ListObjectsV2", {path.profile, path.bucket, prefix}, false);
-        const auto listed = client.ListObjectsV2(list);
+        const auto listed = client->ListObjectsV2(list);
         if (!listed.IsSuccess())
         {
             log_aws_error("ListObjectsV2", listed.GetError());
@@ -1217,7 +1280,7 @@ BOOL remove_directory(wchar_t* remote_name)
         Aws::S3::Model::DeleteObjectRequest remove;
         remove.SetBucket(path.bucket.c_str());
         remove.SetKey(prefix.c_str());
-        const auto removed = client.DeleteObject(remove);
+        const auto removed = client->DeleteObject(remove);
         if (!removed.IsSuccess())
             log_aws_error("DeleteObject directory marker", removed.GetError());
         return removed.IsSuccess();

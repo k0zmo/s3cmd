@@ -1,4 +1,5 @@
 #include "s3.hpp"
+#include "utils.hpp"
 
 #include <aws/core/Aws.h>
 #include <aws/core/auth/AWSCredentialsProviderChain.h>
@@ -26,6 +27,12 @@ struct AwsSession
     ~AwsSession() { Aws::ShutdownAPI(options); }
 
     Aws::SDKOptions options;
+};
+
+struct PluginSession
+{
+    PluginSession() { s3cmd::initialize(0, nullptr, nullptr, nullptr); }
+    ~PluginSession() { s3cmd::shutdown(); }
 };
 
 class TemporaryAppData
@@ -125,6 +132,7 @@ TEST_CASE("a bucket region can be discovered from its name", "[integration]")
     if (!profile || !bucket || !region)
         SKIP("Set S3CMD_TEST_PROFILE, S3CMD_TEST_BUCKET, and S3CMD_TEST_REGION");
 
+    PluginSession session;
     CHECK(s3cmd::discover_bucket_region(*profile, *bucket) == *region);
 }
 
@@ -140,6 +148,7 @@ TEST_CASE("a bucket can be entered using its own region", "[integration]")
              "S3CMD_TEST_LIST_BUCKETS, and S3CMD_TEST_OBJECT");
 
     REQUIRE((*list_buckets == "allowed" || *list_buckets == "denied"));
+    PluginSession session;
 
     REQUIRE_FALSE(object->empty());
     REQUIRE(object->front() != '/');

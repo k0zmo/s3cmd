@@ -39,6 +39,11 @@ WFX_EXPORT int __stdcall FsPutFileW(wchar_t* local_name, wchar_t* remote_name, i
     return s3cmd::put_file(local_name, remote_name, copy_flags);
 }
 
+WFX_EXPORT int __stdcall FsGetBackgroundFlags()
+{
+    return BG_DOWNLOAD | BG_UPLOAD;
+}
+
 WFX_EXPORT BOOL __stdcall FsDeleteFileW(wchar_t* remote_name)
 {
     return s3cmd::delete_file(remote_name);
@@ -75,4 +80,9 @@ WFX_EXPORT int __stdcall FsContentGetValueW(wchar_t* file_name, int field_index,
                                             int max_length, int)
 {
     return s3cmd::content_get_value(file_name, field_index, value, max_length);
+}
+
+WFX_EXPORT void __stdcall FsContentPluginUnloading()
+{
+    s3cmd::shutdown();
 }
