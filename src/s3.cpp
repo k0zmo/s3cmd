@@ -1,4 +1,5 @@
 #include "s3.hpp"
+#include "utils.hpp"
 
 #include <aws/core/Aws.h>
 #include <aws/core/auth/AWSCredentialsProvider.h>
@@ -106,42 +107,6 @@ struct FindState
     std::vector<FindEntry> entries;
     std::size_t next{};
 };
-
-std::wstring utf8_to_wide_impl(std::string_view text)
-{
-    if (text.empty())
-        return {};
-
-    const auto size = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, text.data(),
-                                          static_cast<int>(text.size()), nullptr, 0);
-    if (size == 0)
-        throw std::runtime_error("S3 returned invalid UTF-8");
-
-    std::wstring result(static_cast<std::size_t>(size), L'\0');
-    if (MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, text.data(),
-                            static_cast<int>(text.size()), result.data(), size) == 0)
-        throw std::runtime_error("S3 returned invalid UTF-8");
-    return result;
-}
-
-std::string wide_to_utf8_impl(std::wstring_view text)
-{
-    if (text.empty())
-        return {};
-
-    const auto size =
-        WideCharToMultiByte(CP_UTF8, WC_ERR_INVALID_CHARS, text.data(),
-                            static_cast<int>(text.size()), nullptr, 0, nullptr, nullptr);
-    if (size == 0)
-        throw std::runtime_error("Total Commander passed invalid UTF-16");
-
-    std::string result(static_cast<std::size_t>(size), '\0');
-    if (WideCharToMultiByte(CP_UTF8, WC_ERR_INVALID_CHARS, text.data(),
-                            static_cast<int>(text.size()), result.data(), size, nullptr,
-                            nullptr) == 0)
-        throw std::runtime_error("Total Commander passed invalid UTF-16");
-    return result;
-}
 
 RemotePath parse_remote_path_impl(std::wstring_view path)
 {
@@ -808,16 +773,6 @@ int copy_or_move(const wchar_t* old_name, const wchar_t* new_name, bool move, bo
     return FS_FILE_OK;
 }
 } // namespace
-
-std::wstring utf8_to_wide(std::string_view text)
-{
-    return utf8_to_wide_impl(text);
-}
-
-std::string wide_to_utf8(std::wstring_view text)
-{
-    return wide_to_utf8_impl(text);
-}
 
 RemotePath parse_remote_path(std::wstring_view path)
 {

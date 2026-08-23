@@ -27,8 +27,6 @@ struct BucketInfo
 
 using BucketMap = std::map<std::string, BucketInfo>;
 
-std::wstring utf8_to_wide(std::string_view text);
-std::string wide_to_utf8(std::wstring_view text);
 RemotePath parse_remote_path(std::wstring_view path);
 std::string directory_prefix(const RemotePath& path);
 
