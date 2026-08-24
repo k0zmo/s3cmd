@@ -331,10 +331,15 @@ std::string profile_region(std::string_view profile)
     return {configuration.region.data(), configuration.region.size()};
 }
 
-std::shared_ptr<Aws::S3::S3Client> get_client(const RemotePath& path)
+std::shared_ptr<Aws::S3::S3Client> get_client(const RemotePath& path,
+                                              std::string_view region_override = {})
 {
     Aws::S3::S3ClientConfiguration configuration(path.profile.c_str());
-    if (!path.bucket.empty())
+    if (!region_override.empty())
+    {
+        configuration.region.assign(region_override.data(), region_override.size());
+    }
+    else if (!path.bucket.empty())
     {
         const auto region = bucket_region(bucket_registry_file, path.profile, path.bucket);
         if (!region.empty())
@@ -471,7 +476,10 @@ std::vector<FindEntry> list_entries(const RemotePath& path)
         const auto hidden = hidden_buckets(bucket_registry_file, path.profile);
 
         BucketMap discovered;
-        auto client = get_client(path);
+        // Force us-east-1 region because global endpoint returns the original bucket creation time
+        // whereas regional replicas return their last metadata replication time in the CreationDate
+        // field.
+        auto client = get_client(path, "us-east-1");
         Aws::S3::Model::ListBucketsRequest request;
         request.SetMaxBuckets(10'000);
         log_operation("ListBuckets", path, false);
