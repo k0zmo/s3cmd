@@ -989,6 +989,10 @@ BucketMap merge_buckets(BucketMap registered, const std::set<std::string>& hidde
 
 int initialize(int number, tProgressProcW progress, tLogProcW log, tRequestProcW request)
 {
+    OutputDebugStringW(std::format(L"[s3cmd] Initialize called, plugin={}, thread={}", number,
+                                   GetCurrentThreadId())
+                           .c_str());
+
     std::unique_lock lock(aws_lifecycle_mutex);
     if (!aws_initialized)
     {
@@ -1010,6 +1014,9 @@ int initialize(int number, tProgressProcW progress, tLogProcW log, tRequestProcW
 
 void shutdown()
 {
+    OutputDebugStringW(
+        std::format(L"[s3cmd] Shutdown called, thread={}", GetCurrentThreadId()).c_str());
+
     std::unique_lock lock(aws_lifecycle_mutex);
     if (!aws_initialized)
         return;
