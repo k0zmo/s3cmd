@@ -195,11 +195,6 @@ std::wstring bucket_section(std::string_view profile)
     return L"buckets." + utf8_to_wide(profile);
 }
 
-std::wstring hidden_section(std::string_view profile)
-{
-    return L"hidden." + utf8_to_wide(profile);
-}
-
 std::wstring region_section(std::string_view profile)
 {
     return L"regions." + utf8_to_wide(profile);
@@ -236,16 +231,6 @@ BucketMap registered_buckets_impl(const std::filesystem::path& file, std::string
     BucketMap buckets;
     for (const auto& [bucket, region] : read_ini_section(file, bucket_section(profile)))
         buckets.emplace(wide_to_utf8(bucket), BucketInfo{wide_to_utf8(region)});
-    return buckets;
-}
-
-std::set<std::string> hidden_buckets_impl(const std::filesystem::path& file,
-                                          std::string_view profile)
-{
-    std::scoped_lock lock(registry_mutex);
-    std::set<std::string> buckets;
-    for (const auto& [bucket, ignored] : read_ini_section(file, hidden_section(profile)))
-        buckets.emplace(wide_to_utf8(bucket));
     return buckets;
 }
 
@@ -293,16 +278,12 @@ bool register_bucket_impl(const std::filesystem::path& file, std::string_view pr
         return false;
 
     const auto profile_section = bucket_section(profile);
-    const auto ignored_section = hidden_section(profile);
     const auto bucket_name = utf8_to_wide(bucket);
     const auto bucket_region = utf8_to_wide(region);
 
     std::scoped_lock lock(registry_mutex);
-    const auto written = WritePrivateProfileStringW(profile_section.c_str(), bucket_name.c_str(),
-                                                    bucket_region.c_str(), file.c_str()) != FALSE;
-    const auto unhidden = WritePrivateProfileStringW(ignored_section.c_str(), bucket_name.c_str(),
-                                                     nullptr, file.c_str()) != FALSE;
-    return written && unhidden;
+    return WritePrivateProfileStringW(profile_section.c_str(), bucket_name.c_str(),
+                                      bucket_region.c_str(), file.c_str()) != FALSE;
 }
 
 bool unregister_bucket_impl(const std::filesystem::path& file, std::string_view profile,
@@ -314,15 +295,14 @@ bool unregister_bucket_impl(const std::filesystem::path& file, std::string_view 
         return false;
 
     const auto profile_section = bucket_section(profile);
-    const auto ignored_section = hidden_section(profile);
     const auto bucket_name = utf8_to_wide(bucket);
 
     std::scoped_lock lock(registry_mutex);
-    const auto removed = WritePrivateProfileStringW(profile_section.c_str(), bucket_name.c_str(),
-                                                    nullptr, file.c_str()) != FALSE;
-    const auto hidden = WritePrivateProfileStringW(ignored_section.c_str(), bucket_name.c_str(),
-                                                   L"1", file.c_str()) != FALSE;
-    return removed && hidden;
+    const auto buckets = read_ini_section(file, profile_section);
+    if (std::ranges::none_of(buckets, [&](const auto& entry) { return entry.first == bucket_name; }))
+        return false;
+    return WritePrivateProfileStringW(profile_section.c_str(), bucket_name.c_str(), nullptr,
+                                      file.c_str()) != FALSE;
 }
 
 std::string profile_region(std::string_view profile)
@@ -472,10 +452,7 @@ std::vector<FindEntry> list_entries(const RemotePath& path)
 
     if (path.bucket.empty())
     {
-        auto registered = registered_buckets(bucket_registry_file, path.profile);
-        const auto hidden = hidden_buckets(bucket_registry_file, path.profile);
-
-        BucketMap discovered;
+        BucketMap buckets;
         // Force us-east-1 region because global endpoint returns the original bucket creation time
         // whereas regional replicas return their last metadata replication time in the CreationDate
         // field.
@@ -490,7 +467,7 @@ std::vector<FindEntry> list_entries(const RemotePath& path)
             if (!outcome.IsSuccess())
             {
                 discovery_succeeded = false;
-                discovered.clear();
+                buckets = registered_buckets(bucket_registry_file, path.profile);
                 if (outcome.GetError().GetResponseCode() != Aws::Http::HttpResponseCode::FORBIDDEN)
                     log_aws_error("ListBuckets", outcome.GetError());
                 break;
@@ -501,7 +478,7 @@ std::vector<FindEntry> list_entries(const RemotePath& path)
             {
                 const std::string name(bucket.GetName().data(), bucket.GetName().size());
                 const auto& region = bucket.GetBucketRegion();
-                discovered[name] = {
+                buckets[name] = {
                     {region.data(), region.size()},
                     to_file_time(bucket.GetCreationDate()),
                 };
@@ -512,10 +489,12 @@ std::vector<FindEntry> list_entries(const RemotePath& path)
             request.SetContinuationToken(result.GetContinuationToken());
         }
 
-        if (discovery_succeeded && !cache_bucket_regions(bucket_registry_file, path.profile, discovered))
+        if (discovery_succeeded &&
+            !cache_bucket_regions(bucket_registry_file, path.profile, buckets))
+        {
             log_error("ListBuckets", "Cannot cache bucket regions");
+        }
 
-        const auto buckets = merge_buckets(std::move(registered), hidden, discovered);
         for (const auto& [name, bucket] : buckets)
             append_entry(entries, name, true, 0, bucket.created);
         return entries;
@@ -914,11 +893,6 @@ BucketMap registered_buckets(const std::filesystem::path& file, std::string_view
     return registered_buckets_impl(file, profile);
 }
 
-std::set<std::string> hidden_buckets(const std::filesystem::path& file, std::string_view profile)
-{
-    return hidden_buckets_impl(file, profile);
-}
-
 BucketMap cached_bucket_regions(const std::filesystem::path& file, std::string_view profile)
 {
     return cached_bucket_regions_impl(file, profile);
@@ -977,22 +951,6 @@ bool unregister_bucket(const std::filesystem::path& file, std::string_view profi
                        std::string_view bucket)
 {
     return unregister_bucket_impl(file, profile, bucket);
-}
-
-BucketMap merge_buckets(BucketMap registered, const std::set<std::string>& hidden,
-                        const BucketMap& discovered)
-{
-    for (const auto& [name, bucket] : discovered)
-    {
-        if (!hidden.contains(name))
-        {
-            auto& visible = registered[name];
-            if (visible.region.empty())
-                visible.region = bucket.region;
-            visible.created = bucket.created;
-        }
-    }
-    return registered;
 }
 
 int initialize(int number, tProgressProcW progress, tLogProcW log, tRequestProcW request)
@@ -1238,13 +1196,6 @@ BOOL remove_directory(wchar_t* remote_name)
         {
             if (!path.key.empty())
                 return TRUE;
-            const auto is_dry = is_dry_run();
-            log_operation("UnregisterBucket", path, is_dry);
-            if (is_dry)
-            {
-                return TRUE;
-            }
-            return unregister_bucket(bucket_registry_file, path.profile, path.bucket);
         }
 
         if (path.key.empty())
@@ -1252,9 +1203,7 @@ BOOL remove_directory(wchar_t* remote_name)
             const auto is_dry = is_dry_run();
             log_operation("UnregisterBucket", path, is_dry);
             if (is_dry)
-            {
-                return TRUE;
-            }
+                return registered_buckets(bucket_registry_file, path.profile).contains(path.bucket);
             return unregister_bucket(bucket_registry_file, path.profile, path.bucket);
         }
 

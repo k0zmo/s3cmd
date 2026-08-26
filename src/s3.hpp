@@ -4,7 +4,6 @@
 
 #include <filesystem>
 #include <map>
-#include <set>
 #include <string>
 #include <string_view>
 
@@ -31,7 +30,6 @@ RemotePath parse_remote_path(std::wstring_view path);
 std::string directory_prefix(const RemotePath& path);
 
 BucketMap registered_buckets(const std::filesystem::path& file, std::string_view profile);
-std::set<std::string> hidden_buckets(const std::filesystem::path& file, std::string_view profile);
 BucketMap cached_bucket_regions(const std::filesystem::path& file, std::string_view profile);
 bool cache_bucket_regions(const std::filesystem::path& file, std::string_view profile,
                           const BucketMap& buckets);
@@ -42,8 +40,6 @@ bool register_bucket(const std::filesystem::path& file, std::string_view profile
                      std::string_view bucket, std::string_view region);
 bool unregister_bucket(const std::filesystem::path& file, std::string_view profile,
                        std::string_view bucket);
-BucketMap merge_buckets(BucketMap registered, const std::set<std::string>& hidden,
-                        const BucketMap& discovered);
 
 int initialize(int number, tProgressProcW progress, tLogProcW log, tRequestProcW request);
 void shutdown();
