@@ -5,7 +5,12 @@ set(CMAKE_MODULE_PATH "${s3cmd_SOURCE_DIR}/cmake;${CMAKE_MODULE_PATH}")
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
-find_package(AWSSDK CONFIG REQUIRED COMPONENTS aws-sdk-cpp-s3)
+if(S3CMD_USING_CONAN)
+    # Sadly, conan package uses different naming scheme
+    find_package(AWSSDK CONFIG REQUIRED COMPONENTS aws-sdk-cpp-s3)
+else()
+    find_package(AWSSDK CONFIG REQUIRED COMPONENTS core s3)
+endif()
 
 add_library(s3cmd-core STATIC
     src/fsplugin.h
@@ -15,7 +20,12 @@ add_library(s3cmd-core STATIC
 target_compile_features(s3cmd-core PUBLIC cxx_std_20)
 target_compile_definitions(s3cmd-core PUBLIC NOMINMAX WIN32_LEAN_AND_MEAN)
 target_include_directories(s3cmd-core PUBLIC "${s3cmd_SOURCE_DIR}/src")
-target_link_libraries(s3cmd-core PUBLIC AWS::aws-sdk-cpp-s3)
+
+if(TARGET AWS::aws-sdk-cpp-s3)
+    target_link_libraries(s3cmd-core PUBLIC AWS::aws-sdk-cpp-core AWS::aws-sdk-cpp-s3)
+else()
+    target_link_libraries(s3cmd-core PUBLIC aws-cpp-sdk-core aws-cpp-sdk-s3)
+endif()
 
 add_library(s3cmd MODULE
     src/main.cpp

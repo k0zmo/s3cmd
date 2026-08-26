@@ -17,7 +17,8 @@
             "hidden": true,
             "cacheVariables": {
                 "CMAKE_PROJECT_TOP_LEVEL_INCLUDES": "${sourceDir}/cmake/conan_provider.cmake",
-                "CONAN_INSTALL_ARGS": "--build=missing"
+                "CONAN_INSTALL_ARGS": "--build=missing",
+                "S3CMD_USING_CONAN": "ON"
             }
         },
         {
