@@ -11,6 +11,7 @@
 
 #include <catch2/catch_test_macros.hpp>
 
+#include <cstdlib>
 #include <filesystem>
 #include <optional>
 #include <stdexcept>
@@ -43,29 +44,28 @@ public:
                 (L"s3cmd-aws-" + std::to_wstring(GetCurrentProcessId()) + L"-" +
                  std::to_wstring(GetTickCount64())))
     {
-        const auto old_size = GetEnvironmentVariableW(L"APPDATA", nullptr, 0);
-        if (old_size != 0)
+        wchar_t* previous{};
+        std::size_t size{};
+        if (_wdupenv_s(&previous, &size, L"APPDATA") != 0)
+            throw std::runtime_error("Cannot read APPDATA");
+        if (previous)
         {
-            old_.resize(old_size, L'\0');
-            const auto written = GetEnvironmentVariableW(L"APPDATA", old_.data(), old_size);
-            if (written == 0 || written >= old_size)
-                throw std::runtime_error("Cannot save APPDATA");
-            old_.resize(written);
+            old_ = previous;
+            std::free(previous);
         }
 
         std::filesystem::create_directories(path_);
-        if (!SetEnvironmentVariableW(L"APPDATA", path_.c_str()))
+        if (_wputenv_s(L"APPDATA", path_.c_str()) != 0)
             throw std::runtime_error("Cannot set APPDATA");
+        s3cmd::reset_config();
     }
 
     ~TemporaryAppData()
     {
-        SetEnvironmentVariableW(L"APPDATA", old_.empty() ? nullptr : old_.c_str());
+        _wputenv_s(L"APPDATA", old_.c_str());
         std::error_code ignored;
         std::filesystem::remove_all(path_, ignored);
     }
-
-    std::filesystem::path registry_file() const { return path_ / L"s3cmd" / L"buckets.ini"; }
 
 private:
     std::filesystem::path path_;
@@ -168,7 +168,7 @@ TEST_CASE("a bucket can be entered using its own region", "[integration]")
 
     TemporaryAppData app_data;
     if (*list_buckets == "denied")
-        REQUIRE(s3cmd::register_bucket(app_data.registry_file(), *profile, *bucket, *region));
+        REQUIRE(s3cmd::register_bucket(*profile, *bucket, *region));
 
     auto profile_path = L"\\" + s3cmd::utf8_to_wide(*profile);
     const auto bucket_name = s3cmd::utf8_to_wide(*bucket);

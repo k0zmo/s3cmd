@@ -11,6 +11,7 @@
         "s3"
       ]
     },
-    "catch2"
+    "catch2",
+    "tomlplusplus"
   ]
 }

@@ -22,6 +22,7 @@
 #include <aws/s3/model/ListBucketsRequest.h>
 #include <aws/s3/model/ListObjectsV2Request.h>
 #include <aws/s3/model/PutObjectRequest.h>
+#include <toml++/toml.hpp>
 
 #include <Windows.h>
 
@@ -32,6 +33,7 @@
 #include <charconv>
 #include <cstdint>
 #include <cstring>
+#include <cstdlib>
 #include <debugapi.h>
 #include <exception>
 #include <filesystem>
@@ -40,6 +42,7 @@
 #include <ios>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <shared_mutex>
 #include <set>
 #include <stdexcept>
@@ -60,10 +63,11 @@ tRequestProcW request_proc{};
 
 std::shared_mutex aws_lifecycle_mutex;
 std::mutex client_mutex;
-std::mutex registry_mutex;
+std::mutex config_mutex;
 Aws::SDKOptions aws_options;
 DWORD aws_init_thread_id{};
 bool aws_initialized{};
+std::optional<toml::table> runtime_config;
 
 enum class DeleteMode
 {
@@ -128,181 +132,137 @@ struct ClientEntry
 using ClientKey = std::pair<std::string, std::string>; // (profile, region)
 std::map<ClientKey, std::shared_ptr<ClientEntry>> clients;
 
-const std::filesystem::path bucket_registry_file = [] {
-    const auto size = GetEnvironmentVariableW(L"APPDATA", nullptr, 0);
-    if (size == 0)
+std::filesystem::path config_file()
+{
+#ifdef _WIN32
+    wchar_t* app_data{};
+    std::size_t size{};
+    // _wdupenv_s allocates a correctly sized UTF-16 copy.
+    if (_wdupenv_s(&app_data, &size, L"APPDATA") != 0 || !app_data || !*app_data)
+    {
+        std::free(app_data);
         throw std::runtime_error("APPDATA is not set");
-
-    std::wstring app_data(size, L'\0');
-    const auto written = GetEnvironmentVariableW(L"APPDATA", app_data.data(), size);
-    if (written == 0 || written >= size)
-        throw std::runtime_error("Cannot read APPDATA");
-    app_data.resize(written);
-    return std::filesystem::path(std::move(app_data)) / L"s3cmd" / L"buckets.ini";
-}();
-
-RemotePath parse_remote_path_impl(std::wstring_view path)
-{
-    while (!path.empty() && path.front() == L'\\')
-        path.remove_prefix(1);
-    while (!path.empty() && path.back() == L'\\')
-        path.remove_suffix(1);
-
-    const auto profile_end = path.find(L'\\');
-    const auto profile = path.substr(0, profile_end);
-    if (profile_end == std::wstring_view::npos)
-        return {wide_to_utf8(profile), {}, {}};
-
-    path.remove_prefix(profile_end + 1);
-    const auto bucket_end = path.find(L'\\');
-    const auto bucket = path.substr(0, bucket_end);
-    const auto key =
-        bucket_end == std::wstring_view::npos ? std::wstring_view{} : path.substr(bucket_end + 1);
-
-    auto key_utf8 = wide_to_utf8(key);
-    std::ranges::replace(key_utf8, '\\', '/');
-    return {wide_to_utf8(profile), wide_to_utf8(bucket), std::move(key_utf8)};
+    }
+    const std::unique_ptr<wchar_t, decltype(&std::free)> value(app_data, &std::free);
+    return std::filesystem::path(value.get()) / L"s3cmd" / L"s3cmd.toml";
+#else
+    if (const auto* config_home = std::getenv("XDG_CONFIG_HOME"); config_home && *config_home)
+        return std::filesystem::path(config_home) / "s3cmd" / "s3cmd.toml";
+    if (const auto* home = std::getenv("HOME"); home && *home)
+        return std::filesystem::path(home) / ".config" / "s3cmd" / "s3cmd.toml";
+    throw std::runtime_error("XDG_CONFIG_HOME and HOME are not set");
+#endif
 }
 
-std::string directory_prefix_impl(const RemotePath& path)
+std::optional<toml::table> read_config(const std::filesystem::path& file)
 {
-    if (path.key.empty())
-        return {};
-    return path.key.back() == '/' ? path.key : path.key + '/';
+    std::ifstream input{file};
+    if (!input)
+    {
+        std::error_code ec;
+        if (!std::filesystem::exists(file, ec) && !ec)
+        {
+            // Config file does not exist
+            return toml::table{};
+        }
+        // Config path exists but for some reason cannot be opened
+        return std::nullopt;
+    }
+
+    try
+    {
+        return toml::parse(input);
+    }
+    catch (const toml::parse_error&)
+    {
+        return std::nullopt;
+    }
 }
 
-FILETIME to_file_time(const Aws::Utils::DateTime& value)
+bool write_config(const std::filesystem::path& file, const toml::table& config)
 {
-    constexpr std::int64_t windows_epoch_offset_ms = 11'644'473'600'000;
-    const auto ticks =
-        static_cast<std::uint64_t>(value.Millis() + windows_epoch_offset_ms) * 10'000;
-    return {static_cast<DWORD>(ticks), static_cast<DWORD>(ticks >> 32)};
+    std::error_code ec;
+    std::filesystem::create_directories(file.parent_path(), ec);
+    if (ec)
+        return false;
+
+    std::ofstream output(file, std::ios::trunc);
+    return output && (output << config) && output.flush();
 }
 
-bool valid_entry_name(const std::wstring& name)
+toml::table* get_config()
 {
-    return !name.empty() && name != L"." && name != L".." && name.find(L'\\') == name.npos &&
-           name.size() < MAX_PATH;
+    if (!runtime_config)
+        runtime_config = read_config(config_file());
+    return runtime_config ? &*runtime_config : nullptr;
+}
+
+// Returns config[kind][profile] as a table (in TOML, [kind.profile]),
+// or nullptr if it is missing or has a different/invalid type.
+template <typename Config> // Config is `(const) toml::table`
+auto profile_table(Config& config, std::string_view kind, std::string_view profile)
+{
+    auto* profiles = config.template get_as<toml::table>(kind);
+    return profiles ? profiles->template get_as<toml::table>(profile) : nullptr;
+}
+
+toml::table& table_at(toml::table& parent, std::string_view key)
+{
+    if (auto* table = parent.get_as<toml::table>(key))
+        return *table;
+    // Key does not exist, insert empty table as its value
+    parent.insert_or_assign(key, toml::table{});
+    return *parent.get_as<toml::table>(key);
+}
+
+BucketMap read_bucket_map(const toml::table& config, std::string_view kind,
+                          std::string_view profile)
+{
+    const auto* values = profile_table(config, kind, profile);
+    BucketMap buckets;
+    if (!values)
+        return buckets;
+
+    for (const auto& [bucket, value] : *values)
+    {
+        if (const auto region = value.value<std::string>())
+            buckets.emplace(bucket.str(), BucketInfo{*region});
+    }
+    return buckets;
+}
+
+std::string bucket_region_from_config(const toml::table& config, std::string_view profile,
+                                      std::string_view bucket)
+{
+    for (const auto kind : {"buckets", "regions"})
+    {
+        const auto* values = profile_table(config, kind, profile);
+        if (values)
+        {
+            if (const auto region = (*values)[bucket].value<std::string>())
+                return *region;
+        }
+    }
+    return {};
 }
 
 bool is_dry_run()
 {
-    return GetPrivateProfileIntW(L"settings", L"DryRun", 0, bucket_registry_file.c_str()) != 0;
+    std::scoped_lock lock(config_mutex);
+    const auto* config = get_config();
+    return config && (*config)["settings"]["DryRun"].value_or(false);
 }
 
-std::wstring bucket_section(std::string_view profile)
+void cache_bucket_regions_in_config(toml::table& config, std::string_view profile,
+                                    const BucketMap& buckets)
 {
-    return L"buckets." + utf8_to_wide(profile);
-}
-
-std::wstring region_section(std::string_view profile)
-{
-    return L"regions." + utf8_to_wide(profile);
-}
-
-std::vector<std::pair<std::wstring, std::wstring>>
-    read_ini_section(const std::filesystem::path& file, const std::wstring& section)
-{
-    std::vector<wchar_t> buffer(1024);
-
-    for (;;)
-    {
-        const auto length = GetPrivateProfileSectionW(
-            section.c_str(), buffer.data(), static_cast<DWORD>(buffer.size()), file.c_str());
-        if (length < buffer.size() - 2)
-            break;
-        buffer.resize(buffer.size() * 2);
-    }
-
-    std::vector<std::pair<std::wstring, std::wstring>> values;
-    for (const wchar_t* item = buffer.data(); *item; item += std::wcslen(item) + 1)
-    {
-        const std::wstring_view entry(item);
-        const auto separator = entry.find(L'=');
-        if (separator != entry.npos)
-            values.emplace_back(entry.substr(0, separator), entry.substr(separator + 1));
-    }
-    return values;
-}
-
-BucketMap registered_buckets_impl(const std::filesystem::path& file, std::string_view profile)
-{
-    std::scoped_lock lock(registry_mutex);
-    BucketMap buckets;
-    for (const auto& [bucket, region] : read_ini_section(file, bucket_section(profile)))
-        buckets.emplace(wide_to_utf8(bucket), BucketInfo{wide_to_utf8(region)});
-    return buckets;
-}
-
-BucketMap cached_bucket_regions_impl(const std::filesystem::path& file, std::string_view profile)
-{
-    std::scoped_lock lock(registry_mutex);
-    BucketMap buckets;
-    for (const auto& [bucket, region] : read_ini_section(file, region_section(profile)))
-        buckets.emplace(wide_to_utf8(bucket), BucketInfo{wide_to_utf8(region)});
-    return buckets;
-}
-
-bool cache_bucket_regions_impl(const std::filesystem::path& file, std::string_view profile,
-                               const BucketMap& buckets)
-{
-    std::error_code error;
-    std::filesystem::create_directories(file.parent_path(), error);
-    if (error)
-        return false;
-
-    const auto section = region_section(profile);
-    std::scoped_lock lock(registry_mutex);
-    if (!WritePrivateProfileStringW(section.c_str(), nullptr, nullptr, file.c_str()))
-        return false;
-
+    toml::table regions;
     for (const auto& [bucket, info] : buckets)
     {
-        if (info.region.empty())
-            continue;
-        const auto name = utf8_to_wide(bucket);
-        const auto region = utf8_to_wide(info.region);
-        if (!WritePrivateProfileStringW(section.c_str(), name.c_str(), region.c_str(),
-                                        file.c_str()))
-            return false;
+        if (!info.region.empty())
+            regions.insert_or_assign(bucket, info.region);
     }
-    return true;
-}
-
-bool register_bucket_impl(const std::filesystem::path& file, std::string_view profile,
-                          std::string_view bucket, std::string_view region)
-{
-    std::error_code error;
-    std::filesystem::create_directories(file.parent_path(), error);
-    if (error)
-        return false;
-
-    const auto profile_section = bucket_section(profile);
-    const auto bucket_name = utf8_to_wide(bucket);
-    const auto bucket_region = utf8_to_wide(region);
-
-    std::scoped_lock lock(registry_mutex);
-    return WritePrivateProfileStringW(profile_section.c_str(), bucket_name.c_str(),
-                                      bucket_region.c_str(), file.c_str()) != FALSE;
-}
-
-bool unregister_bucket_impl(const std::filesystem::path& file, std::string_view profile,
-                            std::string_view bucket)
-{
-    std::error_code error;
-    std::filesystem::create_directories(file.parent_path(), error);
-    if (error)
-        return false;
-
-    const auto profile_section = bucket_section(profile);
-    const auto bucket_name = utf8_to_wide(bucket);
-
-    std::scoped_lock lock(registry_mutex);
-    const auto buckets = read_ini_section(file, profile_section);
-    if (std::ranges::none_of(buckets, [&](const auto& entry) { return entry.first == bucket_name; }))
-        return false;
-    return WritePrivateProfileStringW(profile_section.c_str(), bucket_name.c_str(), nullptr,
-                                      file.c_str()) != FALSE;
+    table_at(config, "regions").insert_or_assign(profile, std::move(regions));
 }
 
 std::string profile_region(std::string_view profile)
@@ -321,7 +281,7 @@ std::shared_ptr<Aws::S3::S3Client> get_client(const RemotePath& path,
     }
     else if (!path.bucket.empty())
     {
-        const auto region = bucket_region(bucket_registry_file, path.profile, path.bucket);
+        const auto region = bucket_region(path.profile, path.bucket);
         if (!region.empty())
             configuration.region = region.c_str();
     }
@@ -422,12 +382,31 @@ void fill_find_data(const FindEntry& entry, WIN32_FIND_DATAW* data)
     data->cFileName[entry.name.size()] = L'\0';
 }
 
+bool valid_entry_name(const std::wstring& name)
+{
+    return !name.empty()                 &&
+           name != L"."                  &&
+           name != L".."                 &&
+           name.find(L'\\') == name.npos &&
+           // cFileName has MAX_PATH slots, including the terminating null
+           // This only limits displayed entry name, not the complete S3 key/path
+           name.size() < MAX_PATH;
+}
+
 void append_entry(std::vector<FindEntry>& entries, std::string_view name, bool directory,
                   std::uint64_t size = 0, FILETIME modified = {})
 {
     auto wide_name = utf8_to_wide(name);
     if (valid_entry_name(wide_name))
         entries.push_back({std::move(wide_name), size, modified, directory});
+}
+
+FILETIME to_file_time(const Aws::Utils::DateTime& value)
+{
+    constexpr std::int64_t windows_epoch_offset_ms = 11'644'473'600'000;
+    const auto ticks =
+        static_cast<std::uint64_t>(value.Millis() + windows_epoch_offset_ms) * 10'000;
+    return {static_cast<DWORD>(ticks), static_cast<DWORD>(ticks >> 32)};
 }
 
 std::vector<FindEntry> list_entries(const RemotePath& path)
@@ -467,7 +446,7 @@ std::vector<FindEntry> list_entries(const RemotePath& path)
             if (!outcome.IsSuccess())
             {
                 discovery_succeeded = false;
-                buckets = registered_buckets(bucket_registry_file, path.profile);
+                buckets = registered_buckets(path.profile);
                 if (outcome.GetError().GetResponseCode() != Aws::Http::HttpResponseCode::FORBIDDEN)
                     log_aws_error("ListBuckets", outcome.GetError());
                 break;
@@ -489,8 +468,7 @@ std::vector<FindEntry> list_entries(const RemotePath& path)
             request.SetContinuationToken(result.GetContinuationToken());
         }
 
-        if (discovery_succeeded &&
-            !cache_bucket_regions(bucket_registry_file, path.profile, buckets))
+        if (discovery_succeeded && !cache_bucket_regions(path.profile, buckets))
         {
             log_error("ListBuckets", "Cannot cache bucket regions");
         }
@@ -880,42 +858,65 @@ int copy_or_move(const wchar_t* old_name, const wchar_t* new_name, bool move, bo
 
 RemotePath parse_remote_path(std::wstring_view path)
 {
-    return parse_remote_path_impl(path);
+    while (!path.empty() && path.front() == L'\\')
+        path.remove_prefix(1);
+    while (!path.empty() && path.back() == L'\\')
+        path.remove_suffix(1);
+
+    const auto profile_end = path.find(L'\\');
+    const auto profile = path.substr(0, profile_end);
+    if (profile_end == std::wstring_view::npos)
+        return {wide_to_utf8(profile), {}, {}};
+
+    path.remove_prefix(profile_end + 1);
+    const auto bucket_end = path.find(L'\\');
+    const auto bucket = path.substr(0, bucket_end);
+    const auto key =
+        bucket_end == std::wstring_view::npos ? std::wstring_view{} : path.substr(bucket_end + 1);
+
+    auto key_utf8 = wide_to_utf8(key);
+    std::ranges::replace(key_utf8, '\\', '/');
+    return {wide_to_utf8(profile), wide_to_utf8(bucket), std::move(key_utf8)};
 }
 
 std::string directory_prefix(const RemotePath& path)
 {
-    return directory_prefix_impl(path);
+    if (path.key.empty())
+        return {};
+    return path.key.back() == '/' ? path.key : path.key + '/';
 }
 
-BucketMap registered_buckets(const std::filesystem::path& file, std::string_view profile)
+void reset_config()
 {
-    return registered_buckets_impl(file, profile);
+    std::scoped_lock lock(config_mutex);
+    runtime_config.reset();
 }
 
-BucketMap cached_bucket_regions(const std::filesystem::path& file, std::string_view profile)
+BucketMap registered_buckets(std::string_view profile)
 {
-    return cached_bucket_regions_impl(file, profile);
+    std::scoped_lock lock(config_mutex);
+    const auto* config = get_config();
+    return config ? read_bucket_map(*config, "buckets", profile) : BucketMap{};
 }
 
-bool cache_bucket_regions(const std::filesystem::path& file, std::string_view profile,
-                          const BucketMap& buckets)
+BucketMap cached_bucket_regions(std::string_view profile)
 {
-    return cache_bucket_regions_impl(file, profile, buckets);
+    std::scoped_lock lock(config_mutex);
+    const auto* config = get_config();
+    return config ? read_bucket_map(*config, "regions", profile) : BucketMap{};
 }
 
-std::string bucket_region(const std::filesystem::path& file, std::string_view profile,
-                          std::string_view bucket)
+bool cache_bucket_regions(std::string_view profile, const BucketMap& buckets)
 {
-    const std::string bucket_name(bucket);
-    const auto registered = registered_buckets(file, profile);
-    if (const auto found = registered.find(bucket_name); found != registered.end())
-        return found->second.region;
-
-    const auto cached = cached_bucket_regions(file, profile);
-    if (const auto found = cached.find(bucket_name); found != cached.end())
-        return found->second.region;
-    return {};
+    std::scoped_lock lock(config_mutex);
+    auto* config = get_config();
+    if (!config)
+        return false;
+    cache_bucket_regions_in_config(*config, profile, buckets);
+    if (write_config(config_file(), *config))
+        return true;
+    runtime_config = read_config(config_file());
+    return false;
 }
 
 std::string discover_bucket_region(std::string_view profile, std::string_view bucket)
@@ -941,16 +942,37 @@ std::string discover_bucket_region(std::string_view profile, std::string_view bu
     return {region.data(), region.size()};
 }
 
-bool register_bucket(const std::filesystem::path& file, std::string_view profile,
-                     std::string_view bucket, std::string_view region)
+std::string bucket_region(std::string_view profile, std::string_view bucket)
 {
-    return register_bucket_impl(file, profile, bucket, region);
+    std::scoped_lock lock(config_mutex);
+    const auto* config = get_config();
+    return config ? bucket_region_from_config(*config, profile, bucket) : std::string{};
 }
 
-bool unregister_bucket(const std::filesystem::path& file, std::string_view profile,
-                       std::string_view bucket)
+bool register_bucket(std::string_view profile, std::string_view bucket, std::string_view region)
 {
-    return unregister_bucket_impl(file, profile, bucket);
+    std::scoped_lock lock(config_mutex);
+    auto* config = get_config();
+    if (!config)
+        return false;
+    table_at(table_at(*config, "buckets"), profile).insert_or_assign(bucket, region);
+    if (write_config(config_file(), *config))
+        return true;
+    runtime_config = read_config(config_file());
+    return false;
+}
+
+bool unregister_bucket(std::string_view profile, std::string_view bucket)
+{
+    std::scoped_lock lock(config_mutex);
+    auto* config = get_config();
+    auto* buckets = config ? profile_table(*config, "buckets", profile) : nullptr;
+    if (!buckets || !buckets->erase(bucket))
+        return false;
+    if (write_config(config_file(), *config))
+        return true;
+    runtime_config = read_config(config_file());
+    return false;
 }
 
 int initialize(int number, tProgressProcW progress, tLogProcW log, tRequestProcW request)
@@ -984,6 +1006,7 @@ void shutdown()
         std::format(L"[s3cmd] Shutdown called, thread={}", GetCurrentThreadId()).c_str());
 
     std::unique_lock lock(aws_lifecycle_mutex);
+    reset_config();
     if (!aws_initialized)
         return;
 
@@ -1150,7 +1173,7 @@ BOOL make_directory(wchar_t* remote_name)
             {
                 return TRUE;
             }
-            return register_bucket(bucket_registry_file, path.profile, path.bucket, region);
+            return register_bucket(path.profile, path.bucket, region);
         }
 
         const RemotePath marker{path.profile, path.bucket, directory_prefix(path)};
@@ -1203,8 +1226,8 @@ BOOL remove_directory(wchar_t* remote_name)
             const auto is_dry = is_dry_run();
             log_operation("UnregisterBucket", path, is_dry);
             if (is_dry)
-                return registered_buckets(bucket_registry_file, path.profile).contains(path.bucket);
-            return unregister_bucket(bucket_registry_file, path.profile, path.bucket);
+                return registered_buckets(path.profile).contains(path.bucket);
+            return unregister_bucket(path.profile, path.bucket);
         }
 
         const auto prefix = directory_prefix(path);
@@ -1306,7 +1329,7 @@ int content_get_value(wchar_t* file_name, int field_index, void* field_value, in
     if (path.profile.empty() || path.bucket.empty() || !path.key.empty())
         return ft_fieldempty;
 
-    const auto region = bucket_region(bucket_registry_file, path.profile, path.bucket);
+    const auto region = bucket_region(path.profile, path.bucket);
     if (region.empty())
         return ft_fieldempty;
 

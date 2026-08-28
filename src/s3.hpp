@@ -2,7 +2,6 @@
 
 #include "fsplugin.h"
 
-#include <filesystem>
 #include <map>
 #include <string>
 #include <string_view>
@@ -29,18 +28,18 @@ using BucketMap = std::map<std::string, BucketInfo>;
 RemotePath parse_remote_path(std::wstring_view path);
 std::string directory_prefix(const RemotePath& path);
 
-BucketMap registered_buckets(const std::filesystem::path& file, std::string_view profile);
-BucketMap cached_bucket_regions(const std::filesystem::path& file, std::string_view profile);
-bool cache_bucket_regions(const std::filesystem::path& file, std::string_view profile,
-                          const BucketMap& buckets);
-std::string bucket_region(const std::filesystem::path& file, std::string_view profile,
-                          std::string_view bucket);
-std::string discover_bucket_region(std::string_view profile, std::string_view bucket);
-bool register_bucket(const std::filesystem::path& file, std::string_view profile,
-                     std::string_view bucket, std::string_view region);
-bool unregister_bucket(const std::filesystem::path& file, std::string_view profile,
-                       std::string_view bucket);
+// Function called only in tests
+void reset_config();
 
+BucketMap registered_buckets(std::string_view profile);
+BucketMap cached_bucket_regions(std::string_view profile);
+bool cache_bucket_regions(std::string_view profile, const BucketMap& buckets);
+std::string bucket_region(std::string_view profile, std::string_view bucket);
+std::string discover_bucket_region(std::string_view profile, std::string_view bucket);
+bool register_bucket(std::string_view profile, std::string_view bucket, std::string_view region);
+bool unregister_bucket(std::string_view profile, std::string_view bucket);
+
+// Plugin API implementation
 int initialize(int number, tProgressProcW progress, tLogProcW log, tRequestProcW request);
 void shutdown();
 HANDLE find_first(wchar_t* path, WIN32_FIND_DATAW* find_data);

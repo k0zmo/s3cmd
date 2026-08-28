@@ -12,6 +12,8 @@ else()
     find_package(AWSSDK CONFIG REQUIRED COMPONENTS core s3)
 endif()
 
+find_package(tomlplusplus CONFIG REQUIRED)
+
 add_library(s3cmd-core STATIC
     src/fsplugin.h
     src/s3.cpp      src/s3.hpp
@@ -20,6 +22,7 @@ add_library(s3cmd-core STATIC
 target_compile_features(s3cmd-core PUBLIC cxx_std_20)
 target_compile_definitions(s3cmd-core PUBLIC NOMINMAX WIN32_LEAN_AND_MEAN)
 target_include_directories(s3cmd-core PUBLIC "${s3cmd_SOURCE_DIR}/src")
+target_link_libraries(s3cmd-core PRIVATE tomlplusplus::tomlplusplus)
 
 if(TARGET AWS::aws-sdk-cpp-s3)
     target_link_libraries(s3cmd-core PUBLIC AWS::aws-sdk-cpp-core AWS::aws-sdk-cpp-s3)

@@ -66,39 +66,56 @@ struct PluginSession
     ~PluginSession() { s3cmd::shutdown(); }
 };
 
-struct TemporaryIni
+struct TemporaryConfig
 {
-    TemporaryIni()
+    TemporaryConfig()
         : root(std::filesystem::temp_directory_path() /
                (L"s3cmd-" + std::to_wstring(GetCurrentProcessId()) + L"-" +
                 std::to_wstring(GetTickCount64()))),
-          path(root / L"s3cmd" / L"buckets.ini")
+          path(root / L"s3cmd" / L"s3cmd.toml")
     {
-        const auto old_size = GetEnvironmentVariableW(L"APPDATA", nullptr, 0);
-        if (old_size != 0)
+        wchar_t* previous{};
+        std::size_t size{};
+        if (_wdupenv_s(&previous, &size, L"APPDATA") != 0)
+            throw std::runtime_error("Cannot read APPDATA");
+        if (previous)
         {
-            old_app_data.resize(old_size, L'\0');
-            const auto written = GetEnvironmentVariableW(L"APPDATA", old_app_data.data(), old_size);
-            if (written == 0 || written >= old_size)
-                throw std::runtime_error("Cannot save APPDATA");
-            old_app_data.resize(written);
+            old_app_data = previous;
+            std::free(previous);
         }
         std::filesystem::create_directories(root);
-        if (!SetEnvironmentVariableW(L"APPDATA", root.c_str()))
+        if (_wputenv_s(L"APPDATA", root.c_str()) != 0)
             throw std::runtime_error("Cannot set APPDATA");
     }
 
-    ~TemporaryIni()
+    ~TemporaryConfig()
     {
-        SetEnvironmentVariableW(L"APPDATA", old_app_data.empty() ? nullptr : old_app_data.c_str());
+        _wputenv_s(L"APPDATA", old_app_data.c_str());
         std::error_code ignored;
         std::filesystem::remove_all(root, ignored);
+    }
+
+    void reset()
+    {
+        std::error_code error;
+        std::filesystem::remove_all(root, error);
+        if (error)
+            throw std::runtime_error("Cannot reset temporary config");
+        std::filesystem::create_directories(root);
+        s3cmd::reset_config();
     }
 
     std::filesystem::path root;
     std::filesystem::path path;
     std::wstring old_app_data;
 };
+
+TemporaryConfig& temporary_config()
+{
+    static TemporaryConfig config;
+    config.reset();
+    return config;
+}
 
 } // namespace
 
@@ -132,48 +149,48 @@ TEST_CASE("directory prefixes use S3 separators", "[unit]")
 
 TEST_CASE("bucket registry only unregisters registered buckets", "[unit]")
 {
-    TemporaryIni ini;
+    temporary_config();
 
-    REQUIRE(s3cmd::register_bucket(ini.path, "work", "private-bucket", "eu-central-1"));
+    REQUIRE(s3cmd::register_bucket("work", "private-bucket", "eu-central-1"));
 
-    const auto registered = s3cmd::registered_buckets(ini.path, "work");
+    const auto registered = s3cmd::registered_buckets("work");
     REQUIRE(registered.contains("private-bucket"));
     CHECK(registered.at("private-bucket").region == "eu-central-1");
-    REQUIRE(s3cmd::unregister_bucket(ini.path, "work", "private-bucket"));
-    CHECK(s3cmd::registered_buckets(ini.path, "work").empty());
-    CHECK_FALSE(s3cmd::unregister_bucket(ini.path, "work", "private-bucket"));
+    REQUIRE(s3cmd::unregister_bucket("work", "private-bucket"));
+    CHECK(s3cmd::registered_buckets("work").empty());
+    CHECK_FALSE(s3cmd::unregister_bucket("work", "private-bucket"));
 }
 
 TEST_CASE("discovered bucket regions are cached separately from registrations", "[unit]")
 {
-    TemporaryIni ini;
+    temporary_config();
     const s3cmd::BucketMap discovered{
         {"ireland-bucket", {"eu-west-1"}},
         {"singapore-bucket", {"ap-southeast-1"}},
     };
 
-    REQUIRE(s3cmd::cache_bucket_regions(ini.path, "work", discovered));
+    REQUIRE(s3cmd::cache_bucket_regions("work", discovered));
 
-    const auto cached = s3cmd::cached_bucket_regions(ini.path, "work");
+    const auto cached = s3cmd::cached_bucket_regions("work");
     CHECK(cached.at("ireland-bucket").region == "eu-west-1");
     CHECK(cached.at("singapore-bucket").region == "ap-southeast-1");
-    CHECK(s3cmd::registered_buckets(ini.path, "work").empty());
+    CHECK(s3cmd::registered_buckets("work").empty());
 }
 
 TEST_CASE("registered regions override discovered regions", "[unit]")
 {
-    TemporaryIni ini;
-    REQUIRE(s3cmd::cache_bucket_regions(ini.path, "work", {{"shared-bucket", {"us-west-2"}}}));
-    CHECK(s3cmd::bucket_region(ini.path, "work", "shared-bucket") == "us-west-2");
+    temporary_config();
+    REQUIRE(s3cmd::cache_bucket_regions("work", {{"shared-bucket", {"us-west-2"}}}));
+    CHECK(s3cmd::bucket_region("work", "shared-bucket") == "us-west-2");
 
-    REQUIRE(s3cmd::register_bucket(ini.path, "work", "shared-bucket", "eu-west-1"));
-    CHECK(s3cmd::bucket_region(ini.path, "work", "shared-bucket") == "eu-west-1");
+    REQUIRE(s3cmd::register_bucket("work", "shared-bucket", "eu-west-1"));
+    CHECK(s3cmd::bucket_region("work", "shared-bucket") == "eu-west-1");
 }
 
 TEST_CASE("Region is exposed as a Total Commander content field", "[unit]")
 {
-    TemporaryIni ini;
-    REQUIRE(s3cmd::cache_bucket_regions(ini.path, "work", {{"owned-bucket", {"ap-southeast-1"}}}));
+    auto& ini = temporary_config();
+    REQUIRE(s3cmd::cache_bucket_regions("work", {{"owned-bucket", {"ap-southeast-1"}}}));
 
     char name[32]{};
     char units[32]{};
@@ -184,18 +201,40 @@ TEST_CASE("Region is exposed as a Total Commander content field", "[unit]")
 
     wchar_t bucket_path[] = L"\\work\\owned-bucket";
     wchar_t value[32]{};
-    CHECK(s3cmd::content_get_value(bucket_path, 0, value, sizeof(value)) == ft_stringw);
-    CHECK(std::wstring_view(value) == L"ap-southeast-1");
+    {
+        PluginSession session;
+        CHECK(s3cmd::content_get_value(bucket_path, 0, value, sizeof(value)) == ft_stringw);
+        CHECK(std::wstring_view(value) == L"ap-southeast-1");
 
-    wchar_t object_path[] = L"\\work\\owned-bucket\\file.txt";
-    CHECK(s3cmd::content_get_value(object_path, 0, value, sizeof(value)) == ft_fieldempty);
+        {
+            std::ofstream file(ini.path, std::ios::trunc);
+            REQUIRE(file);
+            file << "[regions.work]\nowned-bucket = \"eu-west-1\"\n";
+        }
+        s3cmd::reset_config();
+        CHECK(s3cmd::content_get_value(bucket_path, 0, value, sizeof(value)) == ft_stringw);
+        CHECK(std::wstring_view(value) == L"eu-west-1");
+
+        wchar_t object_path[] = L"\\work\\owned-bucket\\file.txt";
+        CHECK(s3cmd::content_get_value(object_path, 0, value, sizeof(value)) == ft_fieldempty);
+    }
+
+    PluginSession session;
+    CHECK(s3cmd::content_get_value(bucket_path, 0, value, sizeof(value)) == ft_stringw);
+    CHECK(std::wstring_view(value) == L"eu-west-1");
 }
 
 TEST_CASE("runtime dry run completes S3 operations without side effects", "[unit]")
 {
-    TemporaryIni ini;
+    auto& ini = temporary_config();
     std::filesystem::create_directories(ini.path.parent_path());
-    REQUIRE(WritePrivateProfileStringW(L"settings", L"DryRun", L"1", ini.path.c_str()));
+    {
+        std::ofstream file(ini.path);
+        REQUIRE(file);
+        file << "[settings]\nDryRun = true\n";
+    }
+    REQUIRE(s3cmd::register_bucket("work", "registered-bucket", "eu-central-1"));
+    PluginSession session;
 
     wchar_t object[] = L"\\work\\bucket\\file.txt";
     wchar_t directory[] = L"\\work\\bucket\\folder";
@@ -220,15 +259,14 @@ TEST_CASE("runtime dry run completes S3 operations without side effects", "[unit
     CHECK(s3cmd::delete_file(object));
     CHECK(s3cmd::make_directory(directory));
     CHECK(s3cmd::rename_or_move(object, copy, TRUE, TRUE, nullptr) == FS_FILE_OK);
-    REQUIRE(s3cmd::register_bucket(ini.path, "work", "registered-bucket", "eu-central-1"));
     CHECK(s3cmd::remove_directory(registered_bucket));
     CHECK_FALSE(s3cmd::remove_directory(discovered_bucket));
-    CHECK(s3cmd::registered_buckets(ini.path, "work").contains("registered-bucket"));
+    CHECK(s3cmd::registered_buckets("work").contains("registered-bucket"));
 }
 
 TEST_CASE("expired SSO session reports the login command on every attempt", "[unit]")
 {
-    TemporaryIni ini;
+    auto& ini = temporary_config();
     const auto config = ini.root / L"config";
     const auto credentials = ini.root / L"credentials";
     {

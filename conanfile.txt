@@ -1,5 +1,6 @@
 [requires]
 aws-sdk-cpp/1.11.692
+tomlplusplus/3.4.0
 
 [test_requires]
 catch2/3.14.0

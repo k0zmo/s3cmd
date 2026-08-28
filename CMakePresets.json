@@ -29,8 +29,11 @@
         {
             "name": ":windows",
             "hidden": true,
-            "inherits": [":base", ":conan"],
-            "condition": { "type": "equals", "lhs": "${hostSystemName}", "rhs": "Windows" }
+            "inherits": [":base"],
+            "condition": { "type": "equals", "lhs": "${hostSystemName}", "rhs": "Windows" },
+            "cacheVariables": {
+                "VCPKG_TARGET_TRIPLET": "x64-windows-static-md"
+            }
         },
         {
             "name": ":linux",
