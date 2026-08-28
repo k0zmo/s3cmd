@@ -168,7 +168,7 @@ TEST_CASE("a bucket can be entered using its own region", "[integration]")
 
     TemporaryAppData app_data;
     if (*list_buckets == "denied")
-        REQUIRE(s3cmd::register_bucket(*profile, *bucket, *region));
+        REQUIRE(s3cmd::ProfileConfig(*profile).register_bucket(*bucket, *region));
 
     auto profile_path = L"\\" + s3cmd::utf8_to_wide(*profile);
     const auto bucket_name = s3cmd::utf8_to_wide(*bucket);

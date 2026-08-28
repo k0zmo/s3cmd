@@ -150,47 +150,51 @@ TEST_CASE("directory prefixes use S3 separators", "[unit]")
 TEST_CASE("bucket registry only unregisters registered buckets", "[unit]")
 {
     temporary_config();
+    const s3cmd::ProfileConfig profile("work");
 
-    REQUIRE(s3cmd::register_bucket("work", "private-bucket", "eu-central-1"));
+    REQUIRE(profile.register_bucket("private-bucket", "eu-central-1"));
 
-    const auto registered = s3cmd::registered_buckets("work");
+    const auto registered = profile.registered_buckets();
     REQUIRE(registered.contains("private-bucket"));
     CHECK(registered.at("private-bucket").region == "eu-central-1");
-    REQUIRE(s3cmd::unregister_bucket("work", "private-bucket"));
-    CHECK(s3cmd::registered_buckets("work").empty());
-    CHECK_FALSE(s3cmd::unregister_bucket("work", "private-bucket"));
+    REQUIRE(profile.unregister_bucket("private-bucket"));
+    CHECK(profile.registered_buckets().empty());
+    CHECK_FALSE(profile.unregister_bucket("private-bucket"));
 }
 
 TEST_CASE("discovered bucket regions are cached separately from registrations", "[unit]")
 {
     temporary_config();
+    const s3cmd::ProfileConfig profile("work");
     const s3cmd::BucketMap discovered{
         {"ireland-bucket", {"eu-west-1"}},
         {"singapore-bucket", {"ap-southeast-1"}},
     };
 
-    REQUIRE(s3cmd::cache_bucket_regions("work", discovered));
+    REQUIRE(profile.cache_bucket_regions(discovered));
 
-    const auto cached = s3cmd::cached_bucket_regions("work");
+    const auto cached = profile.cached_bucket_regions();
     CHECK(cached.at("ireland-bucket").region == "eu-west-1");
     CHECK(cached.at("singapore-bucket").region == "ap-southeast-1");
-    CHECK(s3cmd::registered_buckets("work").empty());
+    CHECK(profile.registered_buckets().empty());
 }
 
 TEST_CASE("registered regions override discovered regions", "[unit]")
 {
     temporary_config();
-    REQUIRE(s3cmd::cache_bucket_regions("work", {{"shared-bucket", {"us-west-2"}}}));
-    CHECK(s3cmd::bucket_region("work", "shared-bucket") == "us-west-2");
+    const s3cmd::ProfileConfig profile("work");
+    REQUIRE(profile.cache_bucket_regions({{"shared-bucket", {"us-west-2"}}}));
+    CHECK(profile.bucket_region("shared-bucket") == "us-west-2");
 
-    REQUIRE(s3cmd::register_bucket("work", "shared-bucket", "eu-west-1"));
-    CHECK(s3cmd::bucket_region("work", "shared-bucket") == "eu-west-1");
+    REQUIRE(profile.register_bucket("shared-bucket", "eu-west-1"));
+    CHECK(profile.bucket_region("shared-bucket") == "eu-west-1");
 }
 
 TEST_CASE("Region is exposed as a Total Commander content field", "[unit]")
 {
     auto& ini = temporary_config();
-    REQUIRE(s3cmd::cache_bucket_regions("work", {{"owned-bucket", {"ap-southeast-1"}}}));
+    const s3cmd::ProfileConfig profile("work");
+    REQUIRE(profile.cache_bucket_regions({{"owned-bucket", {"ap-southeast-1"}}}));
 
     char name[32]{};
     char units[32]{};
@@ -233,7 +237,8 @@ TEST_CASE("runtime dry run completes S3 operations without side effects", "[unit
         REQUIRE(file);
         file << "[settings]\nDryRun = true\n";
     }
-    REQUIRE(s3cmd::register_bucket("work", "registered-bucket", "eu-central-1"));
+    const s3cmd::ProfileConfig profile("work");
+    REQUIRE(profile.register_bucket("registered-bucket", "eu-central-1"));
     PluginSession session;
 
     wchar_t object[] = L"\\work\\bucket\\file.txt";
@@ -261,7 +266,7 @@ TEST_CASE("runtime dry run completes S3 operations without side effects", "[unit
     CHECK(s3cmd::rename_or_move(object, copy, TRUE, TRUE, nullptr) == FS_FILE_OK);
     CHECK(s3cmd::remove_directory(registered_bucket));
     CHECK_FALSE(s3cmd::remove_directory(discovered_bucket));
-    CHECK(s3cmd::registered_buckets("work").contains("registered-bucket"));
+    CHECK(profile.registered_buckets().contains("registered-bucket"));
 }
 
 TEST_CASE("expired SSO session reports the login command on every attempt", "[unit]")

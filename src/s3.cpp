@@ -281,7 +281,7 @@ std::shared_ptr<Aws::S3::S3Client> get_client(const RemotePath& path,
     }
     else if (!path.bucket.empty())
     {
-        const auto region = bucket_region(path.profile, path.bucket);
+        const auto region = ProfileConfig(path.profile).bucket_region(path.bucket);
         if (!region.empty())
             configuration.region = region.c_str();
     }
@@ -446,7 +446,7 @@ std::vector<FindEntry> list_entries(const RemotePath& path)
             if (!outcome.IsSuccess())
             {
                 discovery_succeeded = false;
-                buckets = registered_buckets(path.profile);
+                buckets = ProfileConfig(path.profile).registered_buckets();
                 if (outcome.GetError().GetResponseCode() != Aws::Http::HttpResponseCode::FORBIDDEN)
                     log_aws_error("ListBuckets", outcome.GetError());
                 break;
@@ -468,7 +468,7 @@ std::vector<FindEntry> list_entries(const RemotePath& path)
             request.SetContinuationToken(result.GetContinuationToken());
         }
 
-        if (discovery_succeeded && !cache_bucket_regions(path.profile, buckets))
+        if (discovery_succeeded && !ProfileConfig(path.profile).cache_bucket_regions(buckets))
         {
             log_error("ListBuckets", "Cannot cache bucket regions");
         }
@@ -892,27 +892,29 @@ void reset_config()
     runtime_config.reset();
 }
 
-BucketMap registered_buckets(std::string_view profile)
+ProfileConfig::ProfileConfig(std::string_view profile) : profile_(profile) {}
+
+BucketMap ProfileConfig::registered_buckets() const
 {
     std::scoped_lock lock(config_mutex);
     const auto* config = get_config();
-    return config ? read_bucket_map(*config, "buckets", profile) : BucketMap{};
+    return config ? read_bucket_map(*config, "buckets", profile_) : BucketMap{};
 }
 
-BucketMap cached_bucket_regions(std::string_view profile)
+BucketMap ProfileConfig::cached_bucket_regions() const
 {
     std::scoped_lock lock(config_mutex);
     const auto* config = get_config();
-    return config ? read_bucket_map(*config, "regions", profile) : BucketMap{};
+    return config ? read_bucket_map(*config, "regions", profile_) : BucketMap{};
 }
 
-bool cache_bucket_regions(std::string_view profile, const BucketMap& buckets)
+bool ProfileConfig::cache_bucket_regions(const BucketMap& buckets) const
 {
     std::scoped_lock lock(config_mutex);
     auto* config = get_config();
     if (!config)
         return false;
-    cache_bucket_regions_in_config(*config, profile, buckets);
+    cache_bucket_regions_in_config(*config, profile_, buckets);
     if (write_config(config_file(), *config))
         return true;
     runtime_config = read_config(config_file());
@@ -942,31 +944,31 @@ std::string discover_bucket_region(std::string_view profile, std::string_view bu
     return {region.data(), region.size()};
 }
 
-std::string bucket_region(std::string_view profile, std::string_view bucket)
+std::string ProfileConfig::bucket_region(std::string_view bucket) const
 {
     std::scoped_lock lock(config_mutex);
     const auto* config = get_config();
-    return config ? bucket_region_from_config(*config, profile, bucket) : std::string{};
+    return config ? bucket_region_from_config(*config, profile_, bucket) : std::string{};
 }
 
-bool register_bucket(std::string_view profile, std::string_view bucket, std::string_view region)
+bool ProfileConfig::register_bucket(std::string_view bucket, std::string_view region) const
 {
     std::scoped_lock lock(config_mutex);
     auto* config = get_config();
     if (!config)
         return false;
-    table_at(table_at(*config, "buckets"), profile).insert_or_assign(bucket, region);
+    table_at(table_at(*config, "buckets"), profile_).insert_or_assign(bucket, region);
     if (write_config(config_file(), *config))
         return true;
     runtime_config = read_config(config_file());
     return false;
 }
 
-bool unregister_bucket(std::string_view profile, std::string_view bucket)
+bool ProfileConfig::unregister_bucket(std::string_view bucket) const
 {
     std::scoped_lock lock(config_mutex);
     auto* config = get_config();
-    auto* buckets = config ? profile_table(*config, "buckets", profile) : nullptr;
+    auto* buckets = config ? profile_table(*config, "buckets", profile_) : nullptr;
     if (!buckets || !buckets->erase(bucket))
         return false;
     if (write_config(config_file(), *config))
@@ -1173,7 +1175,7 @@ BOOL make_directory(wchar_t* remote_name)
             {
                 return TRUE;
             }
-            return register_bucket(path.profile, path.bucket, region);
+            return ProfileConfig(path.profile).register_bucket(path.bucket, region);
         }
 
         const RemotePath marker{path.profile, path.bucket, directory_prefix(path)};
@@ -1226,8 +1228,8 @@ BOOL remove_directory(wchar_t* remote_name)
             const auto is_dry = is_dry_run();
             log_operation("UnregisterBucket", path, is_dry);
             if (is_dry)
-                return registered_buckets(path.profile).contains(path.bucket);
-            return unregister_bucket(path.profile, path.bucket);
+                return ProfileConfig(path.profile).registered_buckets().contains(path.bucket);
+            return ProfileConfig(path.profile).unregister_bucket(path.bucket);
         }
 
         const auto prefix = directory_prefix(path);
@@ -1329,7 +1331,7 @@ int content_get_value(wchar_t* file_name, int field_index, void* field_value, in
     if (path.profile.empty() || path.bucket.empty() || !path.key.empty())
         return ft_fieldempty;
 
-    const auto region = bucket_region(path.profile, path.bucket);
+    const auto region = ProfileConfig(path.profile).bucket_region(path.bucket);
     if (region.empty())
         return ft_fieldempty;
 

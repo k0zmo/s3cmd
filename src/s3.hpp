@@ -31,13 +31,23 @@ std::string directory_prefix(const RemotePath& path);
 // Function called only in tests
 void reset_config();
 
-BucketMap registered_buckets(std::string_view profile);
-BucketMap cached_bucket_regions(std::string_view profile);
-bool cache_bucket_regions(std::string_view profile, const BucketMap& buckets);
-std::string bucket_region(std::string_view profile, std::string_view bucket);
+class ProfileConfig
+{
+public:
+    explicit ProfileConfig(std::string_view profile);
+
+    BucketMap registered_buckets() const;
+    BucketMap cached_bucket_regions() const;
+    bool cache_bucket_regions(const BucketMap& buckets) const;
+    std::string bucket_region(std::string_view bucket) const;
+    bool register_bucket(std::string_view bucket, std::string_view region) const;
+    bool unregister_bucket(std::string_view bucket) const;
+
+private:
+    std::string profile_;
+};
+
 std::string discover_bucket_region(std::string_view profile, std::string_view bucket);
-bool register_bucket(std::string_view profile, std::string_view bucket, std::string_view region);
-bool unregister_bucket(std::string_view profile, std::string_view bucket);
 
 // Plugin API implementation
 int initialize(int number, tProgressProcW progress, tLogProcW log, tRequestProcW request);
