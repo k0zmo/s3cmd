@@ -1,4 +1,5 @@
 #include "s3.hpp"
+#include "log.hpp"
 #include "utils.hpp"
 
 #include <aws/core/Aws.h>
@@ -309,10 +310,11 @@ std::shared_ptr<Aws::S3::S3Client> get_client(const RemotePath& path,
         const SsoLoginRequired error(path.profile);
         if (request_proc)
         {
-            auto title = std::wstring(L"Amazon S3");
-            auto message = utf8_to_wide(error.what());
+            const auto title = std::wstring(L"Amazon S3");
+            const auto message = utf8_to_wide(error.what());
             std::array<wchar_t, 1> ignored{};
-            request_proc(plugin_number, RT_MsgOK, title.data(), message.data(), ignored.data(),
+            request_proc(plugin_number, RT_MsgOK, const_cast<wchar_t*>(title.data()),
+                         const_cast<wchar_t*>(message.data()), ignored.data(),
                          static_cast<int>(ignored.size()));
         }
         throw error;
@@ -320,19 +322,13 @@ std::shared_ptr<Aws::S3::S3Client> get_client(const RemotePath& path,
     return entry->client;
 }
 
-void log_message(int type, std::wstring message)
-{
-    if (log_proc)
-        log_proc(plugin_number, type, message.data());
-    OutputDebugStringW(std::format(L"[s3cmd] {}", message).c_str());
-}
-
 void log_error(std::string_view operation, std::string_view message)
 {
-    auto text = utf8_to_wide(operation);
-    text += L": ";
-    text += utf8_to_wide(message);
-    log_message(MSGTYPE_IMPORTANTERROR, std::move(text));
+    const auto text = std::format("{}: {}", operation, message);
+    if (log_proc)
+        log_proc(plugin_number, MSGTYPE_IMPORTANTERROR, utf8_to_wide(text).data());
+
+    log("[s3cmd] {}", text);
 }
 
 template <class Error>
@@ -348,21 +344,14 @@ void log_unexpected(std::string_view operation, const std::exception& error)
 
 void log_operation(std::string_view operation, const RemotePath& path, bool dry)
 {
-    const auto message = std::format(L"[s3cmd] operation={} dry={} profile={} bucket={} key={}\n",
-                                     utf8_to_wide(operation), dry, utf8_to_wide(path.profile),
-                                     utf8_to_wide(path.bucket), utf8_to_wide(path.key));
-    OutputDebugStringW(message.c_str());
+    log("[s3cmd] operation={} dry={} profile={} bucket={} key={}", operation, dry, path.profile,
+        path.bucket, path.key);
 }
 
 void log_local_operation(std::string_view operation, const wchar_t* path, bool dry)
 {
-    const auto message = std::format(L"[s3cmd] operation={} dry={} path={}\n",
-                                     utf8_to_wide(operation), dry, path);
-    OutputDebugStringW(message.c_str());
+    log("[s3cmd] operation={} dry={} path={}", operation, dry, wide_to_utf8(path));
 }
-
-
-
 
 bool report_progress(const wchar_t* source, const wchar_t* target, int percent)
 {
@@ -807,9 +796,7 @@ bool ProfileConfig::unregister_bucket(std::string_view bucket) const
 
 int initialize(int number, tProgressProcW progress, tLogProcW log, tRequestProcW request)
 {
-    OutputDebugStringW(std::format(L"[s3cmd] Initialize called, plugin={}, thread={}", number,
-                                   GetCurrentThreadId())
-                           .c_str());
+    s3cmd::log("[s3cmd] Initialize called, plugin={}, thread={}", number, GetCurrentThreadId());
 
     std::unique_lock lock(aws_lifecycle_mutex);
     if (!aws_initialized)
@@ -832,8 +819,7 @@ int initialize(int number, tProgressProcW progress, tLogProcW log, tRequestProcW
 
 void shutdown()
 {
-    OutputDebugStringW(
-        std::format(L"[s3cmd] Shutdown called, thread={}", GetCurrentThreadId()).c_str());
+    log("[s3cmd] Shutdown called, thread={}", GetCurrentThreadId());
 
     std::unique_lock lock(aws_lifecycle_mutex);
     reset_config();
@@ -997,8 +983,7 @@ try
     const auto size = std::filesystem::file_size(local_name, error);
     if (error)
         return FS_FILE_READERROR;
-    // ponytail: single-part upload stops at S3's 5 GiB limit; use TransferManager
-    // when larger uploads are actually needed.
+    // FIXME: single-part upload stops at S3's 5 GiB limit
     if (size > max_single_part_size)
         return FS_FILE_NOTSUPPORTED;
     if (report_progress(local_name, remote_name, 0))
@@ -1238,7 +1223,7 @@ try
     if (info && info->SizeHigh == 0xFFFFFFFF)
         return FS_FILE_NOTSUPPORTED;
     const auto size = info ? (static_cast<std::uint64_t>(info->SizeHigh) << 32) | info->SizeLow : 0;
-    // ponytail: CopyObject is limited to 5 GiB and only reports 0%/100%; use
+    // FIXME: CopyObject is limited to 5 GiB and only reports 0%/100%; use
     // multipart copy when larger objects or intermediate progress are needed.
     if (size > max_single_part_size)
         return FS_FILE_NOTSUPPORTED;
@@ -1271,7 +1256,6 @@ try
     Aws::S3::Model::CopyObjectRequest copy;
     copy.SetBucket(target.bucket.c_str());
     copy.SetKey(target.key.c_str());
-    // CopyObjectRequest URL-encodes this value when serializing the header.
     auto copy_source = std::format("{}/{}", source.bucket, source.key);
     copy.SetCopySource(std::move(copy_source));
     const auto copy_outcome = target_client->CopyObject(copy);
