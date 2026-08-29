@@ -130,21 +130,21 @@ TEST_CASE("AWS SDK lifecycle is idempotent on its owner thread", "[unit]")
 
 TEST_CASE("remote paths identify profile, bucket, and object", "[unit]")
 {
-    CHECK(s3cmd::parse_remote_path(L"\\") == s3cmd::RemotePath{});
-    CHECK(s3cmd::parse_remote_path(L"\\work") == s3cmd::RemotePath{"work", {}, {}});
-    CHECK(s3cmd::parse_remote_path(L"\\work\\my-bucket") ==
+    CHECK(s3cmd::RemotePath::make(L"\\") == s3cmd::RemotePath{});
+    CHECK(s3cmd::RemotePath::make(L"\\work") == s3cmd::RemotePath{"work", {}, {}});
+    CHECK(s3cmd::RemotePath::make(L"\\work\\my-bucket") ==
           s3cmd::RemotePath{"work", "my-bucket", {}});
-    CHECK(s3cmd::parse_remote_path(L"\\work\\my-bucket\\one\\two.txt") ==
+    CHECK(s3cmd::RemotePath::make(L"\\work\\my-bucket\\one\\two.txt") ==
           s3cmd::RemotePath{"work", "my-bucket", "one/two.txt"});
-    CHECK(s3cmd::parse_remote_path(L"\\\\work\\my-bucket\\one\\\\") ==
+    CHECK(s3cmd::RemotePath::make(L"\\\\work\\my-bucket\\one\\\\") ==
           s3cmd::RemotePath{"work", "my-bucket", "one"});
 }
 
 TEST_CASE("directory prefixes use S3 separators", "[unit]")
 {
-    CHECK(s3cmd::directory_prefix({"work", "bucket", ""}).empty());
-    CHECK(s3cmd::directory_prefix({"work", "bucket", "one/two"}) == "one/two/");
-    CHECK(s3cmd::directory_prefix({"work", "bucket", "one/two/"}) == "one/two/");
+    CHECK(s3cmd::RemotePath{"work", "bucket", ""}.directory_prefix().empty());
+    CHECK(s3cmd::RemotePath{"work", "bucket", "one/two"}.directory_prefix() == "one/two/");
+    CHECK(s3cmd::RemotePath{"work", "bucket", "one/two/"}.directory_prefix() == "one/two/");
 }
 
 TEST_CASE("bucket registry only unregisters registered buckets", "[unit]")
