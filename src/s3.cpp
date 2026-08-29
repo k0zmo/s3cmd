@@ -459,27 +459,6 @@ bool remote_exists(Aws::S3::S3Client& client, const RemotePath& path)
     throw std::runtime_error(outcome.GetError().GetMessage().c_str());
 }
 
-// Show the user prompt, asking user the for region for the just manually registered bucket
-bool request_region(std::string_view profile, std::string& region)
-{
-    if (!request_proc)
-        return !region.empty();
-
-    std::array<wchar_t, 128> value{};
-    const auto default_region = utf8_to_wide(region);
-    std::copy_n(default_region.data(), std::min(default_region.size(), value.size() - 1),
-                value.data());
-
-    std::wstring title = L"Register S3 bucket";
-    std::wstring prompt = std::format(L"Region for AWS profile '{}:", utf8_to_wide(profile));
-    if (!request_proc(plugin_number, RT_Other, title.data(), prompt.data(), value.data(),
-                      static_cast<int>(value.size())))
-        return false;
-
-    region = wide_to_utf8(value.data());
-    return !region.empty();
-}
-
 class FindState
 {
 public:
@@ -1103,8 +1082,25 @@ try
                 AwsLease lease;
                 region = profile_region(path.profile);
             }
-            
-            if (!request_region(path.profile, region))
+
+            if (request_proc)
+            {
+                std::array<wchar_t, 128> value{};
+                const auto default_region = utf8_to_wide(region);
+                std::copy_n(default_region.data(),
+                            std::min(default_region.size(), value.size() - 1), value.data());
+
+                std::wstring title = L"Register S3 bucket";
+                std::wstring prompt =
+                    std::format(L"Region for AWS profile '{}:", utf8_to_wide(path.profile));
+                if (!request_proc(plugin_number, RT_Other, title.data(), prompt.data(),
+                                  value.data(), static_cast<int>(value.size())))
+                    return false;
+
+                region = wide_to_utf8(value.data());
+            }
+
+            if (region.empty())
                 return false;
         }
         const auto is_dry = is_dry_run();
