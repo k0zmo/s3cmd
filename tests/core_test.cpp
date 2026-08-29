@@ -140,6 +140,42 @@ TEST_CASE("remote paths identify profile, bucket, and object", "[unit]")
           s3cmd::RemotePath{"work", "my-bucket", "one"});
 }
 
+TEST_CASE("virtual deletes skip recursive directory listings", "[unit]")
+{
+    temporary_config();
+    const s3cmd::ProfileConfig config("work");
+    REQUIRE(config.register_bucket("bucket", "eu-central-1"));
+
+    wchar_t root[] = L"\\";
+    wchar_t profile[] = L"\\work";
+    wchar_t bucket[] = L"\\work\\bucket";
+    WIN32_FIND_DATAW entry{};
+
+    s3cmd::status_info(root, FS_STATUS_START, FS_STATUS_OP_DELETE);
+    SetLastError(ERROR_SUCCESS);
+    CHECK(s3cmd::find_first(profile, &entry) == INVALID_HANDLE_VALUE);
+    CHECK(GetLastError() == ERROR_NO_MORE_FILES);
+    CHECK_FALSE(s3cmd::remove_directory(profile));
+    s3cmd::status_info(root, FS_STATUS_END, FS_STATUS_OP_DELETE);
+
+    s3cmd::status_info(profile, FS_STATUS_START, FS_STATUS_OP_DELETE);
+    SetLastError(ERROR_SUCCESS);
+    CHECK(s3cmd::find_first(bucket, &entry) == INVALID_HANDLE_VALUE);
+    CHECK(GetLastError() == ERROR_NO_MORE_FILES);
+    CHECK(s3cmd::remove_directory(bucket));
+    CHECK_FALSE(config.registered_buckets().contains("bucket"));
+    s3cmd::status_info(profile, FS_STATUS_END, FS_STATUS_OP_DELETE);
+
+    REQUIRE(config.register_bucket("discovered-bucket", "eu-central-1"));
+    config.set_discovered_buckets({{"discovered-bucket", {"us-west-2"}}});
+    wchar_t discovered_bucket[] = L"\\work\\discovered-bucket";
+
+    s3cmd::status_info(profile, FS_STATUS_START, FS_STATUS_OP_DELETE);
+    CHECK_FALSE(s3cmd::remove_directory(discovered_bucket));
+    CHECK(config.registered_buckets().contains("discovered-bucket"));
+    s3cmd::status_info(profile, FS_STATUS_END, FS_STATUS_OP_DELETE);
+}
+
 TEST_CASE("directory prefixes use S3 separators", "[unit]")
 {
     CHECK(s3cmd::RemotePath{"work", "bucket", ""}.directory_prefix().empty());

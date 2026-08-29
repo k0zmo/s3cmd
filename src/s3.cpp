@@ -93,14 +93,9 @@ private:
 std::mutex config_mtx;
 std::optional<RuntimeConfig> runtime_config;
 
-enum class DeleteMode
-{
-    normal,
-    unregister_buckets,
-    protect_profiles,
-};
-
-thread_local DeleteMode delete_mode = DeleteMode::normal;
+// Total Commander recursively lists directories before calling FsRemoveDir. Profiles and buckets
+// are virtual directories, so their delete operations must see an empty listing.
+thread_local bool suppress_delete_listing{};
 
 struct ClientEntry
 {
@@ -832,6 +827,12 @@ void shutdown()
 
 HANDLE find_first(const wchar_t* path, WIN32_FIND_DATAW* find_data)
 {
+    if (suppress_delete_listing)
+    {
+        SetLastError(ERROR_NO_MORE_FILES);
+        return INVALID_HANDLE_VALUE;
+    }
+
     try
     {
         auto state = std::make_unique<FindState>(RemotePath::make(path));
@@ -876,14 +877,12 @@ void status_info(const wchar_t* remote_directory, int start_end, int operation)
         return;
     if (start_end == FS_STATUS_END)
     {
-        delete_mode = DeleteMode::normal;
+        suppress_delete_listing = false;
         return;
     }
 
     const auto path = RemotePath::make(remote_directory);
-    delete_mode = path.profile.empty()
-                      ? DeleteMode::protect_profiles
-                      : path.bucket.empty() ? DeleteMode::unregister_buckets : DeleteMode::normal;
+    suppress_delete_listing = path.bucket.empty();
 }
 
 int get_file(const wchar_t* remote_name, const wchar_t* local_name, int copy_flags,
@@ -1047,9 +1046,6 @@ catch (const std::exception& error)
 bool delete_file(const wchar_t* remote_name)
 try
 {
-    if (delete_mode != DeleteMode::normal)
-        return true;
-
     const auto path = RemotePath::make(remote_name);
     if (path.profile.empty() || path.bucket.empty() || path.key.empty())
         return false;
@@ -1170,18 +1166,11 @@ try
     if (path.profile.empty() || path.bucket.empty())
         return false;
 
-    // Top-level profile and bucket directories are virtual links. During
-    // recursive deletion, never pass the delete through to their S3 contents.
-    if (delete_mode == DeleteMode::protect_profiles)
-        return true;
-    if (delete_mode == DeleteMode::unregister_buckets)
-    {
-        if (!path.key.empty())
-            return true;
-    }
-
     if (path.key.empty())
     {
+        if (ProfileConfig(path.profile).has_discovered_buckets())
+            return false;
+
         const auto is_dry = is_dry_run();
         log_operation("UnregisterBucket", path, is_dry);
         if (is_dry)
