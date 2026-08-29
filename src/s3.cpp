@@ -555,6 +555,7 @@ private:
     void list_buckets(const RemotePath& path)
     {
         BucketMap buckets;
+        bool discovered{};
         // Force us-east-1 region because global endpoint returns the original bucket creation time
         // whereas regional replicas return their last metadata replication time in the CreationDate
         // field.
@@ -573,6 +574,7 @@ private:
                 break;
             }
 
+            discovered = true;
             const auto& result = outcome.GetResult();
             for (const auto& bucket : result.GetBuckets())
             {
@@ -589,7 +591,8 @@ private:
             request.SetContinuationToken(result.GetContinuationToken());
         }
 
-        ProfileConfig(path.profile).set_discovered_buckets(buckets);
+        // We either want to list discovered buckets, or registered, never both
+        ProfileConfig(path.profile).set_discovered_buckets(discovered ? buckets : BucketMap{});
 
         for (const auto& [name, bucket] : buckets)
             append_entry(name, true, 0, bucket.created);
@@ -720,6 +723,14 @@ BucketMap ProfileConfig::registered_buckets() const
     const auto profile = config.profiles.find(profile_);
     return profile == config.profiles.end() ? BucketMap{}
                                             : profile->second.registered_buckets;
+}
+
+bool ProfileConfig::has_discovered_buckets() const
+{
+    std::scoped_lock lock(config_mtx);
+    const auto& config = RuntimeConfig::get();
+    const auto profile = config.profiles.find(profile_);
+    return profile != config.profiles.end() && !profile->second.discovered_buckets.empty();
 }
 
 void ProfileConfig::set_discovered_buckets(BucketMap buckets) const
@@ -1075,9 +1086,22 @@ try
 
     if (path.key.empty())
     {
+        const ProfileConfig profile(path.profile);
+
+        // Don't allow bucket registration is the profile already lists remote buckets.
+        // Also, check for already registered bucket
+        if (profile.has_discovered_buckets() ||
+            profile.registered_buckets().contains(path.bucket))
+        {
+            return false;
+        }
+
+        // Try to discover a bucket region
         auto region = discover_bucket_region(path.profile, path.bucket);
         if (region.empty())
         {
+            // Can't do, let's ask the user to provide it manually,
+            // with profile's default region being the default option
             {
                 AwsLease lease;
                 region = profile_region(path.profile);
@@ -1100,6 +1124,7 @@ try
                 region = wide_to_utf8(value.data());
             }
 
+            // Still no region, early-return with an error
             if (region.empty())
                 return false;
         }
@@ -1109,7 +1134,7 @@ try
         {
             return true;
         }
-        return ProfileConfig(path.profile).register_bucket(path.bucket, region);
+        return profile.register_bucket(path.bucket, region);
     }
 
     const RemotePath marker{path.profile, path.bucket, path.directory_prefix()};

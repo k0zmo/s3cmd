@@ -187,6 +187,29 @@ TEST_CASE("discovered bucket regions remain in memory", "[unit]")
     CHECK_FALSE(std::filesystem::exists(ini.path));
 }
 
+TEST_CASE("bucket registration is disabled when buckets were discovered", "[unit]")
+{
+    temporary_config();
+    const s3cmd::ProfileConfig profile("work");
+    profile.set_discovered_buckets({{"discovered-bucket", {"eu-west-1"}}});
+    PluginSession session;
+
+    wchar_t bucket[] = L"\\work\\new-bucket";
+    CHECK_FALSE(s3cmd::make_directory(bucket));
+    CHECK_FALSE(profile.registered_buckets().contains("new-bucket"));
+}
+
+TEST_CASE("bucket registration rejects an already registered bucket", "[unit]")
+{
+    temporary_config();
+    const s3cmd::ProfileConfig profile("work");
+    REQUIRE(profile.register_bucket("registered-bucket", "eu-central-1"));
+    PluginSession session;
+
+    wchar_t bucket[] = L"\\work\\registered-bucket";
+    CHECK_FALSE(s3cmd::make_directory(bucket));
+}
+
 TEST_CASE("registered regions override discovered regions", "[unit]")
 {
     temporary_config();
