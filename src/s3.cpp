@@ -53,6 +53,8 @@
 #include <utility>
 #include <vector>
 
+using namespace std::string_view_literals;
+
 namespace s3cmd {
 
 namespace {
@@ -63,13 +65,35 @@ tProgressProcW progress_proc{};
 tLogProcW log_proc{};
 tRequestProcW request_proc{};
 
-std::shared_mutex aws_lifecycle_mutex;
-std::mutex client_mutex;
-std::mutex config_mutex;
+std::shared_mutex aws_lifecycle_mtx;
 Aws::SDKOptions aws_options;
 DWORD aws_init_thread_id{};
 bool aws_initialized{};
-std::optional<toml::table> runtime_config;
+
+// All operations on RuntimeConfig requires a `config_mtx` mutex to be held
+struct RuntimeConfig
+{
+    static RuntimeConfig& get();
+
+    // Mirror the current config on the disk, at `path()`
+    bool flush_to_disk();
+
+    struct ProfileSettings
+    {
+        BucketMap registered_buckets;
+        BucketMap cached_bucket_regions;
+    };
+
+    bool dry_run{};
+    std::map<std::string, ProfileSettings, std::less<>> profiles;
+
+private:
+    // Returns a path to the config file
+    static const std::filesystem::path& path();
+};
+
+std::mutex config_mtx;
+std::optional<RuntimeConfig> runtime_config;
 
 enum class DeleteMode
 {
@@ -80,13 +104,24 @@ enum class DeleteMode
 
 thread_local DeleteMode delete_mode = DeleteMode::normal;
 
+struct ClientEntry
+{
+    std::shared_ptr<Aws::Auth::AWSCredentialsProvider> credentials;
+    std::shared_ptr<Aws::S3::S3Client> client;
+    bool uses_sso{};
+};
+
+std::mutex client_mutex;
+using ClientKey = std::pair<std::string, std::string>; // (profile, region)
+std::map<ClientKey, std::shared_ptr<ClientEntry>> clients;
+
 // AwsLease has two jobs:
 // 1. Verify the SDK is initialized.
 // 2. Hold a shared lifecycle lock for the entire AWS operation.
 // Multiple operations can hold it concurrently, but shutdown() needs the exclusive lock.
 struct AwsLease
 {
-    AwsLease() : lock(aws_lifecycle_mutex)
+    AwsLease() : lock(aws_lifecycle_mtx)
     {
         if (!aws_initialized)
             throw std::runtime_error("AWS SDK is not initialized");
@@ -110,19 +145,103 @@ public:
     }
 };
 
-struct ClientEntry
+std::optional<toml::table> read_document(const std::filesystem::path& file_path)
 {
-    std::shared_ptr<Aws::Auth::AWSCredentialsProvider> credentials;
-    std::shared_ptr<Aws::S3::S3Client> client;
-    bool uses_sso{};
-};
+    try
+    {
+        std::ifstream input{file_path};
+        if (input)
+            return toml::parse(input);
+    }
+    catch (const toml::parse_error&)
+    {
+    }
+    return std::nullopt;
+}
 
-using ClientKey = std::pair<std::string, std::string>; // (profile, region)
-std::map<ClientKey, std::shared_ptr<ClientEntry>> clients;
-
-const std::filesystem::path& config_file()
+bool write_document(const toml::table& document, const std::filesystem::path& file_path)
 {
-    static std::filesystem::path path = [] {
+    std::error_code ec;
+    std::filesystem::create_directories(file_path.parent_path(), ec);
+    if (ec)
+        return false;
+
+    std::ofstream output(file_path, std::ios::trunc);
+    return output && (output << document) && output.flush();
+}
+
+RuntimeConfig& RuntimeConfig::get()
+{
+    if (runtime_config)
+        return *runtime_config;
+    runtime_config.emplace();
+
+    if (auto document = read_document(path()))
+    {
+        // Deserialize TOML document into RuntimeConfig
+        runtime_config->dry_run = (*document)["settings"]["DryRun"].value_or(false);
+
+        for (const auto kind : {"buckets"sv, "regions"sv})
+        {
+            const toml::table* profiles = document->get_as<toml::table>(kind);
+            if (!profiles)
+                continue;
+
+            for (const auto& [name, profile] : *profiles)
+            {
+                if (!profile.is_table())
+                    continue;
+                auto& settings = runtime_config->profiles[std::string(name.str())];
+                auto& fields = kind == "buckets"sv ? settings.registered_buckets
+                                                   : settings.cached_bucket_regions;
+                for (const auto& [bucket, region] : *profile.as_table())
+                {
+                    if (const auto value = region.value<std::string>())
+                        fields.emplace(bucket.str(), BucketInfo{*value});
+                }
+            }
+        }
+    }
+
+    return *runtime_config;
+}
+
+bool RuntimeConfig::flush_to_disk()
+{
+    // Serialize our config to TOML document and write it to disk
+    toml::table document;
+    document.emplace("settings", toml::table{{"DryRun", dry_run}});
+
+    for (const auto kind : {"buckets"sv, "regions"sv})
+    {
+        toml::table section;
+
+        for (const auto& [profile_name, profile] : profiles)
+        {
+            const auto& fields = kind == "buckets"sv ? profile.registered_buckets 
+                                                     : profile.cached_bucket_regions;
+            if (fields.empty())
+                continue;
+
+            toml::table bucket_map;
+            for (const auto& [bucket_name, bucket_info] : fields)
+            {
+                bucket_map.emplace(bucket_name, bucket_info.region);
+            }
+
+            section.emplace(profile_name, std::move(bucket_map));
+        }
+
+        if (!section.empty())
+            document.emplace(kind, std::move(section));
+    }
+    
+    return write_document(document, path());
+}
+
+const std::filesystem::path& RuntimeConfig::path()
+{
+    static std::filesystem::path value = [] {
 #ifdef _WIN32
         wchar_t* app_data{};
         std::size_t size{};
@@ -132,8 +251,8 @@ const std::filesystem::path& config_file()
             std::free(app_data);
             throw std::runtime_error("APPDATA is not set");
         }
-        const std::unique_ptr<wchar_t, decltype(&std::free)> value(app_data, &std::free);
-        return std::filesystem::path(value.get()) / L"s3cmd" / L"s3cmd.toml";
+        std::unique_ptr<wchar_t, decltype(&std::free)> releaser(app_data, &std::free);
+        return std::filesystem::path(releaser.get()) / L"s3cmd" / L"s3cmd.toml";
 #else
         if (const auto* config_home = std::getenv("XDG_CONFIG_HOME"); config_home && *config_home)
             return std::filesystem::path(config_home) / "s3cmd" / "s3cmd.toml";
@@ -142,118 +261,13 @@ const std::filesystem::path& config_file()
         throw std::runtime_error("XDG_CONFIG_HOME and HOME are not set");
 #endif
     }();
-    return path;
-}
-
-std::optional<toml::table> read_config(const std::filesystem::path& file)
-{
-    std::ifstream input{file};
-    if (!input)
-    {
-        std::error_code ec;
-        if (!std::filesystem::exists(file, ec) && !ec)
-        {
-            // Config file does not exist
-            return toml::table{};
-        }
-        // Config path exists but for some reason cannot be opened
-        return std::nullopt;
-    }
-
-    try
-    {
-        return toml::parse(input);
-    }
-    catch (const toml::parse_error&)
-    {
-        return std::nullopt;
-    }
-}
-
-bool write_config(const std::filesystem::path& file, const toml::table& config)
-{
-    std::error_code ec;
-    std::filesystem::create_directories(file.parent_path(), ec);
-    if (ec)
-        return false;
-
-    std::ofstream output(file, std::ios::trunc);
-    return output && (output << config) && output.flush();
-}
-
-toml::table* get_config()
-{
-    if (!runtime_config)
-        runtime_config = read_config(config_file());
-    return runtime_config ? &*runtime_config : nullptr;
-}
-
-// Returns config[kind][profile] as a table (in TOML, [kind.profile]),
-// or nullptr if it is missing or has a different/invalid type.
-template <typename Config> // Config is `(const) toml::table`
-auto profile_table(Config& config, std::string_view kind, std::string_view profile)
-{
-    auto* profiles = config.template get_as<toml::table>(kind);
-    return profiles ? profiles->template get_as<toml::table>(profile) : nullptr;
-}
-
-toml::table& table_at(toml::table& parent, std::string_view key)
-{
-    if (auto* table = parent.get_as<toml::table>(key))
-        return *table;
-    // Key does not exist, insert empty table as its value
-    parent.insert_or_assign(key, toml::table{});
-    return *parent.get_as<toml::table>(key);
-}
-
-BucketMap read_bucket_map(const toml::table& config, std::string_view kind,
-                          std::string_view profile)
-{
-    const auto* values = profile_table(config, kind, profile);
-    BucketMap buckets;
-    if (!values)
-        return buckets;
-
-    for (const auto& [bucket, value] : *values)
-    {
-        if (const auto region = value.value<std::string>())
-            buckets.emplace(bucket.str(), BucketInfo{*region});
-    }
-    return buckets;
-}
-
-std::string bucket_region_from_config(const toml::table& config, std::string_view profile,
-                                      std::string_view bucket)
-{
-    for (const auto kind : {"buckets", "regions"})
-    {
-        const auto* values = profile_table(config, kind, profile);
-        if (values)
-        {
-            if (const auto region = (*values)[bucket].value<std::string>())
-                return *region;
-        }
-    }
-    return {};
+    return value;
 }
 
 bool is_dry_run()
 {
-    std::scoped_lock lock(config_mutex);
-    const auto* config = get_config();
-    return config && (*config)["settings"]["DryRun"].value_or(false);
-}
-
-void cache_bucket_regions_in_config(toml::table& config, std::string_view profile,
-                                    const BucketMap& buckets)
-{
-    toml::table regions;
-    for (const auto& [bucket, info] : buckets)
-    {
-        if (!info.region.empty())
-            regions.insert_or_assign(bucket, info.region);
-    }
-    table_at(config, "regions").insert_or_assign(profile, std::move(regions));
+    std::scoped_lock lock(config_mtx);
+    return RuntimeConfig::get().dry_run;
 }
 
 std::string profile_region(std::string_view profile)
@@ -706,7 +720,7 @@ std::string RemotePath::directory_prefix() const
 
 void reset_config()
 {
-    std::scoped_lock lock(config_mutex);
+    std::scoped_lock lock(config_mtx);
     runtime_config.reset();
 }
 
@@ -736,61 +750,71 @@ std::string discover_bucket_region(std::string_view profile, std::string_view bu
 
 BucketMap ProfileConfig::registered_buckets() const
 {
-    std::scoped_lock lock(config_mutex);
-    const auto* config = get_config();
-    return config ? read_bucket_map(*config, "buckets", profile_) : BucketMap{};
+    std::scoped_lock lock(config_mtx);
+    const auto& config = RuntimeConfig::get();
+    const auto profile = config.profiles.find(profile_);
+    return profile == config.profiles.end() ? BucketMap{}
+                                            : profile->second.registered_buckets;
 }
 
 BucketMap ProfileConfig::cached_bucket_regions() const
 {
-    std::scoped_lock lock(config_mutex);
-    const auto* config = get_config();
-    return config ? read_bucket_map(*config, "regions", profile_) : BucketMap{};
+    std::scoped_lock lock(config_mtx);
+    const auto& config = RuntimeConfig::get();
+    const auto profile = config.profiles.find(profile_);
+    return profile == config.profiles.end() ? BucketMap{}
+                                            : profile->second.cached_bucket_regions;
 }
 
 bool ProfileConfig::cache_bucket_regions(const BucketMap& buckets) const
 {
-    std::scoped_lock lock(config_mutex);
-    auto* config = get_config();
-    if (!config)
-        return false;
-    cache_bucket_regions_in_config(*config, profile_, buckets);
-    if (write_config(config_file(), *config))
-        return true;
-    runtime_config = read_config(config_file());
-    return false;
+    std::scoped_lock lock(config_mtx);
+    auto& config = RuntimeConfig::get();
+    config.profiles[profile_].cached_bucket_regions = buckets;
+    return config.flush_to_disk();
 }
 
 std::string ProfileConfig::bucket_region(std::string_view bucket) const
 {
-    std::scoped_lock lock(config_mutex);
-    const auto* config = get_config();
-    return config ? bucket_region_from_config(*config, profile_, bucket) : std::string{};
+    std::scoped_lock lock(config_mtx);
+    const auto& config = RuntimeConfig::get();
+    const auto profile = config.profiles.find(profile_);
+    if (profile == config.profiles.end())
+        return {};
+
+    if (const auto registered = profile->second.registered_buckets.find(bucket);
+        registered != profile->second.registered_buckets.end())
+    {
+        return registered->second.region;
+    }
+    if (const auto cached = profile->second.cached_bucket_regions.find(bucket);
+        cached != profile->second.cached_bucket_regions.end())
+    {
+        return cached->second.region;
+    }
+
+    return {};
 }
 
 bool ProfileConfig::register_bucket(std::string_view bucket, std::string_view region) const
 {
-    std::scoped_lock lock(config_mutex);
-    auto* config = get_config();
-    if (!config)
-        return false;
-    table_at(table_at(*config, "buckets"), profile_).insert_or_assign(bucket, region);
-    if (write_config(config_file(), *config))
-        return true;
-    runtime_config = read_config(config_file());
-    return false;
+    std::scoped_lock lock(config_mtx);
+    auto& config = RuntimeConfig::get();
+    config.profiles[profile_].registered_buckets[std::string{bucket}] =
+        BucketInfo{std::string{region}};
+    return config.flush_to_disk();
 }
 
 bool ProfileConfig::unregister_bucket(std::string_view bucket) const
 {
-    std::scoped_lock lock(config_mutex);
-    auto* config = get_config();
-    auto* buckets = config ? profile_table(*config, "buckets", profile_) : nullptr;
-    if (!buckets || !buckets->erase(bucket))
-        return false;
-    if (write_config(config_file(), *config))
-        return true;
-    runtime_config = read_config(config_file());
+    std::scoped_lock lock(config_mtx);
+    auto& config = RuntimeConfig::get();
+    auto& registered = config.profiles[profile_].registered_buckets;
+    if (auto it = registered.find(bucket); it != registered.end())
+    {
+        registered.erase(it);
+        return config.flush_to_disk();
+    }
     return false;
 }
 
@@ -798,7 +822,7 @@ int initialize(int number, tProgressProcW progress, tLogProcW log, tRequestProcW
 {
     s3cmd::log("[s3cmd] Initialize called, plugin={}, thread={}", number, GetCurrentThreadId());
 
-    std::unique_lock lock(aws_lifecycle_mutex);
+    std::unique_lock lock(aws_lifecycle_mtx);
     if (!aws_initialized)
     {
         Aws::InitAPI(aws_options);
@@ -821,7 +845,7 @@ void shutdown()
 {
     log("[s3cmd] Shutdown called, thread={}", GetCurrentThreadId());
 
-    std::unique_lock lock(aws_lifecycle_mutex);
+    std::unique_lock lock(aws_lifecycle_mtx);
     reset_config();
     if (!aws_initialized)
         return;

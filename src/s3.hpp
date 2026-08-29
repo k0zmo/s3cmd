@@ -30,7 +30,7 @@ struct BucketInfo
     std::string region;
     FILETIME created{};
 };
-using BucketMap = std::map<std::string, BucketInfo>;
+using BucketMap = std::map<std::string, BucketInfo, std::less<>>;
 
 // Function called only in tests
 void reset_config();
