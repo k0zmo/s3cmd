@@ -1,4 +1,5 @@
 #include "s3.hpp"
+#include "core.hpp"
 
 #include <catch2/catch_test_macros.hpp>
 

@@ -1,5 +1,5 @@
 #include "s3.hpp"
-#include "utils.hpp"
+#include "core.hpp"
 
 #include <aws/core/Aws.h>
 #include <aws/core/auth/AWSCredentialsProviderChain.h>
@@ -170,8 +170,8 @@ TEST_CASE("a bucket can be entered using its own region", "[integration]")
     if (*list_buckets == "denied")
         REQUIRE(s3cmd::ProfileConfig(*profile).register_bucket(*bucket, *region));
 
-    auto profile_path = L"\\" + s3cmd::utf8_to_wide(*profile);
-    const auto bucket_name = s3cmd::utf8_to_wide(*bucket);
+    auto profile_path = L"\\" + s3cmd::to_wide(*profile);
+    const auto bucket_name = s3cmd::to_wide(*bucket);
     WIN32_FIND_DATAW entry{};
     auto handle = s3cmd::find_first(profile_path.data(), &entry);
     REQUIRE(handle != INVALID_HANDLE_VALUE);
@@ -187,7 +187,7 @@ TEST_CASE("a bucket can be entered using its own region", "[integration]")
     auto directory = profile_path + L"\\" + bucket_name;
     for (std::size_t index = 0; index < components.size(); ++index)
     {
-        const auto expected = s3cmd::utf8_to_wide(components[index]);
+        const auto expected = s3cmd::to_wide(components[index]);
         handle = s3cmd::find_first(directory.data(), &entry);
         REQUIRE(handle != INVALID_HANDLE_VALUE);
 

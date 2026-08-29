@@ -1,6 +1,6 @@
 #include "s3.hpp"
+#include "core.hpp"
 #include "log.hpp"
-#include "utils.hpp"
 
 #include <aws/core/Aws.h>
 #include <aws/core/auth/AWSCredentialsProvider.h>
@@ -24,8 +24,6 @@
 #include <aws/s3/model/ListObjectsV2Request.h>
 #include <aws/s3/model/PutObjectRequest.h>
 #include <toml++/toml.hpp>
-
-#include <Windows.h>
 
 #include <algorithm>
 #include <array>
@@ -250,12 +248,6 @@ const std::filesystem::path& RuntimeConfig::path()
     return value;
 }
 
-bool is_dry_run()
-{
-    std::scoped_lock lock(config_mtx);
-    return RuntimeConfig::get().dry_run;
-}
-
 std::string profile_region(std::string_view profile)
 {
     const Aws::S3::S3ClientConfiguration configuration(std::string(profile).c_str(), true);
@@ -311,7 +303,7 @@ std::shared_ptr<Aws::S3::S3Client> get_client(const RemotePath& path,
         if (request_proc)
         {
             const auto title = std::wstring(L"Amazon S3");
-            const auto message = utf8_to_wide(error.what());
+            const auto message = to_wide(error.what());
             std::array<wchar_t, 1> ignored{};
             request_proc(plugin_number, RT_MsgOK, const_cast<wchar_t*>(title.data()),
                          const_cast<wchar_t*>(message.data()), ignored.data(),
@@ -326,7 +318,7 @@ void log_error(std::string_view operation, std::string_view message)
 {
     const auto text = std::format("{}: {}", operation, message);
     if (log_proc)
-        log_proc(plugin_number, MSGTYPE_IMPORTANTERROR, utf8_to_wide(text).data());
+        log_proc(plugin_number, MSGTYPE_IMPORTANTERROR, to_wide(text).data());
 
     log("[s3cmd] {}", text);
 }
@@ -350,7 +342,7 @@ void log_operation(std::string_view operation, const RemotePath& path, bool dry)
 
 void log_local_operation(std::string_view operation, const wchar_t* path, bool dry)
 {
-    log("[s3cmd] operation={} dry={} path={}", operation, dry, wide_to_utf8(path));
+    log("[s3cmd] operation={} dry={} path={}", operation, dry, to_utf8(path));
 }
 
 bool report_progress(const wchar_t* source, const wchar_t* target, int percent)
@@ -520,7 +512,7 @@ private:
     void append_entry(std::string_view name, bool directory, std::uint64_t size = 0,
                       FILETIME modified = {})
     {
-        auto wide_name = utf8_to_wide(name);
+        auto wide_name = to_wide(name);
         if (valid_entry_name(wide_name))
             entries_.push_back({std::move(wide_name), size, modified, directory});
     }
@@ -648,67 +640,16 @@ private:
 
 } // namespace
 
-RemotePath RemotePath::make(std::wstring_view path)
-{
-    // Remove \ from the back and the front
-    while (!path.empty() && path.front() == L'\\')
-        path.remove_prefix(1);
-    while (!path.empty() && path.back() == L'\\')
-        path.remove_suffix(1);
-
-    // Check for the profile
-    const auto profile_end = path.find(L'\\');
-    const auto profile = path.substr(0, profile_end);
-    if (profile_end == std::wstring_view::npos)
-        return {wide_to_utf8(profile), {}, {}};
-
-    // Split the remaining into the bucket and the key
-    path.remove_prefix(profile_end + 1);
-    const auto bucket_end = path.find(L'\\');
-    const auto bucket = path.substr(0, bucket_end);
-    const auto key =
-        bucket_end == std::wstring_view::npos ? std::wstring_view{} : path.substr(bucket_end + 1);
-
-    auto key_utf8 = wide_to_utf8(key);
-    std::ranges::replace(key_utf8, '\\', '/');
-    return {wide_to_utf8(profile), wide_to_utf8(bucket), std::move(key_utf8)};
-}
-
-std::string RemotePath::directory_prefix() const
-{
-    if (key.empty())
-        return {};
-    return key.back() == '/' ? key : key + '/';
-}
-
 void reset_config()
 {
     std::scoped_lock lock(config_mtx);
     runtime_config.reset();
 }
 
-std::string discover_bucket_region(std::string_view profile, std::string_view bucket)
+bool is_dry_run()
 {
-    // FIXME path is needed only to log
-    const RemotePath path{std::string(profile), std::string(bucket), {}};
-    AwsLease lease;
-    auto client = get_client({std::string(profile), {}, {}});
-    Aws::S3::Model::GetBucketLocationRequest request;
-    request.SetBucket(std::string(bucket).c_str());
-    log_operation("GetBucketLocation", path, false);
-    const auto outcome = client->GetBucketLocation(request);
-    if (!outcome.IsSuccess())
-        return {};
-
-    const auto location = outcome.GetResult().GetLocationConstraint();
-    if (location == Aws::S3::Model::BucketLocationConstraint::NOT_SET)
-        return "us-east-1";
-    if (location == Aws::S3::Model::BucketLocationConstraint::EU)
-        return "eu-west-1";
-    const auto region =
-        Aws::S3::Model::BucketLocationConstraintMapper::GetNameForBucketLocationConstraint(
-            location);
-    return {region.data(), region.size()};
+    std::scoped_lock lock(config_mtx);
+    return RuntimeConfig::get().dry_run;
 }
 
 BucketMap ProfileConfig::registered_buckets() const
@@ -777,6 +718,28 @@ bool ProfileConfig::unregister_bucket(std::string_view bucket) const
         return config.flush_to_disk();
     }
     return false;
+}
+
+std::string discover_bucket_region(std::string_view profile, std::string_view bucket)
+{
+    AwsLease lease;
+    auto client = get_client({std::string(profile), {}, {}});
+    Aws::S3::Model::GetBucketLocationRequest request;
+    request.SetBucket(std::string(bucket).c_str());
+    log("[s3cmd] operation=GetBucketLocation profile={} bucket={}", profile, bucket);
+    const auto outcome = client->GetBucketLocation(request);
+    if (!outcome.IsSuccess())
+        return {};
+
+    const auto location = outcome.GetResult().GetLocationConstraint();
+    if (location == Aws::S3::Model::BucketLocationConstraint::NOT_SET)
+        return "us-east-1";
+    if (location == Aws::S3::Model::BucketLocationConstraint::EU)
+        return "eu-west-1";
+    const auto region =
+        Aws::S3::Model::BucketLocationConstraintMapper::GetNameForBucketLocationConstraint(
+            location);
+    return {region.data(), region.size()};
 }
 
 int initialize(int number, tProgressProcW progress, tLogProcW log, tRequestProcW request)
@@ -1106,18 +1069,18 @@ try
             if (request_proc)
             {
                 std::array<wchar_t, 128> value{};
-                const auto default_region = utf8_to_wide(region);
+                const auto default_region = to_wide(region);
                 std::copy_n(default_region.data(),
                             std::min(default_region.size(), value.size() - 1), value.data());
 
                 std::wstring title = L"Register S3 bucket";
                 std::wstring prompt =
-                    std::format(L"Region for AWS profile '{}:", utf8_to_wide(path.profile));
+                    std::format(L"Region for AWS profile '{}:", to_wide(path.profile));
                 if (!request_proc(plugin_number, RT_Other, title.data(), prompt.data(),
                                   value.data(), static_cast<int>(value.size())))
                     return false;
 
-                region = wide_to_utf8(value.data());
+                region = to_utf8(value.data());
             }
 
             // Still no region, early-return with an error
@@ -1343,7 +1306,7 @@ int content_get_value(const wchar_t* file_name, int field_index, void* field_val
     if (region.empty())
         return ft_fieldempty;
 
-    const auto value = utf8_to_wide(region);
+    const auto value = to_wide(region);
     auto* output = static_cast<wchar_t*>(field_value);
     const auto capacity = static_cast<std::size_t>(max_length) / sizeof(wchar_t);
     const auto length = std::min(value.size(), capacity - 1);
