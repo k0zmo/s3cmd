@@ -53,8 +53,6 @@
 #include <utility>
 #include <vector>
 
-using namespace std::string_view_literals;
-
 namespace s3cmd {
 
 namespace {
@@ -81,7 +79,7 @@ struct RuntimeConfig
     struct ProfileSettings
     {
         BucketMap registered_buckets;
-        BucketMap cached_bucket_regions;
+        BucketMap discovered_buckets;
     };
 
     bool dry_run{};
@@ -181,23 +179,18 @@ RuntimeConfig& RuntimeConfig::get()
         // Deserialize TOML document into RuntimeConfig
         runtime_config->dry_run = (*document)["settings"]["DryRun"].value_or(false);
 
-        for (const auto kind : {"buckets"sv, "regions"sv})
+        if (const auto* profiles = document->get_as<toml::table>("buckets"))
         {
-            const toml::table* profiles = document->get_as<toml::table>(kind);
-            if (!profiles)
-                continue;
-
             for (const auto& [name, profile] : *profiles)
             {
                 if (!profile.is_table())
                     continue;
-                auto& settings = runtime_config->profiles[std::string(name.str())];
-                auto& fields = kind == "buckets"sv ? settings.registered_buckets
-                                                   : settings.cached_bucket_regions;
+                auto& buckets =
+                    runtime_config->profiles[std::string(name.str())].registered_buckets;
                 for (const auto& [bucket, region] : *profile.as_table())
                 {
                     if (const auto value = region.value<std::string>())
-                        fields.emplace(bucket.str(), BucketInfo{*value});
+                        buckets.emplace(bucket.str(), BucketInfo{*value});
                 }
             }
         }
@@ -212,29 +205,22 @@ bool RuntimeConfig::flush_to_disk()
     toml::table document;
     document.emplace("settings", toml::table{{"DryRun", dry_run}});
 
-    for (const auto kind : {"buckets"sv, "regions"sv})
+    toml::table buckets;
+    for (const auto& [profile_name, profile] : profiles)
     {
-        toml::table section;
+        if (profile.registered_buckets.empty())
+            continue;
 
-        for (const auto& [profile_name, profile] : profiles)
+        toml::table bucket_map;
+        for (const auto& [bucket_name, bucket_info] : profile.registered_buckets)
         {
-            const auto& fields = kind == "buckets"sv ? profile.registered_buckets 
-                                                     : profile.cached_bucket_regions;
-            if (fields.empty())
-                continue;
-
-            toml::table bucket_map;
-            for (const auto& [bucket_name, bucket_info] : fields)
-            {
-                bucket_map.emplace(bucket_name, bucket_info.region);
-            }
-
-            section.emplace(profile_name, std::move(bucket_map));
+            bucket_map.emplace(bucket_name, bucket_info.region);
         }
 
-        if (!section.empty())
-            document.emplace(kind, std::move(section));
+        buckets.emplace(profile_name, std::move(bucket_map));
     }
+    if (!buckets.empty())
+        document.emplace("buckets", std::move(buckets));
     
     return write_document(document, path());
 }
@@ -592,13 +578,11 @@ private:
         Aws::S3::Model::ListBucketsRequest request;
         request.SetMaxBuckets(10'000);
         log_operation("ListBuckets", path, false);
-        bool discovery_succeeded = true;
         for (;;)
         {
             const auto outcome = client->ListBuckets(request);
             if (!outcome.IsSuccess())
             {
-                discovery_succeeded = false;
                 buckets = ProfileConfig(path.profile).registered_buckets();
                 if (outcome.GetError().GetResponseCode() != Aws::Http::HttpResponseCode::FORBIDDEN)
                     log_aws_error("ListBuckets", outcome.GetError());
@@ -621,10 +605,7 @@ private:
             request.SetContinuationToken(result.GetContinuationToken());
         }
 
-        if (discovery_succeeded && !ProfileConfig(path.profile).cache_bucket_regions(buckets))
-        {
-            log_error("ListBuckets", "Cannot cache bucket regions");
-        }
+        ProfileConfig(path.profile).set_discovered_buckets(buckets);
 
         for (const auto& [name, bucket] : buckets)
             append_entry(name, true, 0, bucket.created);
@@ -757,21 +738,11 @@ BucketMap ProfileConfig::registered_buckets() const
                                             : profile->second.registered_buckets;
 }
 
-BucketMap ProfileConfig::cached_bucket_regions() const
-{
-    std::scoped_lock lock(config_mtx);
-    const auto& config = RuntimeConfig::get();
-    const auto profile = config.profiles.find(profile_);
-    return profile == config.profiles.end() ? BucketMap{}
-                                            : profile->second.cached_bucket_regions;
-}
-
-bool ProfileConfig::cache_bucket_regions(const BucketMap& buckets) const
+void ProfileConfig::set_discovered_buckets(BucketMap buckets) const
 {
     std::scoped_lock lock(config_mtx);
     auto& config = RuntimeConfig::get();
-    config.profiles[profile_].cached_bucket_regions = buckets;
-    return config.flush_to_disk();
+    config.profiles[profile_].discovered_buckets = std::move(buckets);
 }
 
 std::string ProfileConfig::bucket_region(std::string_view bucket) const
@@ -787,10 +758,10 @@ std::string ProfileConfig::bucket_region(std::string_view bucket) const
     {
         return registered->second.region;
     }
-    if (const auto cached = profile->second.cached_bucket_regions.find(bucket);
-        cached != profile->second.cached_bucket_regions.end())
+    if (const auto discovered = profile->second.discovered_buckets.find(bucket);
+        discovered != profile->second.discovered_buckets.end())
     {
-        return cached->second.region;
+        return discovered->second.region;
     }
 
     return {};

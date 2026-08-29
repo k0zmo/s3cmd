@@ -162,28 +162,27 @@ TEST_CASE("bucket registry only unregisters registered buckets", "[unit]")
     CHECK_FALSE(profile.unregister_bucket("private-bucket"));
 }
 
-TEST_CASE("discovered bucket regions are cached separately from registrations", "[unit]")
+TEST_CASE("discovered bucket regions remain in memory", "[unit]")
 {
-    temporary_config();
+    auto& ini = temporary_config();
     const s3cmd::ProfileConfig profile("work");
     const s3cmd::BucketMap discovered{
         {"ireland-bucket", {"eu-west-1"}},
         {"singapore-bucket", {"ap-southeast-1"}},
     };
 
-    REQUIRE(profile.cache_bucket_regions(discovered));
-
-    const auto cached = profile.cached_bucket_regions();
-    CHECK(cached.at("ireland-bucket").region == "eu-west-1");
-    CHECK(cached.at("singapore-bucket").region == "ap-southeast-1");
+    profile.set_discovered_buckets(discovered);
+    CHECK(profile.bucket_region("ireland-bucket") == "eu-west-1");
+    CHECK(profile.bucket_region("singapore-bucket") == "ap-southeast-1");
     CHECK(profile.registered_buckets().empty());
+    CHECK_FALSE(std::filesystem::exists(ini.path));
 }
 
 TEST_CASE("registered regions override discovered regions", "[unit]")
 {
     temporary_config();
     const s3cmd::ProfileConfig profile("work");
-    REQUIRE(profile.cache_bucket_regions({{"shared-bucket", {"us-west-2"}}}));
+    profile.set_discovered_buckets({{"shared-bucket", {"us-west-2"}}});
     CHECK(profile.bucket_region("shared-bucket") == "us-west-2");
 
     REQUIRE(profile.register_bucket("shared-bucket", "eu-west-1"));
@@ -192,9 +191,9 @@ TEST_CASE("registered regions override discovered regions", "[unit]")
 
 TEST_CASE("Region is exposed as a Total Commander content field", "[unit]")
 {
-    auto& ini = temporary_config();
+    temporary_config();
     const s3cmd::ProfileConfig profile("work");
-    REQUIRE(profile.cache_bucket_regions({{"owned-bucket", {"ap-southeast-1"}}}));
+    profile.set_discovered_buckets({{"owned-bucket", {"ap-southeast-1"}}});
 
     char name[32]{};
     char units[32]{};
@@ -210,22 +209,15 @@ TEST_CASE("Region is exposed as a Total Commander content field", "[unit]")
         CHECK(s3cmd::content_get_value(bucket_path, 0, value, sizeof(value)) == ft_stringw);
         CHECK(std::wstring_view(value) == L"ap-southeast-1");
 
-        {
-            std::ofstream file(ini.path, std::ios::trunc);
-            REQUIRE(file);
-            file << "[regions.work]\nowned-bucket = \"eu-west-1\"\n";
-        }
         s3cmd::reset_config();
-        CHECK(s3cmd::content_get_value(bucket_path, 0, value, sizeof(value)) == ft_stringw);
-        CHECK(std::wstring_view(value) == L"eu-west-1");
+        CHECK(s3cmd::content_get_value(bucket_path, 0, value, sizeof(value)) == ft_fieldempty);
 
         wchar_t object_path[] = L"\\work\\owned-bucket\\file.txt";
         CHECK(s3cmd::content_get_value(object_path, 0, value, sizeof(value)) == ft_fieldempty);
     }
 
     PluginSession session;
-    CHECK(s3cmd::content_get_value(bucket_path, 0, value, sizeof(value)) == ft_stringw);
-    CHECK(std::wstring_view(value) == L"eu-west-1");
+    CHECK(s3cmd::content_get_value(bucket_path, 0, value, sizeof(value)) == ft_fieldempty);
 }
 
 TEST_CASE("runtime dry run completes S3 operations without side effects", "[unit]")

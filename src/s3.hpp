@@ -44,8 +44,7 @@ public:
     }
 
     BucketMap registered_buckets() const;
-    BucketMap cached_bucket_regions() const;
-    bool cache_bucket_regions(const BucketMap& buckets) const;
+    void set_discovered_buckets(BucketMap buckets) const;
     std::string bucket_region(std::string_view bucket) const;
     bool register_bucket(std::string_view bucket, std::string_view region) const;
     bool unregister_bucket(std::string_view bucket) const;
