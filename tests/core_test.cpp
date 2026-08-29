@@ -149,10 +149,19 @@ TEST_CASE("directory prefixes use S3 separators", "[unit]")
 
 TEST_CASE("bucket registry only unregisters registered buckets", "[unit]")
 {
-    temporary_config();
+    auto& ini = temporary_config();
     const s3cmd::ProfileConfig profile("work");
 
     REQUIRE(profile.register_bucket("private-bucket", "eu-central-1"));
+
+    std::ifstream file(ini.path);
+    REQUIRE(file);
+    bool found_profile_buckets{};
+    for (std::string line; std::getline(file, line);)
+        found_profile_buckets |= line == "[profiles.work.buckets]";
+    CHECK(found_profile_buckets);
+
+    s3cmd::reset_config();
 
     const auto registered = profile.registered_buckets();
     REQUIRE(registered.contains("private-bucket"));

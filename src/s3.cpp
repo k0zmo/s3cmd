@@ -179,18 +179,21 @@ RuntimeConfig& RuntimeConfig::get()
         // Deserialize TOML document into RuntimeConfig
         runtime_config->dry_run = (*document)["settings"]["DryRun"].value_or(false);
 
-        if (const auto* profiles = document->get_as<toml::table>("buckets"))
+        if (const auto* profiles = document->get_as<toml::table>("profiles"))
         {
             for (const auto& [name, profile] : *profiles)
             {
-                if (!profile.is_table())
+                const auto* profile_table = profile.as_table();
+                const auto* buckets =
+                    profile_table ? profile_table->get_as<toml::table>("buckets") : nullptr;
+                if (!buckets)
                     continue;
-                auto& buckets =
+                auto& registered =
                     runtime_config->profiles[std::string(name.str())].registered_buckets;
-                for (const auto& [bucket, region] : *profile.as_table())
+                for (const auto& [bucket, region] : *buckets)
                 {
                     if (const auto value = region.value<std::string>())
-                        buckets.emplace(bucket.str(), BucketInfo{*value});
+                        registered.emplace(bucket.str(), BucketInfo{*value});
                 }
             }
         }
@@ -205,7 +208,7 @@ bool RuntimeConfig::flush_to_disk()
     toml::table document;
     document.emplace("settings", toml::table{{"DryRun", dry_run}});
 
-    toml::table buckets;
+    toml::table profile_tables;
     for (const auto& [profile_name, profile] : profiles)
     {
         if (profile.registered_buckets.empty())
@@ -217,10 +220,12 @@ bool RuntimeConfig::flush_to_disk()
             bucket_map.emplace(bucket_name, bucket_info.region);
         }
 
-        buckets.emplace(profile_name, std::move(bucket_map));
+        toml::table profile_table;
+        profile_table.emplace("buckets", std::move(bucket_map));
+        profile_tables.emplace(profile_name, std::move(profile_table));
     }
-    if (!buckets.empty())
-        document.emplace("buckets", std::move(buckets));
+    if (!profile_tables.empty())
+        document.emplace("profiles", std::move(profile_tables));
     
     return write_document(document, path());
 }
