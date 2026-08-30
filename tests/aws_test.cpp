@@ -11,8 +11,11 @@
 
 #include <catch2/catch_test_macros.hpp>
 
+#include <algorithm>
 #include <cstdlib>
 #include <filesystem>
+#include <fstream>
+#include <iterator>
 #include <optional>
 #include <stdexcept>
 #include <string>
@@ -66,6 +69,8 @@ public:
         std::error_code ignored;
         std::filesystem::remove_all(path_, ignored);
     }
+
+    const std::filesystem::path& path() const { return path_; }
 
 private:
     std::filesystem::path path_;
@@ -210,4 +215,49 @@ TEST_CASE("a bucket can be entered using its own region", "[integration]")
             directory += L"\\" + expected;
         }
     }
+}
+
+TEST_CASE("Get resumes a partial local file", "[integration]")
+{
+    const auto profile = environment("S3CMD_TEST_PROFILE");
+    const auto bucket = environment("S3CMD_TEST_BUCKET");
+    const auto region = environment("S3CMD_TEST_REGION");
+    const auto list_buckets = environment("S3CMD_TEST_LIST_BUCKETS");
+    const auto object = environment("S3CMD_TEST_OBJECT");
+    if (!profile || !bucket || !region || !list_buckets || !object)
+        SKIP("Set S3CMD_TEST_PROFILE, S3CMD_TEST_BUCKET, S3CMD_TEST_REGION, "
+             "S3CMD_TEST_LIST_BUCKETS, and S3CMD_TEST_OBJECT");
+
+    TemporaryAppData app_data;
+    if (*list_buckets == "denied")
+        REQUIRE(s3cmd::ProfileConfig(*profile).register_bucket(*bucket, *region));
+    PluginSession session;
+
+    auto remote = s3cmd::to_wide("\\" + *profile + "\\" + *bucket + "\\" + *object);
+    std::replace(remote.begin(), remote.end(), L'/', L'\\');
+    const auto local = app_data.path() / L"resumed-download";
+    const auto expected = app_data.path() / L"complete-download";
+    auto local_name = local.wstring();
+
+    REQUIRE(s3cmd::get_file(remote.data(), local_name.data(), 0, nullptr) == FS_FILE_OK);
+    const auto size = std::filesystem::file_size(local);
+    if (size == 0)
+        SKIP("S3CMD_TEST_OBJECT must be non-empty");
+    REQUIRE(std::filesystem::copy_file(local, expected));
+    std::filesystem::resize_file(local, size / 2);
+
+    RemoteInfoStruct info{};
+    info.SizeLow = static_cast<DWORD>(size);
+    info.SizeHigh = static_cast<DWORD>(size >> 32);
+    CHECK(s3cmd::get_file(remote.data(), local_name.data(), 0, &info) ==
+          FS_FILE_EXISTSRESUMEALLOWED);
+    REQUIRE(s3cmd::get_file(remote.data(), local_name.data(), FS_COPYFLAGS_RESUME, &info) ==
+            FS_FILE_OK);
+
+    std::ifstream actual(local, std::ios::binary);
+    std::ifstream reference(expected, std::ios::binary);
+    REQUIRE(actual);
+    REQUIRE(reference);
+    CHECK(std::equal(std::istreambuf_iterator<char>(actual), std::istreambuf_iterator<char>(),
+                     std::istreambuf_iterator<char>(reference), std::istreambuf_iterator<char>()));
 }

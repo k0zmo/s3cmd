@@ -48,6 +48,7 @@ HANDLE find_first(const wchar_t* path, WIN32_FIND_DATAW* find_data);
 bool find_next(HANDLE handle, WIN32_FIND_DATAW* find_data);
 int find_close(HANDLE handle);
 void status_info(const wchar_t* remote_directory, int start_end, int operation);
+// Existing regular files advertise resume; resumed downloads append in place and retain partial data.
 int get_file(const wchar_t* remote_name, const wchar_t* local_name, int copy_flags,
              const RemoteInfoStruct* info);
 int put_file(const wchar_t* local_name, const wchar_t* remote_name, int copy_flags);

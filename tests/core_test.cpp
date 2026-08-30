@@ -462,6 +462,16 @@ TEST_CASE("runtime dry run completes S3 operations without side effects", "[unit
 
     CHECK(s3cmd::get_file(object, local_name.data(), FS_COPYFLAGS_MOVE, nullptr) == FS_FILE_OK);
     CHECK_FALSE(std::filesystem::exists(local));
+    const auto partial = ini.root / L"partial-download";
+    {
+        std::ofstream file(partial);
+        REQUIRE(file);
+        file << "partial";
+    }
+    auto partial_name = partial.wstring();
+    CHECK(s3cmd::get_file(object, partial_name.data(), 0, nullptr) == FS_FILE_EXISTSRESUMEALLOWED);
+    CHECK(s3cmd::get_file(object, partial_name.data(), FS_COPYFLAGS_RESUME, nullptr) == FS_FILE_OK);
+    CHECK(std::filesystem::file_size(partial) == 7);
     CHECK(s3cmd::put_file(upload_name.data(), object, FS_COPYFLAGS_MOVE) == FS_FILE_OK);
     CHECK(std::filesystem::exists(upload));
     CHECK(s3cmd::delete_file(object));

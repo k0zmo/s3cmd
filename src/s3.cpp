@@ -425,13 +425,15 @@ class TransferProgress
 public:
     // Constructor for Get request
     TransferProgress(const wchar_t* source, const wchar_t* target,
-                     Aws::S3::Model::GetObjectRequest& request)
-        : TransferProgress{source, target, 0, request}
+                     Aws::S3::Model::GetObjectRequest& request, std::uint64_t transferred = 0)
+        : TransferProgress{source, target, 0, request, transferred}
     {
         request.SetHeadersReceivedEventHandler(
-            [this](const Aws::Http::HttpRequest*, Aws::Http::HttpResponse* response) {
+            [this, transferred](const Aws::Http::HttpRequest*, Aws::Http::HttpResponse* response) {
                 const auto& length = response->GetHeader(Aws::Http::CONTENT_LENGTH_HEADER);
-                std::from_chars(length.data(), length.data() + length.size(), total_);
+                std::uint64_t remaining{};
+                std::from_chars(length.data(), length.data() + length.size(), remaining);
+                total_ = transferred + remaining;
             });
         request.SetDataReceivedEventHandler([this](const Aws::Http::HttpRequest*,
                                                    Aws::Http::HttpResponse*,
@@ -441,8 +443,7 @@ public:
     // Constructor for Put request
     TransferProgress(const wchar_t* source, const wchar_t* target,
                      Aws::S3::Model::PutObjectRequest& request)
-        : TransferProgress{source, target,
-                           static_cast<std::uint64_t>(request.GetContentLength()),
+        : TransferProgress{source, target, static_cast<std::uint64_t>(request.GetContentLength()),
                            request}
     {
         request.SetDataSentEventHandler(
@@ -454,12 +455,16 @@ public:
 private:
     // Common constructor for both Get and Put requests
     template <typename Request>
-    TransferProgress(const wchar_t* source, const wchar_t* target,
-                     std::uint64_t total, Request& request)
-        : source_{source}, target_{target}, total_{total}
+    TransferProgress(const wchar_t* source, const wchar_t* target, std::uint64_t total,
+                     Request& request, std::uint64_t transferred = 0)
+        : source_{source},
+          target_{target},
+          total_{total},
+          initial_transferred_{transferred},
+          transferred_{transferred}
     {
         request.SetRequestRetryHandler(
-            [this](const Aws::AmazonWebServiceRequest&) { transferred_ = 0; });
+            [this](const Aws::AmazonWebServiceRequest&) { transferred_ = initial_transferred_; });
         request.SetContinueRequestHandler(
             [this](const Aws::Http::HttpRequest*) { return !canceled_.load(); });
     }
@@ -490,6 +495,7 @@ private:
     const wchar_t* source_;
     const wchar_t* target_;
     std::uint64_t total_{};
+    const std::uint64_t initial_transferred_{};
     std::uint64_t transferred_{};
     int percent_{};
     std::atomic<bool> canceled_{};
@@ -932,13 +938,29 @@ void status_info(const wchar_t* remote_directory, int start_end, int operation)
 }
 
 int get_file(const wchar_t* remote_name, const wchar_t* local_name, int copy_flags,
-             [[maybe_unused]] const RemoteInfoStruct* info)
+             const RemoteInfoStruct* info)
 try
 {
-    if ((copy_flags & FS_COPYFLAGS_RESUME) != 0)
-        return FS_FILE_NOTSUPPORTED;
-    if ((copy_flags & FS_COPYFLAGS_OVERWRITE) == 0 && std::filesystem::exists(local_name))
-        return FS_FILE_EXISTS;
+    const auto local = std::filesystem::path(local_name);
+    const auto resume = (copy_flags & FS_COPYFLAGS_RESUME) != 0;
+    std::error_code error;
+    const auto local_exists = std::filesystem::exists(local, error);
+    if (error)
+        return FS_FILE_WRITEERROR;
+    if (!resume && (copy_flags & FS_COPYFLAGS_OVERWRITE) == 0 && local_exists)
+        return std::filesystem::is_regular_file(local, error) && !error
+                   ? FS_FILE_EXISTSRESUMEALLOWED
+                   : FS_FILE_EXISTS;
+
+    std::uint64_t offset{};
+    if (resume)
+    {
+        if (!std::filesystem::is_regular_file(local, error) || error)
+            return FS_FILE_NOTSUPPORTED;
+        offset = std::filesystem::file_size(local, error);
+        if (error)
+            return FS_FILE_WRITEERROR;
+    }
     if (report_progress(remote_name, local_name, 0))
         return FS_FILE_USERABORT;
 
@@ -956,45 +978,94 @@ try
         return FS_FILE_OK;
     }
 
-    const auto local = std::filesystem::path(local_name);
-    wchar_t temporary[MAX_PATH];
-    if (GetTempFileNameW(local.parent_path().c_str(), L"s3c", 0, temporary) == 0)
-        return FS_FILE_WRITEERROR;
-    const auto partial = std::filesystem::path(temporary);
-    std::error_code ignored;
-
+    std::uint64_t remote_size{};
     {
         AwsLease lease;
         auto client = get_client(path);
-        Aws::S3::Model::GetObjectRequest request;
-        request.SetBucket(path.bucket);
-        request.SetKey(path.key);
-        request.SetResponseStreamFactory([partial] {
-            return Aws::New<std::fstream>("s3cmd", partial,
-                                          std::ios::out | std::ios::binary | std::ios::trunc);
-        });
 
-        TransferProgress progress{remote_name, local_name, request};
-        const auto outcome = client->GetObject(request);
-        if (!outcome.IsSuccess())
+        Aws::String e_tag;
+        if (resume)
         {
-            std::filesystem::remove(partial, ignored);
-            if (progress.is_canceled())
-                return FS_FILE_USERABORT;
-            log_aws_error("GetObject", outcome.GetError());
-            return outcome.GetError().GetResponseCode() == Aws::Http::HttpResponseCode::NOT_FOUND
-                       ? FS_FILE_NOTFOUND
-                       : FS_FILE_READERROR;
+            // ponytail: the existing prefix is trusted; persist object identity if provenance checks matter.
+            log_operation("HeadObject", path, false);
+            Aws::S3::Model::HeadObjectRequest request;
+            request.SetBucket(path.bucket);
+            request.SetKey(path.key);
+            const auto outcome = client->HeadObject(request);
+            if (!outcome.IsSuccess())
+            {
+                log_aws_error("HeadObject", outcome.GetError());
+                return outcome.GetError().GetResponseCode() ==
+                               Aws::Http::HttpResponseCode::NOT_FOUND
+                           ? FS_FILE_NOTFOUND
+                           : FS_FILE_READERROR;
+            }
+
+            const auto length = outcome.GetResult().GetContentLength();
+            if (length < 0)
+                return FS_FILE_READERROR;
+            remote_size = static_cast<std::uint64_t>(length);
+            const auto listed_size = info ? static_cast<std::uint64_t>(info->SizeLow) |
+                                                (static_cast<std::uint64_t>(info->SizeHigh) << 32)
+                                          : remote_size;
+            if (listed_size != remote_size)
+                return FS_FILE_READERROR;
+            if (offset > remote_size)
+                return FS_FILE_NOTSUPPORTED;
+            e_tag = outcome.GetResult().GetETag();
+        }
+
+        if (!resume || offset < remote_size)
+        {
+            Aws::S3::Model::GetObjectRequest request;
+            request.SetBucket(path.bucket.c_str());
+            request.SetKey(path.key.c_str());
+            if (resume)
+            {
+                const auto range = std::format("bytes={}-", offset);
+                request.SetRange(range.c_str());
+                if (!e_tag.empty())
+                    request.SetIfMatch(e_tag);
+            }
+            request.SetResponseStreamFactory([local, offset] {
+                auto stream = Aws::New<std::fstream>("s3cmd");
+                if (offset == 0)
+                {
+                    stream->open(local, std::ios::out | std::ios::binary | std::ios::trunc);
+                }
+                else
+                {
+                    std::error_code error;
+                    std::filesystem::resize_file(local, offset, error);
+                    if (!error)
+                    {
+                        stream->open(local, std::ios::in | std::ios::out | std::ios::binary);
+                        stream->seekp(static_cast<std::streamoff>(offset));
+                    }
+                }
+                return stream;
+            });
+
+            TransferProgress progress{remote_name, local_name, request, offset};
+            const auto outcome = client->GetObject(request);
+            if (!outcome.IsSuccess())
+            {
+                if (progress.is_canceled())
+                    return FS_FILE_USERABORT;
+                log_aws_error("GetObject", outcome.GetError());
+                return outcome.GetError().GetResponseCode() ==
+                               Aws::Http::HttpResponseCode::NOT_FOUND
+                           ? FS_FILE_NOTFOUND
+                           : FS_FILE_READERROR;
+            }
         }
     }
 
-    auto move_flags = MOVEFILE_WRITE_THROUGH;
-    if ((copy_flags & FS_COPYFLAGS_OVERWRITE) != 0)
-        move_flags |= MOVEFILE_REPLACE_EXISTING;
-    if (!MoveFileExW(partial.c_str(), local_name, move_flags))
+    if (resume)
     {
-        std::filesystem::remove(partial, ignored);
-        return FS_FILE_WRITEERROR;
+        std::filesystem::resize_file(local, remote_size, error);
+        if (error)
+            return FS_FILE_WRITEERROR;
     }
     if ((copy_flags & FS_COPYFLAGS_MOVE) != 0 && !delete_file(remote_name))
         return FS_FILE_WRITEERROR;
