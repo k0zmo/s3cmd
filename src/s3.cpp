@@ -581,6 +581,8 @@ private:
         // We either want to list discovered buckets, or registered, never both
         ProfileConfig(path.profile).set_discovered_buckets(discovered ? buckets : BucketMap{});
 
+        if (!discovered)
+            append_entry("_F7=register bucket.txt", false);
         for (const auto& [name, bucket] : buckets)
             append_entry(name, true, 0, bucket.created);
     }
