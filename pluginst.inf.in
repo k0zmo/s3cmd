@@ -1,0 +1,7 @@
+[plugininstall]
+description=S3 plugin @CMAKE_PROJECT_VERSION@ (64bit)
+type=wfx
+file=s3cmd.wfx64
+file=pluginst.inf
+defaultdir=s3cmd
+version=@CMAKE_PROJECT_VERSION@

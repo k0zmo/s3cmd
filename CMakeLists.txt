@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.24)
-project(s3cmd LANGUAGES C CXX)
+project(s3cmd VERSION 1.0.0 LANGUAGES C CXX)
 
 set(CMAKE_MODULE_PATH "${s3cmd_SOURCE_DIR}/cmake;${CMAKE_MODULE_PATH}")
 set(CMAKE_CXX_STANDARD 20)
@@ -65,3 +65,21 @@ if(BUILD_TESTING)
         )
     endif()
 endif()
+
+configure_file(pluginst.inf.in pluginst.inf @ONLY)
+
+install(TARGETS s3cmd
+    LIBRARY DESTINATION .
+    RUNTIME DESTINATION .
+)
+install(FILES
+    "${CMAKE_CURRENT_BINARY_DIR}/pluginst.inf"
+    README.md
+    DESTINATION .
+)
+
+set(CPACK_GENERATOR ZIP)
+set(CPACK_INCLUDE_TOPLEVEL_DIRECTORY OFF)
+set(CPACK_PACKAGE_VERSION "${CMAKE_PROJECT_VERSION}")
+set(CPACK_PACKAGE_FILE_NAME "s3cmd-${CMAKE_PROJECT_VERSION}-win64")
+include(CPack)
