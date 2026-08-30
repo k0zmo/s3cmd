@@ -1,0 +1,5 @@
+#include "resource.h"
+
+IDI_PLUGIN ICON "..\\icons\\s3cmd.ico"
+IDI_BUCKET ICON "..\\icons\\bucket.ico"
+IDI_PROFILE ICON "..\\icons\\profile.ico"

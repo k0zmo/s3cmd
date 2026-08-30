@@ -1,6 +1,10 @@
 cmake_minimum_required(VERSION 3.24)
 project(s3cmd VERSION 1.0.0 LANGUAGES C CXX)
 
+if(WIN32)
+    enable_language(RC)
+endif()
+
 set(CMAKE_MODULE_PATH "${s3cmd_SOURCE_DIR}/cmake;${CMAKE_MODULE_PATH}")
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -33,8 +37,12 @@ endif()
 
 add_library(s3cmd MODULE
     src/main.cpp
+    src/icons.cpp src/icons.hpp
     src/s3cmd.def
 )
+if(WIN32)
+    target_sources(s3cmd PRIVATE src/s3cmd.rc)
+endif()
 target_compile_features(s3cmd PRIVATE cxx_std_20)
 target_compile_definitions(s3cmd PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
 target_link_libraries(s3cmd PRIVATE s3cmd-core)
@@ -72,6 +80,11 @@ install(TARGETS s3cmd
 install(FILES
     "${CMAKE_CURRENT_BINARY_DIR}/pluginst.inf"
     README.md
+    DESTINATION .
+)
+install(FILES
+    "${CMAKE_CURRENT_SOURCE_DIR}/icons/README.md"
+    RENAME ICONS-LICENSES.md
     DESTINATION .
 )
 

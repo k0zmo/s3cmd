@@ -1,4 +1,5 @@
 #include "s3.hpp"
+#include "icons.hpp"
 
 #define WFX_EXPORT extern "C"
 
@@ -68,6 +69,12 @@ WFX_EXPORT int __stdcall FsRenMovFileW(wchar_t* old_name, wchar_t* new_name, BOO
 WFX_EXPORT void __stdcall FsGetDefRootName(char* name, int max_length)
 {
     s3cmd::get_default_root_name(name, max_length);
+}
+
+WFX_EXPORT int __stdcall FsExtractCustomIconW(wchar_t* remote_name, int extract_flags,
+                                              HICON* icon)
+{
+    return s3cmd::extract_custom_icon(remote_name, extract_flags, icon);
 }
 
 WFX_EXPORT int __stdcall FsContentGetSupportedField(int field_index, char* field_name, char* units,

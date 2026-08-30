@@ -12,6 +12,7 @@ EXPORTS
     FsRemoveDirW
     FsRenMovFileW
     FsGetDefRootName
+    FsExtractCustomIconW
     FsContentGetSupportedField
     FsContentGetValueW
     FsContentPluginUnloading
