@@ -164,6 +164,6 @@ This example passes the vcpkg toolchain directly to the checked-in debug preset:
 
 ```powershell
 cmake --preset msvc-debug --toolchain "$env:VCPKG_ROOT/scripts/buildsystems/vcpkg.cmake"
-cmake --build build/msvc-debug --target s3cmd-test
-ctest --test-dir build/msvc-debug --output-on-failure
+cmake --build build/msvc-debug
+ctest --test-dir build/msvc-debug -L unit --output-on-failure
 ```

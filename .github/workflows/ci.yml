@@ -1,0 +1,75 @@
+name: CI
+
+on:
+  push:
+    branches: ["**"]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  windows:
+    runs-on: windows-2022
+
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Cache vcpkg binaries
+        uses: actions/cache@v6
+        with:
+          path: ~\AppData\Local\vcpkg\archives
+          key: vcpkg-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('vcpkg.json', 'CMakePresets.json') }}
+          restore-keys: |
+            vcpkg-${{ runner.os }}-${{ runner.arch }}-
+
+      - uses: TheMrMilchmann/setup-msvc-dev@v4
+        with:
+          arch: x64
+
+      - name: Configure
+        run: >-
+          cmake --preset msvc-release
+          --toolchain "$env:VCPKG_INSTALLATION_ROOT/scripts/buildsystems/vcpkg.cmake"
+
+      - name: Build
+        run: cmake --build build/msvc-release
+
+      - name: Unit tests
+        run: ctest --test-dir build/msvc-release -L unit --output-on-failure
+
+      - name: AWS integration tests
+        if: github.event_name != 'pull_request'
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          AWS_SESSION_TOKEN: ${{ secrets.AWS_SESSION_TOKEN }}
+          AWS_EC2_METADATA_DISABLED: "true"
+          S3CMD_TEST_PROFILE: ${{ secrets.S3CMD_TEST_PROFILE }}
+          S3CMD_TEST_BUCKET: ${{ secrets.S3CMD_TEST_BUCKET }}
+          S3CMD_TEST_REGION: ${{ secrets.S3CMD_TEST_REGION }}
+          S3CMD_TEST_LIST_BUCKETS: ${{ secrets.S3CMD_TEST_LIST_BUCKETS }}
+          S3CMD_TEST_OBJECT: ${{ secrets.S3CMD_TEST_OBJECT }}
+        run: ctest --test-dir build/msvc-release -L integration --output-on-failure
+
+      - name: Package
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: |
+          cmake --build build/msvc-release --target package
+          $version = $env:GITHUB_REF_NAME.Substring(1)
+          if (-not (Test-Path "build/msvc-release/s3cmd-$version-win64.zip")) {
+            throw "Tag $env:GITHUB_REF_NAME does not match the CMake project version"
+          }
+
+      - name: Create GitHub release
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: >-
+          gh release create $env:GITHUB_REF_NAME
+          "build/msvc-release/s3cmd-*-win64.zip"
+          --verify-tag

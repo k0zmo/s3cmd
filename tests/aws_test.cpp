@@ -88,7 +88,7 @@ Aws::S3::S3Client make_client(const char* profile, const char* region)
 std::optional<std::string> environment(const char* name)
 {
     const auto size = GetEnvironmentVariableA(name, nullptr, 0);
-    if (size == 0)
+    if (size <= 1)
         return std::nullopt;
 
     std::string value(size, '\0');

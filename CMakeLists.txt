@@ -46,9 +46,8 @@ set_target_properties(s3cmd PROPERTIES
 include(CTest)
 if(BUILD_TESTING)
     find_package(Catch2 CONFIG REQUIRED)
-    option(S3CMD_ENABLE_AWS_TESTS "Register tests that use real AWS credentials" OFF)
 
-    add_executable(s3cmd-test EXCLUDE_FROM_ALL
+    add_executable(s3cmd-test
         tests/aws_test.cpp
         tests/core_test.cpp
     )
@@ -57,13 +56,11 @@ if(BUILD_TESTING)
     add_test(NAME s3cmd-unit COMMAND s3cmd-test "[unit]")
     set_tests_properties(s3cmd-unit PROPERTIES LABELS unit)
 
-    if(S3CMD_ENABLE_AWS_TESTS)
-        add_test(NAME s3cmd-aws COMMAND s3cmd-test "[integration]")
-        set_tests_properties(s3cmd-aws PROPERTIES
-            LABELS integration
-            SKIP_RETURN_CODE 4
-        )
-    endif()
+    add_test(NAME s3cmd-aws COMMAND s3cmd-test "[integration]")
+    set_tests_properties(s3cmd-aws PROPERTIES
+        LABELS integration
+        SKIP_RETURN_CODE 4
+    )
 endif()
 
 configure_file(pluginst.inf.in pluginst.inf @ONLY)
