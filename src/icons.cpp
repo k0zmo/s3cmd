@@ -28,14 +28,14 @@ int extract_custom_icon(wchar_t* remote_name, int extract_flags, HICON* icon)
         return FS_ICON_USEDEFAULT;
 
     const auto resource_id = [&] {
-        const auto path = s3cmd::RemotePath::make(remote_name);
+        const auto path = s3cmd::RemotePathView::make(remote_name);
         if (path.bucket.empty())
         {
             // We still want to have a default icon for "one level up" entry
-            if (!path.profile.empty() && path.profile != "..")
+            if (!path.profile.empty() && path.profile != L"..")
                 return IDI_PROFILE;
         }
-        else if (path.key.empty() && path.bucket != "..")
+        else if (path.key.empty() && path.bucket != L"..")
         {
             return IDI_BUCKET;
         }

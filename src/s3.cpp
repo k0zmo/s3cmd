@@ -846,7 +846,7 @@ void status_info(const wchar_t* remote_directory, int start_end, int operation)
         return;
     }
 
-    const auto path = RemotePath::make(remote_directory);
+    const auto path = RemotePathView::make(remote_directory);
     suppress_delete_listing = path.bucket.empty();
 }
 
@@ -1298,13 +1298,13 @@ int content_get_value(const wchar_t* file_name, int field_index, void* field_val
     if (!file_name || !field_value || max_length < static_cast<int>(sizeof(wchar_t)))
         return ft_fileerror;
 
-    const auto path = RemotePath::make(file_name);
+    const auto path = RemotePathView::make(file_name);
     // Region is only available at buckets view
     if (path.profile.empty() || path.bucket.empty() || !path.key.empty())
         return ft_fieldempty;
 
     // Get region from a cached config
-    const auto region = ProfileConfig(path.profile).bucket_region(path.bucket);
+    const auto region = ProfileConfig(to_utf8(path.profile)).bucket_region(to_utf8(path.bucket));
     if (region.empty())
         return ft_fieldempty;
 

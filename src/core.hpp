@@ -5,6 +5,17 @@
 
 namespace s3cmd {
 
+struct RemotePathView
+{
+    std::wstring_view profile;
+    std::wstring_view bucket;
+    std::wstring_view key;
+
+    static RemotePathView make(std::wstring_view path) noexcept;
+
+    bool operator==(const RemotePathView&) const = default;
+};
+
 struct RemotePath
 {
     std::string profile;

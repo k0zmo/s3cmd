@@ -7,7 +7,7 @@
 
 namespace s3cmd {
 
-RemotePath RemotePath::make(std::wstring_view path)
+RemotePathView RemotePathView::make(std::wstring_view path) noexcept
 {
     // Remove \ from the back and the front
     while (!path.empty() && path.front() == L'\\')
@@ -19,7 +19,7 @@ RemotePath RemotePath::make(std::wstring_view path)
     const auto profile_end = path.find(L'\\');
     const auto profile = path.substr(0, profile_end);
     if (profile_end == std::wstring_view::npos)
-        return {to_utf8(profile), {}, {}};
+        return {profile, {}, {}};
 
     // Split the remaining into the bucket and the key
     path.remove_prefix(profile_end + 1);
@@ -28,9 +28,15 @@ RemotePath RemotePath::make(std::wstring_view path)
     const auto key =
         bucket_end == std::wstring_view::npos ? std::wstring_view{} : path.substr(bucket_end + 1);
 
-    auto key_utf8 = to_utf8(key);
+    return {profile, bucket, key};
+}
+
+RemotePath RemotePath::make(std::wstring_view path)
+{
+    const auto view = RemotePathView::make(path);
+    auto key_utf8 = to_utf8(view.key);
     std::ranges::replace(key_utf8, '\\', '/');
-    return {to_utf8(profile), to_utf8(bucket), std::move(key_utf8)};
+    return {to_utf8(view.profile), to_utf8(view.bucket), std::move(key_utf8)};
 }
 
 std::string RemotePath::directory_prefix() const

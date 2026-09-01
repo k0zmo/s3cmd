@@ -141,6 +141,28 @@ TEST_CASE("remote paths identify profile, bucket, and object", "[unit]")
           s3cmd::RemotePath{"work", "my-bucket", "one"});
 }
 
+TEST_CASE("remote path views borrow the original wide path", "[unit]")
+{
+    using s3cmd::RemotePathView;
+    CHECK(RemotePathView::make({}) == RemotePathView{});
+    CHECK(RemotePathView::make(L"\\\\") == RemotePathView{});
+    CHECK(RemotePathView::make(L"\\work\\") == RemotePathView{L"work", {}, {}});
+    CHECK(RemotePathView::make(L"\\work\\bucket\\") ==
+          RemotePathView{L"work", L"bucket", {}});
+    CHECK(RemotePathView::make(L"\\work\\..\\") == RemotePathView{L"work", L"..", {}});
+    CHECK(RemotePathView::make(L"\\\\work\\bucket\\one\\\\") ==
+          RemotePathView{L"work", L"bucket", L"one"});
+
+    const std::wstring path = L"\\w\u00f3rk\\bucket\\one\\two.txt";
+    const auto view = RemotePathView::make(path);
+    CHECK(view == RemotePathView{L"w\u00f3rk", L"bucket", L"one\\two.txt"});
+    CHECK(view.profile.data() == path.data() + 1);
+    CHECK(view.bucket.data() == path.data() + 6);
+    CHECK(view.key.data() == path.data() + 13);
+    CHECK(s3cmd::RemotePath::make(path) ==
+          s3cmd::RemotePath{"w\xc3\xb3rk", "bucket", "one/two.txt"});
+}
+
 TEST_CASE("virtual deletes skip recursive directory listings", "[unit]")
 {
     temporary_config();
