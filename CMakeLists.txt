@@ -1,5 +1,9 @@
 cmake_minimum_required(VERSION 3.24)
-project(s3cmd VERSION 1.0.0 LANGUAGES C CXX)
+project(s3cmd VERSION 1.1.0 LANGUAGES C CXX)
+
+# The next release version. Clear the suffix on release branches.
+set(S3CMD_VERSION_SUFFIX "-dev")
+set(S3CMD_VERSION "${CMAKE_PROJECT_VERSION}${S3CMD_VERSION_SUFFIX}")
 
 if(WIN32)
     enable_language(RC)
@@ -90,6 +94,6 @@ install(FILES
 
 set(CPACK_GENERATOR ZIP)
 set(CPACK_INCLUDE_TOPLEVEL_DIRECTORY OFF)
-set(CPACK_PACKAGE_VERSION "${CMAKE_PROJECT_VERSION}")
-set(CPACK_PACKAGE_FILE_NAME "s3cmd-${CMAKE_PROJECT_VERSION}-win64")
+set(CPACK_PACKAGE_VERSION "${S3CMD_VERSION}")
+set(CPACK_PROJECT_CONFIG_FILE "${s3cmd_SOURCE_DIR}/cmake/PackageVersion.cmake")
 include(CPack)

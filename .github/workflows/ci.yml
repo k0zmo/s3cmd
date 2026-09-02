@@ -63,6 +63,10 @@ jobs:
         if: startsWith(github.ref, 'refs/tags/v')
         run: |
           $version = $env:GITHUB_REF_NAME.Substring(1)
+          if ($version -cnotmatch '^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$' -or
+              (Get-Content "build/msvc-release/pluginst.inf") -cnotcontains "version=$version") {
+            throw "Release tag must match the CMake version with an empty S3CMD_VERSION_SUFFIX"
+          }
           if (-not (Test-Path "build/msvc-release/s3cmd-$version-win64.zip")) {
             throw "Tag $env:GITHUB_REF_NAME does not match the CMake project version"
           }
