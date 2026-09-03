@@ -8,10 +8,15 @@
       "name": "aws-sdk-cpp",
       "default-features": false,
       "features": [
-        "s3"
+        "s3",
+        "sso-oidc"
       ]
     },
     "catch2",
+    {
+      "name": "cpp-httplib",
+      "default-features": false
+    },
     "tomlplusplus"
   ]
 }

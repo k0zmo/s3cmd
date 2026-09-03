@@ -15,12 +15,24 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 if(S3CMD_USING_CONAN)
     # Sadly, conan package uses different naming scheme
-    find_package(AWSSDK CONFIG REQUIRED COMPONENTS aws-sdk-cpp-s3)
+    # Also, Conan aws-sdk-cpp package have inter-components dependencies so we
+    # don't really need to find the core component that s3 and oids depend on
+    find_package(AWSSDK CONFIG REQUIRED
+        COMPONENTS
+            aws-sdk-cpp-s3
+            aws-sdk-cpp-sso-oidc
+    )
 else()
-    find_package(AWSSDK CONFIG REQUIRED COMPONENTS core s3)
+    find_package(AWSSDK CONFIG REQUIRED
+        COMPONENTS
+            core
+            s3
+            sso-oidc
+    )
 endif()
 
 find_package(tomlplusplus CONFIG REQUIRED)
+find_package(httplib CONFIG REQUIRED)
 
 add_library(s3cmd-core STATIC
     src/fsplugin.h
@@ -31,12 +43,25 @@ add_library(s3cmd-core STATIC
 target_compile_features(s3cmd-core PUBLIC cxx_std_20)
 target_compile_definitions(s3cmd-core PUBLIC NOMINMAX WIN32_LEAN_AND_MEAN)
 target_include_directories(s3cmd-core PUBLIC "${s3cmd_SOURCE_DIR}/src")
-target_link_libraries(s3cmd-core PRIVATE tomlplusplus::tomlplusplus)
+target_link_libraries(s3cmd-core PRIVATE
+    httplib::httplib
+    tomlplusplus::tomlplusplus
+)
 
 if(TARGET AWS::aws-sdk-cpp-s3)
-    target_link_libraries(s3cmd-core PUBLIC AWS::aws-sdk-cpp-core AWS::aws-sdk-cpp-s3)
+    target_link_libraries(s3cmd-core PUBLIC
+        AWS::aws-sdk-cpp-s3
+        AWS::aws-sdk-cpp-sso-oidc
+    )
 else()
-    target_link_libraries(s3cmd-core PUBLIC aws-cpp-sdk-core aws-cpp-sdk-s3)
+    target_link_libraries(s3cmd-core PUBLIC
+        aws-cpp-sdk-core
+        aws-cpp-sdk-s3
+        aws-cpp-sdk-sso-oidc
+    )
+endif()
+if(WIN32)
+    target_link_libraries(s3cmd-core PUBLIC shell32)
 endif()
 
 add_library(s3cmd MODULE

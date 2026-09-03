@@ -23,7 +23,8 @@ You can also install the plugin manually:
 ## Configure AWS access
 
 The plugin uses the standard AWS SDK credential chain and AWS shared profile files.
-Create profiles with the AWS CLI before you open the plugin.
+Create profiles before you open the plugin. You can use the AWS CLI or edit the standard
+AWS profile files manually.
 
 For access keys, configure a named profile:
 
@@ -31,14 +32,17 @@ For access keys, configure a named profile:
 aws configure --profile work
 ```
 
-For AWS IAM Identity Center (SSO), run these commands:
+For AWS IAM Identity Center (SSO), run this command:
 
 ```powershell
 aws configure sso --profile work
-aws sso login --profile work
 ```
 
-If an SSO session expires, the plugin shows the required `aws sso login` command.
+The profile must reference an `[sso-session]` section.
+
+When an SSO session is missing or expired, the plugin opens the AWS PKCE browser login flow,
+receives the callback on `127.0.0.1`, and stores the token in the standard AWS SSO cache.
+If PKCE fails, the plugin offers device-code login as a fallback. The AWS CLI is not required.
 
 ## Use
 

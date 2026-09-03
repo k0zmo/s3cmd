@@ -14,6 +14,7 @@ namespace {
 
 int request_count{};
 int request_type{};
+bool request_accept{true};
 std::wstring request_text;
 std::wstring log_text;
 
@@ -22,7 +23,7 @@ BOOL __stdcall capture_request(int, int type, wchar_t*, wchar_t* text, wchar_t*,
     ++request_count;
     request_type = type;
     request_text = text ? text : L"";
-    return TRUE;
+    return request_accept;
 }
 
 void __stdcall capture_log(int, int type, wchar_t* text)
@@ -352,7 +353,7 @@ TEST_CASE("runtime dry run completes S3 operations without side effects", "[unit
     CHECK(profile.registered_buckets().contains("registered-bucket"));
 }
 
-TEST_CASE("expired SSO session reports the login command on every attempt", "[unit]")
+TEST_CASE("expired SSO session asks before starting browser login", "[unit]")
 {
     auto& ini = temporary_config();
     const auto config = ini.root / L"config";
@@ -383,6 +384,7 @@ TEST_CASE("expired SSO session reports the login command on every attempt", "[un
 
     request_count = 0;
     request_type = 0;
+    request_accept = false;
     request_text.clear();
     log_text.clear();
     PluginSession session(7, nullptr, capture_log, capture_request);
@@ -392,10 +394,12 @@ TEST_CASE("expired SSO session reports the login command on every attempt", "[un
     CHECK(s3cmd::find_first(path, &entry) == INVALID_HANDLE_VALUE);
     CHECK(GetLastError() == ERROR_LOGON_FAILURE);
     CHECK(request_count == 1);
-    CHECK(request_type == RT_MsgOK);
-    CHECK(request_text.find(L"aws sso login --profile expired") != std::wstring::npos);
-    CHECK(log_text.find(L"aws sso login --profile expired") != std::wstring::npos);
+    CHECK(request_type == RT_MsgYesNo);
+    CHECK(request_text.find(L"Start browser login") != std::wstring::npos);
+    CHECK(request_text.find(L"aws sso login") == std::wstring::npos);
+    CHECK(log_text.find(L"was cancelled") != std::wstring::npos);
 
     CHECK(s3cmd::find_first(path, &entry) == INVALID_HANDLE_VALUE);
     CHECK(request_count == 2);
+    request_accept = true;
 }

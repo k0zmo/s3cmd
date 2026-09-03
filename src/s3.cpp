@@ -5,10 +5,16 @@
 #include <aws/core/Aws.h>
 #include <aws/core/auth/AWSCredentialsProvider.h>
 #include <aws/core/auth/AWSCredentialsProviderChain.h>
+#include <aws/core/auth/bearer-token-provider/SSOBearerTokenProvider.h>
 #include <aws/core/client/ClientConfiguration.h>
 #include <aws/core/config/ConfigAndCredentialsCacheManager.h>
 #include <aws/core/http/HttpResponse.h>
+#include <aws/core/utils/Array.h>
 #include <aws/core/utils/DateTime.h>
+#include <aws/core/utils/HashingUtils.h>
+#include <aws/core/utils/StringUtils.h>
+#include <aws/core/utils/crypto/Factories.h>
+#include <aws/core/utils/crypto/SecureRandom.h>
 #include <aws/core/utils/memory/AWSMemory.h>
 #include <aws/core/utils/memory/stl/AWSAllocator.h>
 #include <aws/core/utils/memory/stl/AWSString.h>
@@ -23,6 +29,14 @@
 #include <aws/s3/model/ListBucketsRequest.h>
 #include <aws/s3/model/ListObjectsV2Request.h>
 #include <aws/s3/model/PutObjectRequest.h>
+#include <aws/sso-oidc/SSOOIDCClient.h>
+#include <aws/sso-oidc/SSOOIDCErrors.h>
+#include <aws/sso-oidc/model/CreateTokenRequest.h>
+#include <aws/sso-oidc/model/CreateTokenResult.h>
+#include <aws/sso-oidc/model/RegisterClientRequest.h>
+#include <aws/sso-oidc/model/RegisterClientResult.h>
+#include <aws/sso-oidc/model/StartDeviceAuthorizationRequest.h>
+#include <httplib.h>
 #include <toml++/toml.hpp>
 
 #include <algorithm>
@@ -30,6 +44,8 @@
 #include <atomic>
 #include <cassert>
 #include <charconv>
+#include <chrono>
+#include <condition_variable>
 #include <cstdint>
 #include <cstring>
 #include <cstdlib>
@@ -44,10 +60,12 @@
 #include <optional>
 #include <shared_mutex>
 #include <set>
+#include <shellapi.h>
 #include <stdexcept>
 #include <string>
 #include <string_view>
 #include <system_error>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -105,6 +123,7 @@ struct ClientEntry
 std::mutex client_mutex;
 using ClientKey = std::pair<std::string, std::string>; // (profile, region)
 std::map<ClientKey, std::shared_ptr<ClientEntry>> clients;
+std::mutex sso_login_mutex;
 
 // AwsLease has two jobs:
 // 1. Verify the SDK is initialized.
@@ -124,17 +143,379 @@ struct AwsLease
     std::shared_lock<std::shared_mutex> lock;
 };
 
-class SsoLoginRequired : public std::runtime_error
+class SsoLoginFailed : public std::runtime_error
 {
 public:
-    explicit SsoLoginRequired(std::string_view profile)
-        : std::runtime_error(std::format(
-              "AWS SSO credentials for profile '{}' are unavailable or expired.\n\nRun:\naws "
-              "sso login --profile {}\n\nThen retry the operation.",
-              profile, profile))
+    explicit SsoLoginFailed(std::string message) : std::runtime_error(std::move(message)) {}
+};
+
+bool ask_sso_login(std::string_view message, int request_type)
+{
+    std::wstring title = L"Amazon S3";
+    auto text = to_wide(message);
+    std::array<wchar_t, 1> ignored{};
+    return request_proc && request_proc(plugin_number, request_type, title.data(), text.data(),
+                                        ignored.data(), static_cast<int>(ignored.size()));
+}
+
+bool open_url(std::string_view url)
+{
+    const auto wide_url = to_wide(url);
+    return reinterpret_cast<std::intptr_t>(ShellExecuteW(nullptr, L"open", wide_url.c_str(),
+                                                         nullptr, nullptr, SW_SHOWNORMAL)) > 32;
+}
+
+class SsoTokenWriter : private Aws::Auth::SSOBearerTokenProvider
+{
+public:
+    using Token = CachedSsoToken;
+
+    explicit SsoTokenWriter(std::string_view profile)
+        : SSOBearerTokenProvider(Aws::String{profile})
     {
     }
+
+    bool write(const Token& token)
+    {
+        const auto profile_directory =
+            Aws::Auth::ProfileConfigFileAWSCredentialsProvider::GetProfileDirectory();
+        if (profile_directory.empty())
+            return false;
+
+        std::error_code error;
+        std::filesystem::create_directories(
+            std::filesystem::path(profile_directory) / "sso" / "cache", error);
+        return !error && WriteAccessTokenFile(token);
+    }
 };
+
+std::string base64_url(const Aws::Utils::ByteBuffer& buf)
+{
+    std::string base64 = Aws::Utils::HashingUtils::Base64Encode(buf);
+    std::replace(base64.begin(), base64.end(), '+', '-');
+    std::replace(base64.begin(), base64.end(), '/', '_');
+    while (!base64.empty() && base64.back() == '=')
+        base64.pop_back();
+    return base64;
+}
+
+Aws::Utils::ByteBuffer random_bytes(std::size_t byte_count)
+{
+    Aws::Utils::ByteBuffer bytes(byte_count);
+    const auto entropy = Aws::Utils::Crypto::CreateSecureRandomBytesImplementation();
+    if (!entropy)
+        throw SsoLoginFailed("Cannot initialize secure random generation for AWS SSO login");
+    entropy->GetBytes(bytes.GetUnderlyingData(), bytes.GetLength());
+    if (!*entropy)
+        throw SsoLoginFailed("Cannot generate secure random data for AWS SSO login");
+    return bytes;
+}
+
+void write_sso_token(std::string_view profile_name, const Aws::String& start_url,
+                     const Aws::String& region,
+                     const Aws::SSOOIDC::Model::RegisterClientResult& registration,
+                     const Aws::SSOOIDC::Model::CreateTokenResult& token)
+{
+    SsoTokenWriter::Token cached;
+    cached.accessToken = token.GetAccessToken();
+    cached.expiresAt = Aws::Utils::DateTime::Now() + std::chrono::seconds(token.GetExpiresIn());
+    cached.refreshToken = token.GetRefreshToken();
+    cached.clientId = registration.GetClientId();
+    cached.clientSecret = registration.GetClientSecret();
+    cached.registrationExpiresAt = Aws::Utils::DateTime(
+        static_cast<std::uint64_t>(registration.GetClientSecretExpiresAt()));
+    cached.region = region;
+    cached.startUrl = start_url;
+    if (!SsoTokenWriter(profile_name).write(cached))
+        throw SsoLoginFailed("Cannot write the AWS SSO token cache");
+}
+
+void perform_pkce_sso_login(std::string_view profile_name, const Aws::String& start_url,
+                            const Aws::String& region, Aws::SSOOIDC::SSOOIDCClient& oidc)
+{
+    constexpr std::string_view registered_redirect_uri =
+        "http://127.0.0.1/oauth/callback";
+
+    const auto verifier = base64_url(random_bytes(48));
+    const auto challenge = base64_url(Aws::Utils::HashingUtils::CalculateSHA256(verifier));
+    const auto state = base64_url(random_bytes(32));
+
+    struct Callback
+    {
+        std::mutex mutex;
+        std::condition_variable ready;
+        std::optional<std::string> code;
+        std::optional<std::string> error;
+    } callback;
+
+    httplib::Server server;
+    server.Get("/oauth/callback", [&](const httplib::Request& request, httplib::Response& response) {
+        if (!request.has_param("state") || request.get_param_value("state") != state)
+        {
+            response.status = 400;
+            response.set_content("Invalid AWS SSO login state.", "text/plain; charset=utf-8");
+            return;
+        }
+
+        const auto succeeded = request.has_param("code");
+        {
+            std::scoped_lock lock(callback.mutex);
+            if (callback.code || callback.error)
+                return;
+            if (succeeded)
+                callback.code = request.get_param_value("code");
+            else if (request.has_param("error_description"))
+                callback.error = request.get_param_value("error_description");
+            else if (request.has_param("error"))
+                callback.error = request.get_param_value("error");
+            else
+                callback.error = "AWS SSO authorization returned no code";
+        }
+        response.set_content(
+            succeeded
+                ? "Your credentials have been shared successfully and can be used until your "
+                  "session expires. You can now close this tab."
+                : "AWS SSO login failed. You can close this tab.",
+            "text/plain; charset=utf-8");
+        callback.ready.notify_one();
+    });
+
+    const auto port = server.bind_to_any_port("127.0.0.1");
+    if (port <= 0)
+        throw SsoLoginFailed("Cannot start the AWS SSO browser callback server");
+    const auto redirect_uri =
+        std::format("http://127.0.0.1:{}/oauth/callback", port);
+
+    Aws::SSOOIDC::Model::RegisterClientRequest register_request;
+    register_request.SetClientName("s3cmd");
+    register_request.SetClientType("public");
+    register_request.AddRedirectUris(registered_redirect_uri);
+    register_request.AddGrantTypes("authorization_code");
+    register_request.AddGrantTypes("refresh_token");
+    register_request.AddScopes("sso:account:access");
+    register_request.SetIssuerUrl(start_url);
+    const auto registration = oidc.RegisterClient(register_request);
+    if (!registration.IsSuccess())
+    {
+        throw SsoLoginFailed(std::format("AWS SSO client registration failed: {}",
+                                         registration.GetError().GetMessage()));
+    }
+
+    const auto dns_suffix = region.starts_with("cn-") ? "amazonaws.com.cn" : "amazonaws.com";
+    const auto authorization_url = std::format(
+        "https://oidc.{}.{}/authorize?response_type=code&client_id={}&redirect_uri={}&state={}"
+        "&code_challenge_method=S256&scopes={}&code_challenge={}",
+        region,
+        dns_suffix,
+        Aws::Utils::StringUtils::URLEncode(registration.GetResult().GetClientId()),
+        Aws::Utils::StringUtils::URLEncode(redirect_uri),
+        Aws::Utils::StringUtils::URLEncode(state),
+        Aws::Utils::StringUtils::URLEncode("sso:account:access"),
+        Aws::Utils::StringUtils::URLEncode(challenge));
+
+    std::jthread listener([&] {
+        if (!server.listen_after_bind())
+        {
+            std::scoped_lock lock(callback.mutex);
+            if (!callback.code && !callback.error)
+            {
+                callback.error = "AWS SSO browser callback server stopped unexpectedly";
+                callback.ready.notify_one();
+            }
+        }
+    });
+
+    std::optional<std::string> code;
+    std::optional<std::string> callback_error;
+    bool completed{};
+    try
+    {
+        if (!open_url(authorization_url) &&
+            !ask_sso_login(
+                std::format("The AWS SSO browser could not be opened automatically.\n\n"
+                            "Open this URL manually:\n{}\n\n"
+                            "Click OK to keep waiting or Cancel to use another login method.",
+                            authorization_url),
+                RT_MsgOKCancel))
+        {
+            throw SsoLoginFailed(
+                std::format("AWS SSO login for profile '{}' was cancelled", profile_name));
+        }
+
+        std::unique_lock lock(callback.mutex);
+        completed = callback.ready.wait_for(lock, std::chrono::minutes(10), [&] {
+            return callback.code.has_value() || callback.error.has_value();
+        });
+        code = callback.code;
+        callback_error = callback.error;
+    }
+    catch (...)
+    {
+        server.stop();
+        throw;
+    }
+    server.stop();
+    listener.join();
+
+    if (!completed)
+    {
+        throw SsoLoginFailed(std::format("AWS SSO login for profile '{}' timed out", profile_name));
+    }
+    if (callback_error)
+    {
+        throw SsoLoginFailed(
+            std::format("AWS SSO browser authorization failed: {}", *callback_error));
+    }
+
+    Aws::SSOOIDC::Model::CreateTokenRequest token_request;
+    token_request.SetClientId(registration.GetResult().GetClientId());
+    token_request.SetClientSecret(registration.GetResult().GetClientSecret());
+    token_request.SetGrantType("authorization_code");
+    token_request.SetCode(*code);
+    token_request.SetRedirectUri(redirect_uri);
+    token_request.SetCodeVerifier(verifier);
+    const auto token = oidc.CreateToken(token_request);
+    if (!token.IsSuccess())
+    {
+        throw SsoLoginFailed(
+            std::format("AWS SSO token request failed: {}", token.GetError().GetMessage()));
+    }
+
+    write_sso_token(profile_name, start_url, region, registration.GetResult(), token.GetResult());
+}
+
+void perform_device_sso_login(std::string_view profile_name, const Aws::String& start_url,
+                              const Aws::String& region, Aws::SSOOIDC::SSOOIDCClient& oidc)
+{
+    Aws::SSOOIDC::Model::RegisterClientRequest register_request;
+    register_request.SetClientName("s3cmd");
+    register_request.SetClientType("public");
+    register_request.AddGrantTypes("urn:ietf:params:oauth:grant-type:device_code");
+    register_request.AddGrantTypes("refresh_token");
+    register_request.AddScopes("sso:account:access");
+    const auto registration = oidc.RegisterClient(register_request);
+    if (!registration.IsSuccess())
+    {
+        throw SsoLoginFailed(std::format("AWS SSO client registration failed: {}",
+                                         registration.GetError().GetMessage()));
+    }
+
+    Aws::SSOOIDC::Model::StartDeviceAuthorizationRequest start_request;
+    start_request.SetClientId(registration.GetResult().GetClientId());
+    start_request.SetClientSecret(registration.GetResult().GetClientSecret());
+    start_request.SetStartUrl(start_url);
+    const auto authorization = oidc.StartDeviceAuthorization(start_request);
+    if (!authorization.IsSuccess())
+    {
+        throw SsoLoginFailed(std::format("AWS SSO device authorization failed: {}",
+                                         authorization.GetError().GetMessage()));
+    }
+
+    const auto& device = authorization.GetResult();
+    const auto& url = device.GetVerificationUriComplete().empty()
+                          ? device.GetVerificationUri()
+                          : device.GetVerificationUriComplete();
+    const auto browser_opened = open_url(url);
+    if (!ask_sso_login(
+            std::format("Complete AWS SSO login for profile '{}' in your browser.\n\n"
+                        "URL: {}\nCode: {}\n\nClick OK after AWS reports success.",
+                        profile_name, url, device.GetUserCode()),
+            RT_MsgOKCancel))
+    {
+        throw SsoLoginFailed(
+            std::format("AWS SSO login for profile '{}' was cancelled", profile_name));
+    }
+
+    if (!browser_opened)
+        log("[s3cmd] AWS SSO login: browser could not be opened automatically");
+
+    Aws::SSOOIDC::Model::CreateTokenRequest token_request;
+    token_request.SetClientId(registration.GetResult().GetClientId());
+    token_request.SetClientSecret(registration.GetResult().GetClientSecret());
+    token_request.SetGrantType("urn:ietf:params:oauth:grant-type:device_code");
+    token_request.SetDeviceCode(device.GetDeviceCode());
+
+    const auto deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(device.GetExpiresIn());
+    auto interval = std::max(1, device.GetInterval());
+    while (std::chrono::steady_clock::now() < deadline)
+    {
+        const auto token = oidc.CreateToken(token_request);
+        if (token.IsSuccess())
+        {
+            write_sso_token(profile_name, start_url, region, registration.GetResult(),
+                            token.GetResult());
+            return;
+        }
+
+        switch (token.GetError().GetErrorType())
+        {
+        case Aws::SSOOIDC::SSOOIDCErrors::AUTHORIZATION_PENDING:
+            break;
+        case Aws::SSOOIDC::SSOOIDCErrors::SLOW_DOWN:
+            interval = std::min(interval + 5, 30);
+            break;
+        default:
+            throw SsoLoginFailed(
+                std::format("AWS SSO token request failed: {}", token.GetError().GetMessage()));
+        }
+        std::this_thread::sleep_for(std::chrono::seconds(interval));
+    }
+
+    throw SsoLoginFailed(std::format("AWS SSO login for profile '{}' timed out", profile_name));
+}
+
+void perform_sso_login(std::string_view profile_name, const Aws::Config::Profile& profile)
+{
+    assert(profile.IsSsoSessionSet());
+
+    const auto& session = profile.GetSsoSession();
+    const auto& start_url = session.GetSsoStartUrl();
+    const auto& region = session.GetSsoRegion();
+    if (start_url.empty() || region.empty())
+    {
+        throw SsoLoginFailed(std::format(
+            "AWS SSO profile '{}' is missing sso_start_url or sso_region", profile_name));
+    }
+
+    if (!request_proc)
+    {
+        throw SsoLoginFailed("AWS SSO browser login requires an interactive file manager");
+    }
+
+    if (!ask_sso_login(
+            std::format("AWS SSO credentials for profile '{}' are unavailable or expired.\n\n"
+                        "Start browser login?",
+                        profile_name),
+            RT_MsgYesNo))
+    {
+        throw SsoLoginFailed(
+            std::format("AWS SSO login for profile '{}' was cancelled", profile_name));
+    }
+
+    Aws::Client::ClientConfiguration configuration;
+    configuration.region = region;
+    Aws::SSOOIDC::SSOOIDCClient oidc(configuration);
+
+    try
+    {
+        perform_pkce_sso_login(profile_name, start_url, region, oidc);
+        return;
+    }
+    catch (const SsoLoginFailed& error)
+    {
+        log("[s3cmd] AWS SSO PKCE login failed: {}", error.what());
+        if (!ask_sso_login(std::format("AWS SSO browser login failed:\n{}\n\n"
+                                       "Try device-code login instead?",
+                                       error.what()),
+                           RT_MsgYesNo))
+        {
+            throw;
+        }
+    }
+
+    perform_device_sso_login(profile_name, start_url, region, oidc);
+}
 
 std::optional<toml::table> read_document(const std::filesystem::path& file_path)
 {
@@ -219,7 +600,7 @@ bool RuntimeConfig::flush_to_disk()
     }
     if (!profile_tables.empty())
         document.emplace("profiles", std::move(profile_tables));
-    
+
     return write_document(document, path());
 }
 
@@ -248,10 +629,24 @@ const std::filesystem::path& RuntimeConfig::path()
     return value;
 }
 
-std::string profile_region(std::string_view profile)
+// Factory function for creating a new S3Client.
+// Credentials (whether SSO token has expired) are checked later
+std::shared_ptr<ClientEntry> make_client(const Aws::S3::S3ClientConfiguration& configuration,
+                                         const RemotePath& path)
 {
-    const Aws::S3::S3ClientConfiguration configuration(std::string(profile).c_str(), true);
-    return {configuration.region.data(), configuration.region.size()};
+    Aws::Client::ClientConfiguration::CredentialProviderConfiguration credentials_configuration;
+    credentials_configuration.profile = path.profile;
+    credentials_configuration.region = configuration.region;
+    auto credentials = Aws::MakeShared<Aws::Auth::DefaultAWSCredentialsProviderChain>(
+        "s3cmd", credentials_configuration);
+
+    const auto profile = Aws::Config::GetCachedConfigProfile(path.profile);
+    const bool uses_sso = profile.IsSsoSessionSet() || !profile.GetSsoStartUrl().empty();
+    return std::make_shared<ClientEntry>(
+        credentials,
+        Aws::MakeShared<Aws::S3::S3Client>(/*allocationTag*/ "s3cmd", credentials, nullptr,
+                                           configuration),
+        uses_sso);
 }
 
 std::shared_ptr<Aws::S3::S3Client> get_client(const RemotePath& path,
@@ -260,37 +655,29 @@ std::shared_ptr<Aws::S3::S3Client> get_client(const RemotePath& path,
     Aws::S3::S3ClientConfiguration configuration(path.profile.c_str());
     if (!region_override.empty())
     {
-        configuration.region.assign(region_override.data(), region_override.size());
+        configuration.region = region_override;
     }
     else if (!path.bucket.empty())
     {
+        // Get region for the client from the 'active' bucket's region
         const auto region = ProfileConfig(path.profile).bucket_region(path.bucket);
         if (!region.empty())
-            configuration.region = region.c_str();
+            configuration.region = region;
     }
 
-    const ClientKey key{path.profile, {configuration.region.data(), configuration.region.size()}};
-    std::shared_ptr<ClientEntry> entry;
-    {
+    // Clients are cached and keyed by (profile, region)
+    const ClientKey key{path.profile, configuration.region};
+
+    auto entry = [&] {
         std::scoped_lock lock(client_mutex);
         if (const auto found = clients.find(key); found != clients.end())
-            entry = found->second;
-    }
+            return found->second;
+        return std::shared_ptr<ClientEntry>{};
+    }();
 
     if (!entry)
     {
-        Aws::Client::ClientConfiguration::CredentialProviderConfiguration credentials_configuration;
-        credentials_configuration.profile = path.profile.c_str();
-        credentials_configuration.region = configuration.region;
-        auto credentials = Aws::MakeShared<Aws::Auth::DefaultAWSCredentialsProviderChain>(
-            "s3cmd", credentials_configuration);
-
-        const auto profile = Aws::Config::GetCachedConfigProfile(path.profile.c_str());
-        auto candidate = std::make_shared<ClientEntry>(
-            credentials,
-            Aws::MakeShared<Aws::S3::S3Client>("s3cmd", credentials, nullptr, configuration),
-            profile.IsSsoSessionSet() || !profile.GetSsoStartUrl().empty()
-        );
+        auto candidate = make_client(configuration, path);
 
         std::scoped_lock lock(client_mutex);
         entry = clients.try_emplace(key, std::move(candidate)).first->second;
@@ -298,18 +685,35 @@ std::shared_ptr<Aws::S3::S3Client> get_client(const RemotePath& path,
 
     if (entry->uses_sso && entry->credentials->GetAWSCredentials().IsEmpty())
     {
-        // Expired SSO credentials
-        const SsoLoginRequired error(path.profile);
-        if (request_proc)
+        const auto failed_entry = entry;
+
+        // Profile is SSO based but the credentials are expired and couldn't be refreshed
+        std::scoped_lock login_lock(sso_login_mutex);
         {
-            const auto title = std::wstring(L"Amazon S3");
-            const auto message = to_wide(error.what());
-            std::array<wchar_t, 1> ignored{};
-            request_proc(plugin_number, RT_MsgOK, const_cast<wchar_t*>(title.data()),
-                         const_cast<wchar_t*>(message.data()), ignored.data(),
-                         static_cast<int>(ignored.size()));
+            // While this thread waits for sso_login_mutex another one might've
+            // completed login and replace clients[key]. Hence we compare newEntry
+            // with entry down below to detect this scenario and check for
+            // possibly refreshed and valid credentials
+            std::scoped_lock lock(client_mutex);
+            entry = clients.at(key);
         }
-        throw error;
+
+        // Don't call GetAWSCredentials() twice on the same provider which could
+        // potentially just repeat a failed refresh request.
+        if (entry == failed_entry || entry->credentials->GetAWSCredentials().IsEmpty())
+        {
+            const auto profile = Aws::Config::GetCachedConfigProfile(path.profile);
+            perform_sso_login(path.profile, profile);
+
+            auto refreshed = make_client(configuration, path);
+            if (refreshed->credentials->GetAWSCredentials().IsEmpty())
+            {
+                throw SsoLoginFailed(std::format(
+                    "AWS SSO login for profile '{}' did not produce credentials", path.profile));
+            }
+            std::scoped_lock lock(client_mutex);
+            entry = clients.insert_or_assign(key, std::move(refreshed)).first->second;
+        }
     }
     return entry->client;
 }
@@ -808,7 +1212,7 @@ HANDLE find_first(const wchar_t* path, WIN32_FIND_DATAW* find_data)
         }
         return state.release();
     }
-    catch (const SsoLoginRequired& error)
+    catch (const SsoLoginFailed& error)
     {
         log_unexpected("FsFindFirstW", error);
         SetLastError(ERROR_LOGON_FAILURE);
