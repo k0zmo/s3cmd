@@ -15,6 +15,7 @@
 #include <aws/core/utils/StringUtils.h>
 #include <aws/core/utils/crypto/Factories.h>
 #include <aws/core/utils/crypto/SecureRandom.h>
+#include <aws/core/utils/logging/FormattedLogSystem.h>
 #include <aws/core/utils/memory/AWSMemory.h>
 #include <aws/core/utils/memory/stl/AWSAllocator.h>
 #include <aws/core/utils/memory/stl/AWSString.h>
@@ -74,6 +75,38 @@ namespace s3cmd {
 namespace {
 constexpr std::uint64_t max_single_part_size = 5ULL * 1024 * 1024 * 1024;
 
+class AwsLogSystem final : public Aws::Utils::Logging::FormattedLogSystem
+{
+public:
+    using FormattedLogSystem::FormattedLogSystem;
+    void Flush() override {}
+
+private:
+    void ProcessFormattedStatement(Aws::String&& statement) override
+    {
+        statement.pop_back(); // FormattedLogSystem always appends a newline
+        log("{}", statement);
+    }
+};
+
+Aws::Utils::Logging::LogLevel parse_log_level(std::string_view value)
+{
+    using enum Aws::Utils::Logging::LogLevel;
+    if (value == "Off")
+        return Off;
+    if (value == "Fatal")
+        return Fatal;
+    if (value == "Error")
+        return Error;
+    if (value == "Warn")
+        return Warn;
+    if (value == "Debug")
+        return Debug;
+    if (value == "Trace")
+        return Trace;
+    return Info;
+}
+
 int plugin_number{};
 tProgressProcW progress_proc{};
 tLogProcW log_proc{};
@@ -99,6 +132,7 @@ struct RuntimeConfig
     };
 
     bool dry_run{};
+    std::string aws_log_level{"Info"};
     std::map<std::string, ProfileSettings, std::less<>> profiles;
 
 private:
@@ -552,6 +586,8 @@ RuntimeConfig& RuntimeConfig::get()
     {
         // Deserialize TOML document into RuntimeConfig
         runtime_config->dry_run = (*document)["settings"]["DryRun"].value_or(false);
+        runtime_config->aws_log_level =
+            (*document)["settings"]["AwsLogLevel"].value_or("Info");
 
         if (const auto* profiles = document->get_as<toml::table>("profiles"))
         {
@@ -580,7 +616,8 @@ bool RuntimeConfig::flush_to_disk()
 {
     // Serialize our config to TOML document and write it to disk
     toml::table document;
-    document.emplace("settings", toml::table{{"DryRun", dry_run}});
+    document.emplace("settings",
+                     toml::table{{"DryRun", dry_run}, {"AwsLogLevel", aws_log_level}});
 
     toml::table profile_tables;
     for (const auto& [profile_name, profile] : profiles)
@@ -1150,6 +1187,14 @@ int initialize(int number, tProgressProcW progress, tLogProcW log, tRequestProcW
     std::unique_lock lock(aws_lifecycle_mtx);
     if (!aws_initialized)
     {
+        {
+            std::scoped_lock config_lock(config_mtx);
+            aws_options.loggingOptions.logLevel =
+                parse_log_level(RuntimeConfig::get().aws_log_level);
+        }
+        aws_options.loggingOptions.logger_create_fn = [] {
+            return Aws::MakeShared<AwsLogSystem>("s3cmd", aws_options.loggingOptions.logLevel);
+        };
         Aws::InitAPI(aws_options);
         aws_init_thread_id = GetCurrentThreadId();
         aws_initialized = true;

@@ -1,6 +1,9 @@
 #include "s3.hpp"
 #include "core.hpp"
 
+#include <aws/core/utils/logging/AWSLogging.h>
+#include <aws/core/utils/logging/LogLevel.h>
+#include <aws/core/utils/logging/LogSystemInterface.h>
 #include <catch2/catch_test_macros.hpp>
 
 #include <cstdlib>
@@ -128,6 +131,29 @@ TEST_CASE("AWS SDK lifecycle is idempotent on its owner thread", "[unit]")
     s3cmd::shutdown();
     s3cmd::shutdown();
     SUCCEED();
+}
+
+TEST_CASE("AWS log level comes from configuration", "[unit]")
+{
+    auto& config = temporary_config();
+
+    SECTION("default")
+    {
+        PluginSession session;
+        REQUIRE(Aws::Utils::Logging::GetLogSystem());
+        CHECK(Aws::Utils::Logging::GetLogSystem()->GetLogLevel() ==
+              Aws::Utils::Logging::LogLevel::Info);
+    }
+
+    SECTION("configured")
+    {
+        std::filesystem::create_directories(config.path.parent_path());
+        std::ofstream(config.path) << "[settings]\nAwsLogLevel = \"Trace\"\n";
+        PluginSession session;
+        REQUIRE(Aws::Utils::Logging::GetLogSystem());
+        CHECK(Aws::Utils::Logging::GetLogSystem()->GetLogLevel() ==
+              Aws::Utils::Logging::LogLevel::Trace);
+    }
 }
 
 TEST_CASE("remote paths identify profile, bucket, and object", "[unit]")

@@ -94,6 +94,15 @@ The plugin exposes a `Region` content field for bucket entries. If you need regi
 The plugin stores its own configuration in `%APPDATA%\s3cmd\s3cmd.toml`
 This file is created when the plugin stores a registered bucket. Otherwise, it might not exist.
 
+Set `AwsLogLevel` under `[settings]` to control which AWS SDK messages are sent to the debugger.
+The level defaults to `Info`.
+
+```toml
+[settings]
+# Off, Fatal, Error, Warn, Info, Debug, or Trace
+AwsLogLevel = "Debug"
+```
+
 ## Limitations
 
 - Transfer resume and multipart transfer are not supported.
