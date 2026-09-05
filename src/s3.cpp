@@ -730,7 +730,7 @@ void log_error(std::string_view operation, std::string_view message)
 template <class Error>
 void log_aws_error(std::string_view operation, const Error& error)
 {
-    log_error(operation, {error.GetMessage().data(), error.GetMessage().size()});
+    log_error(operation, error.GetMessage());
 }
 
 void log_unexpected(std::string_view operation, const std::exception& error)
@@ -839,15 +839,15 @@ bool remote_exists(Aws::S3::S3Client& client, const RemotePath& path)
 {
     log_operation("HeadObject", path, false);
     Aws::S3::Model::HeadObjectRequest request;
-    request.SetBucket(path.bucket.c_str());
-    request.SetKey(path.key.c_str());
+    request.SetBucket(path.bucket);
+    request.SetKey(path.key);
     const auto outcome = client.HeadObject(request);
     if (outcome.IsSuccess())
         return true;
     if (outcome.GetError().GetResponseCode() == Aws::Http::HttpResponseCode::NOT_FOUND)
         return false;
     log_aws_error("HeadObject", outcome.GetError());
-    throw std::runtime_error(outcome.GetError().GetMessage().c_str());
+    throw std::runtime_error(outcome.GetError().GetMessage());
 }
 
 class FindState
@@ -933,11 +933,11 @@ private:
     {
         std::set<std::string> profiles{"default"};
         const auto selected = Aws::Auth::GetConfigProfileName();
-        profiles.emplace(selected.data(), selected.size());
+        profiles.emplace(selected);
         for (const auto& [name, ignored] : Aws::Config::GetCachedConfigProfiles())
-            profiles.emplace(name.data(), name.size());
+            profiles.emplace(name);
         for (const auto& [name, ignored] : Aws::Config::GetCachedCredentialsProfiles())
-            profiles.emplace(name.data(), name.size());
+            profiles.emplace(name);
 
         for (const auto& profile : profiles)
             append_entry(profile, true);
@@ -969,12 +969,8 @@ private:
             const auto& result = outcome.GetResult();
             for (const auto& bucket : result.GetBuckets())
             {
-                const std::string name(bucket.GetName().data(), bucket.GetName().size());
-                const auto& region = bucket.GetBucketRegion();
-                buckets[name] = {
-                    {region.data(), region.size()},
-                    to_file_time(bucket.GetCreationDate()),
-                };
+                buckets[bucket.GetName()] = {bucket.GetBucketRegion(),
+                                             to_file_time(bucket.GetCreationDate())};
             }
 
             if (result.GetContinuationToken().empty())
@@ -996,9 +992,9 @@ private:
         const auto prefix = path.directory_prefix();
         auto client = get_client(path);
         Aws::S3::Model::ListObjectsV2Request request;
-        request.SetBucket(path.bucket.c_str());
+        request.SetBucket(path.bucket);
         request.SetDelimiter("/");
-        request.SetPrefix(prefix.c_str());
+        request.SetPrefix(prefix);
         log_operation("ListObjectsV2", {path.profile, path.bucket, prefix}, false);
 
         for (;;)
@@ -1007,7 +1003,7 @@ private:
             if (!outcome.IsSuccess())
             {
                 log_aws_error("ListObjectsV2", outcome.GetError());
-                throw std::runtime_error(outcome.GetError().GetMessage().c_str());
+                throw std::runtime_error(outcome.GetError().GetMessage());
             }
 
             const auto& result = outcome.GetResult();
@@ -1023,8 +1019,7 @@ private:
             for (const auto& object : result.GetContents())
             {
                 const auto& key = object.GetKey();
-                if (std::string_view(key.data(), key.size()) == prefix ||
-                    key.size() <= prefix.size())
+                if (key == prefix || key.size() <= prefix.size())
                 {
                     continue;
                 }
@@ -1131,7 +1126,7 @@ std::string discover_bucket_region(std::string_view profile, std::string_view bu
     AwsLease lease;
     auto client = get_client({std::string(profile), {}, {}});
     Aws::S3::Model::GetBucketLocationRequest request;
-    request.SetBucket(std::string(bucket).c_str());
+    request.SetBucket(std::string(bucket));
     log("[s3cmd] operation=GetBucketLocation profile={} bucket={}", profile, bucket);
     const auto outcome = client->GetBucketLocation(request);
     if (!outcome.IsSuccess())
@@ -1145,7 +1140,7 @@ std::string discover_bucket_region(std::string_view profile, std::string_view bu
     const auto region =
         Aws::S3::Model::BucketLocationConstraintMapper::GetNameForBucketLocationConstraint(
             location);
-    return {region.data(), region.size()};
+    return region;
 }
 
 int initialize(int number, tProgressProcW progress, tLogProcW log, tRequestProcW request)
@@ -1290,8 +1285,8 @@ try
         AwsLease lease;
         auto client = get_client(path);
         Aws::S3::Model::GetObjectRequest request;
-        request.SetBucket(path.bucket.c_str());
-        request.SetKey(path.key.c_str());
+        request.SetBucket(path.bucket);
+        request.SetKey(path.key);
         request.SetResponseStreamFactory([partial] {
             return Aws::New<std::fstream>("s3cmd", partial,
                                           std::ios::out | std::ios::binary | std::ios::trunc);
@@ -1371,8 +1366,8 @@ try
             return FS_FILE_READERROR;
 
         Aws::S3::Model::PutObjectRequest request;
-        request.SetBucket(path.bucket.c_str());
-        request.SetKey(path.key.c_str());
+        request.SetBucket(path.bucket);
+        request.SetKey(path.key);
         request.SetBody(body);
         request.SetContentLength(static_cast<long long>(size));
         if ((copy_flags & FS_COPYFLAGS_OVERWRITE) == 0)
@@ -1429,8 +1424,8 @@ try
     AwsLease lease;
     auto client = get_client(path);
     Aws::S3::Model::DeleteObjectRequest request;
-    request.SetBucket(path.bucket.c_str());
-    request.SetKey(path.key.c_str());
+    request.SetBucket(path.bucket);
+    request.SetKey(path.key);
     const auto outcome = client->DeleteObject(request);
     if (!outcome.IsSuccess())
         log_aws_error("DeleteObject", outcome.GetError());
@@ -1469,7 +1464,8 @@ try
             // with profile's default region being the default option
             {
                 AwsLease lease;
-                region = profile_region(path.profile);
+                const Aws::S3::S3ClientConfiguration configuration{path.profile.c_str(), true};
+                region = configuration.region;
             }
 
             if (request_proc)
@@ -1513,8 +1509,8 @@ try
     AwsLease lease;
     auto client = get_client(path);
     Aws::S3::Model::PutObjectRequest request;
-    request.SetBucket(path.bucket.c_str());
-    request.SetKey(path.directory_prefix().c_str());
+    request.SetBucket(path.bucket);
+    request.SetKey(path.directory_prefix());
     request.SetBody(Aws::MakeShared<Aws::StringStream>("s3cmd"));
     request.SetContentLength(0);
     const auto outcome = client->PutObject(request);
@@ -1552,8 +1548,8 @@ try
     AwsLease lease;
     auto client = get_client(path);
     Aws::S3::Model::ListObjectsV2Request list;
-    list.SetBucket(path.bucket.c_str());
-    list.SetPrefix(prefix.c_str());
+    list.SetBucket(path.bucket);
+    list.SetPrefix(prefix);
     list.SetMaxKeys(2);
     log_operation("ListObjectsV2", {path.profile, path.bucket, prefix}, false);
     const auto listed = client->ListObjectsV2(list);
@@ -1566,7 +1562,7 @@ try
     bool marker_exists = false;
     for (const auto& object : listed.GetResult().GetContents())
     {
-        if (std::string_view(object.GetKey().data(), object.GetKey().size()) != prefix)
+        if (object.GetKey() != prefix)
             return false;
         marker_exists = true;
     }
@@ -1582,8 +1578,8 @@ try
     }
 
     Aws::S3::Model::DeleteObjectRequest remove;
-    remove.SetBucket(path.bucket.c_str());
-    remove.SetKey(prefix.c_str());
+    remove.SetBucket(path.bucket);
+    remove.SetKey(prefix);
     const auto removed = client->DeleteObject(remove);
     if (!removed.IsSuccess())
         log_aws_error("DeleteObject directory marker", removed.GetError());
@@ -1633,8 +1629,8 @@ try
         return FS_FILE_EXISTS;
 
     Aws::S3::Model::CopyObjectRequest copy;
-    copy.SetBucket(target.bucket.c_str());
-    copy.SetKey(target.key.c_str());
+    copy.SetBucket(target.bucket);
+    copy.SetKey(target.key);
     auto copy_source = std::format("{}/{}", source.bucket, source.key);
     copy.SetCopySource(std::move(copy_source));
     const auto copy_outcome = target_client->CopyObject(copy);
@@ -1651,8 +1647,8 @@ try
         auto source_client = get_client(source);
         log_operation("DeleteObject", source, false);
         Aws::S3::Model::DeleteObjectRequest remove;
-        remove.SetBucket(source.bucket.c_str());
-        remove.SetKey(source.key.c_str());
+        remove.SetBucket(source.bucket);
+        remove.SetKey(source.key);
         const auto delete_outcome = source_client->DeleteObject(remove);
         if (!delete_outcome.IsSuccess())
         {
