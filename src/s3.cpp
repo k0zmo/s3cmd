@@ -105,7 +105,7 @@ private:
 
 std::shared_mutex aws_lifecycle_mtx;
 Aws::SDKOptions aws_options;
-DWORD aws_init_thread_id{};
+std::thread::id aws_init_thread_id{};
 bool aws_initialized{};
 std::optional<PluginHost> plugin_host{};
 
@@ -789,12 +789,12 @@ int initialize(int number, tProgressProcW progress, tLogProcW log, tRequestProcW
             return Aws::MakeShared<AwsLogSystem>("s3cmd", aws_options.loggingOptions.logLevel);
         };
         Aws::InitAPI(aws_options);
-        aws_init_thread_id = GetCurrentThreadId();
+        aws_init_thread_id = std::this_thread::get_id();
         aws_initialized = true;
     }
     else
     {
-        assert(aws_init_thread_id == GetCurrentThreadId());
+        assert(aws_init_thread_id == std::this_thread::get_id());
     }
 
     plugin_host.emplace(number, progress, log, request);
@@ -810,7 +810,7 @@ void shutdown()
     if (!aws_initialized)
         return;
 
-    const auto same_thread = aws_init_thread_id == GetCurrentThreadId();
+    const auto same_thread = aws_init_thread_id == std::this_thread::get_id();
     assert(same_thread);
     if (!same_thread)
         return;
@@ -821,7 +821,7 @@ void shutdown()
     }
     Aws::ShutdownAPI(aws_options);
     aws_initialized = false;
-    aws_init_thread_id = 0;
+    aws_init_thread_id = std::thread::id{};
 }
 
 HANDLE find_first(const wchar_t* path, WIN32_FIND_DATAW* find_data)
