@@ -20,7 +20,6 @@ public:
 };
 
 void perform_sso_login(PluginHost& plugin_host,
-                       std::string_view profile_name,
                        const Aws::Config::Profile& profile);
 
 } // namespace s3cmd

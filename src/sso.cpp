@@ -441,11 +441,11 @@ void perform_device_sso_login(PluginHost& plugin_host, std::string_view profile_
 
 } // namespace
 
-void perform_sso_login(PluginHost& plugin_host, std::string_view profile_name,
-                       const Aws::Config::Profile& profile)
+void perform_sso_login(PluginHost& plugin_host, const Aws::Config::Profile& profile)
 {
     assert(profile.IsSsoSessionSet());
 
+    const auto& profile_name = profile.GetName();
     const auto& session = profile.GetSsoSession();
     const auto& start_url = session.GetSsoStartUrl();
     const auto& region = session.GetSsoRegion();

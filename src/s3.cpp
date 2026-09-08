@@ -334,8 +334,7 @@ std::shared_ptr<Aws::S3::S3Client> get_client(const RemotePath& path,
         // potentially just repeat a failed refresh request.
         if (entry == failed_entry || entry->credentials->GetAWSCredentials().IsEmpty())
         {
-            const auto profile = Aws::Config::GetCachedConfigProfile(path.profile);
-            perform_sso_login(*plugin_host, path.profile, profile);
+            perform_sso_login(*plugin_host, Aws::Config::GetCachedConfigProfile(path.profile));
 
             auto refreshed = make_client(configuration, path);
             if (refreshed->credentials->GetAWSCredentials().IsEmpty())
