@@ -383,8 +383,12 @@ TEST_CASE("runtime dry run completes S3 operations without side effects", "[unit
     CHECK(profile.registered_buckets().contains("registered-bucket"));
 }
 
-TEST_CASE("expired SSO session asks before starting browser login", "[unit]")
+TEST_CASE("expired SSO profiles require supported login configuration", "[unit]")
 {
+    bool legacy{};
+    SECTION("session profile asks before browser login") {}
+    SECTION("legacy profile reports migration and external login") { legacy = true; }
+
     auto& ini = temporary_config();
     const auto config = ini.root / L"config";
     const auto credentials = ini.root / L"credentials";
@@ -392,12 +396,12 @@ TEST_CASE("expired SSO session asks before starting browser login", "[unit]")
         std::ofstream file(config);
         REQUIRE(file);
         file << "[profile expired]\n"
-                "sso_session = expired\n"
                 "sso_account_id = 111122223333\n"
                 "sso_role_name = ReadOnly\n"
-                "region = eu-central-1\n"
-                "[sso-session expired]\n"
-                "sso_start_url = https://example.awsapps.com/start\n"
+                "region = eu-central-1\n";
+        if (!legacy)
+            file << "sso_session = expired\n[sso-session expired]\n";
+        file << "sso_start_url = https://example.awsapps.com/start\n"
                 "sso_region = eu-central-1\n"
                 "sso_registration_scopes = sso:account:access\n";
     }
@@ -424,10 +428,22 @@ TEST_CASE("expired SSO session asks before starting browser login", "[unit]")
     CHECK(s3cmd::find_first(path, &entry) == INVALID_HANDLE_VALUE);
     CHECK(GetLastError() == ERROR_LOGON_FAILURE);
     CHECK(request_count == 1);
-    CHECK(request_type == RT_MsgYesNo);
-    CHECK(request_text.find(L"Start browser login") != std::wstring::npos);
-    CHECK(request_text.find(L"aws sso login") == std::wstring::npos);
-    CHECK(log_text.find(L"was cancelled") != std::wstring::npos);
+    if (legacy)
+    {
+        CHECK(request_type == RT_MsgOK);
+        CHECK(request_text.find(L"legacy configuration") != std::wstring::npos);
+        CHECK(request_text.find(L"aws configure sso --profile \"expired\"") != std::wstring::npos);
+        CHECK(request_text.find(L"aws sso login --profile \"expired\"") != std::wstring::npos);
+        CHECK(request_text.find(L"Start browser login") == std::wstring::npos);
+        CHECK(log_text.find(request_text) != std::wstring::npos);
+    }
+    else
+    {
+        CHECK(request_type == RT_MsgYesNo);
+        CHECK(request_text.find(L"Start browser login") != std::wstring::npos);
+        CHECK(request_text.find(L"aws sso login") == std::wstring::npos);
+        CHECK(log_text.find(L"was cancelled") != std::wstring::npos);
+    }
 
     CHECK(s3cmd::find_first(path, &entry) == INVALID_HANDLE_VALUE);
     CHECK(request_count == 2);

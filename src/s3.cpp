@@ -334,7 +334,22 @@ std::shared_ptr<Aws::S3::S3Client> get_client(const RemotePath& path,
         // potentially just repeat a failed refresh request.
         if (entry == failed_entry || entry->credentials->GetAWSCredentials().IsEmpty())
         {
-            perform_sso_login(*plugin_host, Aws::Config::GetCachedConfigProfile(path.profile));
+            const auto profile = Aws::Config::GetCachedConfigProfile(path.profile);
+            if (!profile.IsSsoSessionSet())
+            {
+                const auto message = std::format(
+                    "AWS SSO profile '{}' uses legacy configuration. Built-in login needs a "
+                    "sso_session entry that points to an [sso-session] section.\n\n"
+                    "To update this profile, run:\naws configure sso --profile \"{}\"\n"
+                    "When prompted, enter an SSO session name. Then retry the operation.\n\n"
+                    "To keep the legacy configuration, sign in with AWS CLI instead:\n"
+                    "aws sso login --profile \"{}\"\nThen retry the operation.",
+                    path.profile, path.profile, path.profile);
+                plugin_host->notify_message_box(PluginHost::message_box_type::msg_ok, L"Amazon S3",
+                                                to_wide(message).c_str());
+                throw SsoLoginFailed(message);
+            }
+            perform_sso_login(*plugin_host, profile);
 
             auto refreshed = make_client(configuration, path);
             if (refreshed->credentials->GetAWSCredentials().IsEmpty())
