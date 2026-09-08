@@ -307,16 +307,19 @@ void perform_pkce_sso_login(PluginHost& plugin_host, std::string_view profile_na
     bool completed{};
     try
     {
-        if (!open_url(authorization_url) &&
-            !plugin_host.notify_message_box(
-                PluginHost::message_box_type::msg_ok_cancel, title,
-                L"The AWS SSO browser could not be opened automatically.\n\n"
-                L"Open this URL manually:\n{}\n\n"
-                L"Click OK to keep waiting or Cancel to use another login method.",
-                to_wide(authorization_url)))
+        if (!open_url(authorization_url))
         {
-            throw SsoLoginFailed(
-                std::format("AWS SSO login for profile '{}' was cancelled", profile_name));
+            auto url_buffer = to_wide(authorization_url);
+            url_buffer.push_back(L'\0'); // RequestProc's maxlen includes the terminator.
+            if (!plugin_host.notify_message_box_result(
+                PluginHost::message_box_type::url, title,
+                L"The AWS SSO browser could not be opened automatically.\n\n"
+                L"Copy or open this URL manually, then click OK to keep waiting.",
+                url_buffer))
+            {
+                throw SsoLoginFailed(
+                    std::format("AWS SSO login for profile '{}' was cancelled", profile_name));
+            }
         }
 
         std::unique_lock lock(callback.mutex);
