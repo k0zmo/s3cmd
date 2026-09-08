@@ -32,7 +32,6 @@
 #include <algorithm>
 #include <cassert>
 #include <chrono>
-#include <condition_variable>
 #include <cstddef>
 #include <cstdint>
 #include <filesystem>
@@ -41,16 +40,50 @@
 #include <fstream>
 #include <mutex>
 #include <optional>
+#include <semaphore>
+#include <stdexcept>
 #include <string>
 #include <string_view>
 #include <system_error>
 #include <thread>
+#include <utility>
+
+using std::chrono::steady_clock;
+using std::chrono::seconds;
+using namespace std::chrono_literals;
 
 namespace s3cmd {
+
+SsoLoginFailed::SsoLoginFailed(std::string message)
+    : std::runtime_error(std::move(message))
+{
+}
+
+SsoLoginCancelled::SsoLoginCancelled(std::string_view profile)
+    : SsoLoginFailed(std::format("AWS SSO login for profile '{}' was cancelled", profile))
+{
+}
 
 namespace {
 
 constexpr const wchar_t* title = L"Amazon S3";
+
+bool wait_for_sso(PluginHost& host,
+                  std::string_view profile,
+                  std::binary_semaphore& ready,
+                  steady_clock::time_point deadline)
+{
+    const auto source = to_wide(profile);
+    while (steady_clock::now() < deadline)
+    {
+        if (host.notify_progress(source.c_str(), L"Waiting for AWS SSO login", 0))
+            throw SsoLoginCancelled(profile);
+        const auto next = std::min(deadline, steady_clock::now() + 100ms);
+        if (ready.try_acquire_until(next))
+            return true;
+    }
+    return false;
+}
 
 Aws::SSOOIDC::Model::RegisterClientResult
     register_sso_client(const std::filesystem::path& cache_directory, const Aws::String& start_url,
@@ -224,7 +257,7 @@ void perform_pkce_sso_login(PluginHost& plugin_host, std::string_view profile_na
     struct Callback
     {
         std::mutex mutex;
-        std::condition_variable ready;
+        std::binary_semaphore ready{0};
         std::optional<std::string> code;
         std::optional<std::string> error;
     } callback;
@@ -258,7 +291,7 @@ void perform_pkce_sso_login(PluginHost& plugin_host, std::string_view profile_na
                   "session expires. You can now close this tab."
                 : "AWS SSO login failed. You can close this tab.",
             "text/plain; charset=utf-8");
-        callback.ready.notify_one();
+        callback.ready.release();
     });
 
     const auto port = server.bind_to_any_port("127.0.0.1");
@@ -297,10 +330,12 @@ void perform_pkce_sso_login(PluginHost& plugin_host, std::string_view profile_na
             if (!callback.code && !callback.error)
             {
                 callback.error = "AWS SSO browser callback server stopped unexpectedly";
-                callback.ready.notify_one();
+                callback.ready.release();
             }
         }
     });
+    // stop() only closes the socket once listen_after_bind() has started.
+    server.wait_until_ready();
 
     std::optional<std::string> code;
     std::optional<std::string> callback_error;
@@ -317,15 +352,13 @@ void perform_pkce_sso_login(PluginHost& plugin_host, std::string_view profile_na
                 L"Copy or open this URL manually, then click OK to keep waiting.",
                 url_buffer))
             {
-                throw SsoLoginFailed(
-                    std::format("AWS SSO login for profile '{}' was cancelled", profile_name));
+                throw SsoLoginCancelled(profile_name);
             }
         }
 
-        std::unique_lock lock(callback.mutex);
-        completed = callback.ready.wait_for(lock, std::chrono::minutes(10), [&] {
-            return callback.code.has_value() || callback.error.has_value();
-        });
+        completed = wait_for_sso(plugin_host, profile_name, callback.ready,
+                                         steady_clock::now() + 10min);
+        std::scoped_lock lock(callback.mutex);
         code = callback.code;
         callback_error = callback.error;
     }
@@ -399,8 +432,7 @@ void perform_device_sso_login(PluginHost& plugin_host, std::string_view profile_
             L"URL: {}\nCode: {}\n\nClick OK after AWS reports success.",
             to_wide(profile_name), to_wide(url), to_wide(device.GetUserCode())))
     {
-        throw SsoLoginFailed(
-            std::format("AWS SSO login for profile '{}' was cancelled", profile_name));
+        throw SsoLoginCancelled(profile_name);
     }
 
     if (!browser_opened)
@@ -412,11 +444,18 @@ void perform_device_sso_login(PluginHost& plugin_host, std::string_view profile_
     token_request.SetGrantType("urn:ietf:params:oauth:grant-type:device_code");
     token_request.SetDeviceCode(device.GetDeviceCode());
 
-    const auto deadline =
-        std::chrono::steady_clock::now() + std::chrono::seconds(device.GetExpiresIn());
-    auto interval = std::max(1, device.GetInterval());
-    while (std::chrono::steady_clock::now() < deadline)
+    const auto deadline = steady_clock::now() + seconds(device.GetExpiresIn());
+    std::binary_semaphore poll_timer{0}; // Never signalled, only waited on
+    std::chrono::seconds interval{std::max(1, device.GetInterval())};
+    while (steady_clock::now() < deadline)
     {
+        // Sleep for `interval` (in "chunks" of 100ms) while calling plugin host with
+        // notify_progress(0). We do we in this way to enable the end user to cancel the SSO
+        wait_for_sso(plugin_host, profile_name, poll_timer,
+                     std::min(deadline, steady_clock::now() + interval));
+        if (steady_clock::now() >= deadline)
+            break;
+
         const auto token = oidc.CreateToken(token_request);
         if (token.IsSuccess())
         {
@@ -425,18 +464,18 @@ void perform_device_sso_login(PluginHost& plugin_host, std::string_view profile_
             return;
         }
 
+        // Still no token
         switch (token.GetError().GetErrorType())
         {
         case Aws::SSOOIDC::SSOOIDCErrors::AUTHORIZATION_PENDING:
             break;
         case Aws::SSOOIDC::SSOOIDCErrors::SLOW_DOWN:
-            interval = std::min(interval + 5, 30);
+            interval = std::min(interval + 5s, 30s);
             break;
         default:
             throw SsoLoginFailed(
                 std::format("AWS SSO token request failed: {}", token.GetError().GetMessage()));
         }
-        std::this_thread::sleep_for(std::chrono::seconds(interval));
     }
 
     throw SsoLoginFailed(std::format("AWS SSO login for profile '{}' timed out", profile_name));
@@ -469,8 +508,7 @@ void perform_sso_login(PluginHost& plugin_host, const Aws::Config::Profile& prof
             L"Start browser login?",
             to_wide(profile_name)))
     {
-        throw SsoLoginFailed(
-            std::format("AWS SSO login for profile '{}' was cancelled", profile_name));
+        throw SsoLoginCancelled(profile_name);
     }
 
     Aws::Client::ClientConfiguration configuration;
@@ -481,6 +519,10 @@ void perform_sso_login(PluginHost& plugin_host, const Aws::Config::Profile& prof
     {
         perform_pkce_sso_login(plugin_host, profile_name, start_url, region, oidc);
         return;
+    }
+    catch (const SsoLoginCancelled&)
+    {
+        throw;
     }
     catch (const SsoLoginFailed& error)
     {

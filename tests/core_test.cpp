@@ -426,7 +426,7 @@ TEST_CASE("expired SSO profiles require supported login configuration", "[unit]"
     wchar_t path[] = L"\\expired";
     WIN32_FIND_DATAW entry{};
     CHECK(s3cmd::find_first(path, &entry) == INVALID_HANDLE_VALUE);
-    CHECK(GetLastError() == ERROR_LOGON_FAILURE);
+    CHECK(GetLastError() == (legacy ? ERROR_LOGON_FAILURE : ERROR_CANCELLED));
     CHECK(request_count == 1);
     if (legacy)
     {

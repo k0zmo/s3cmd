@@ -24,9 +24,14 @@ public:
                tLogProcW log_proc,
                tRequestProcW request_proc);
 
+    // Reports progress; returns true if the host requests cancellation.
+    // Returns false when no progress callback is available.
     bool notify_progress(const wchar_t* source, const wchar_t* target, int percent);
+
+    // Logs an important error; does nothing when no log callback is available.
     void notify_log(const wchar_t* message);
 
+	// Request types matching the WFX RT_* constants.
 	enum class message_box_type : int
 	{
 		other,
@@ -42,12 +47,16 @@ public:
 		msg_ok_cancel
 	};
 
+    // Returns whether the host supplied a request callback.
     bool is_notify_message_box_available() const { return request_proc_ != nullptr; }
 
+    // Shows a host dialog without text input.
+    // Returns value depends on the type of dialog that was shown and what user selected
     bool notify_message_box(message_box_type type,
                             const wchar_t* title,
                             const wchar_t* text);
 
+    // Formats the dialog text, then calls notify_message_box().
     template <typename... Args>
     bool notify_message_box(message_box_type type,
                             const wchar_t* title,
@@ -58,13 +67,16 @@ public:
                                    std::make_wformat_args(args...));
     }
 
+    // Shows a host dialog using `out` as the text input buffer.
+    // `out` must be pre-sized with a room for terminating null.
+    // Its size is passed to the host and is not adjusted after the call.
+    // Returns value depends on the type of dialog that was shown and what user selected
     bool notify_message_box_result(message_box_type type,
                                    const wchar_t* title,
                                    const wchar_t* text,
                                    std::wstring& out);
 
 private:
-    // Calls notify_message_box with formatter string as text
     bool vnotify_message_box(message_box_type type,
                              const wchar_t* title,
                              std::wstring_view format_str,

@@ -857,6 +857,12 @@ HANDLE find_first(const wchar_t* path, WIN32_FIND_DATAW* find_data)
         }
         return state.release();
     }
+    catch (const SsoLoginCancelled& error)
+    {
+        log_unexpected("FsFindFirstW", error);
+        SetLastError(ERROR_CANCELLED);
+        return INVALID_HANDLE_VALUE;
+    }
     catch (const SsoLoginFailed& error)
     {
         log_unexpected("FsFindFirstW", error);
@@ -970,6 +976,10 @@ try
     report_progress(remote_name, local_name, 100);
     return FS_FILE_OK;
 }
+catch (const SsoLoginCancelled&)
+{
+    return FS_FILE_USERABORT;
+}
 catch (const std::exception& error)
 {
     log_unexpected("FsGetFileW", error);
@@ -1050,6 +1060,10 @@ try
 
     report_progress(local_name, remote_name, 100);
     return FS_FILE_OK;
+}
+catch (const SsoLoginCancelled&)
+{
+    return FS_FILE_USERABORT;
 }
 catch (const std::exception& error)
 {
@@ -1308,6 +1322,10 @@ try
 
     report_progress(old_name, new_name, 100);
     return FS_FILE_OK;
+}
+catch (const SsoLoginCancelled&)
+{
+    return FS_FILE_USERABORT;
 }
 catch (const std::exception& error)
 {
