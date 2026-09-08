@@ -1,22 +1,27 @@
 #include "s3.hpp"
 #include "core.hpp"
+#include "fsplugin.h"
 #include "log.hpp"
 #include "sso.hpp"
 
+#include <aws/core/AmazonWebServiceRequest.h>
 #include <aws/core/Aws.h>
 #include <aws/core/auth/AWSCredentialsProvider.h>
 #include <aws/core/auth/AWSCredentialsProviderChain.h>
 #include <aws/core/client/ClientConfiguration.h>
 #include <aws/core/config/ConfigAndCredentialsCacheManager.h>
+#include <aws/core/http/HttpRequest.h>
 #include <aws/core/http/HttpResponse.h>
 #include <aws/core/utils/DateTime.h>
 #include <aws/core/utils/logging/FormattedLogSystem.h>
+#include <aws/core/utils/logging/LogLevel.h>
 #include <aws/core/utils/memory/AWSMemory.h>
 #include <aws/core/utils/memory/stl/AWSAllocator.h>
 #include <aws/core/utils/memory/stl/AWSString.h>
 #include <aws/core/utils/memory/stl/AWSStringStream.h>
 #include <aws/s3/S3Client.h>
 #include <aws/s3/S3ClientConfiguration.h>
+#include <aws/s3/model/BucketLocationConstraint.h>
 #include <aws/s3/model/CopyObjectRequest.h>
 #include <aws/s3/model/DeleteObjectRequest.h>
 #include <aws/s3/model/GetBucketLocationRequest.h>
@@ -25,7 +30,11 @@
 #include <aws/s3/model/ListBucketsRequest.h>
 #include <aws/s3/model/ListObjectsV2Request.h>
 #include <aws/s3/model/PutObjectRequest.h>
+
 #include <toml++/toml.hpp>
+
+// FIXME: This should be removed
+#include <Windows.h> // GetCurrentThreadId, SetLastError, GetTempFileNameW, MoveFileExW
 
 #include <algorithm>
 #include <array>
@@ -40,7 +49,9 @@
 #include <filesystem>
 #include <format>
 #include <fstream>
+#include <functional>
 #include <ios>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -50,6 +61,7 @@
 #include <string>
 #include <string_view>
 #include <system_error>
+#include <thread>
 #include <utility>
 #include <vector>
 

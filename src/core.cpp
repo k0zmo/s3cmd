@@ -1,4 +1,5 @@
 #include "core.hpp"
+#include "fsplugin.h"
 
 #include <Windows.h>
 
@@ -6,8 +7,12 @@
 #include <array>
 #include <cstdlib>
 #include <filesystem>
+#include <format>
+#include <iterator>
 #include <memory>
 #include <stdexcept>
+#include <string>
+#include <string_view>
 
 namespace s3cmd {
 

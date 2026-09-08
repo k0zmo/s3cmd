@@ -1,16 +1,20 @@
 #include "s3.hpp"
 #include "core.hpp"
+#include "fsplugin.h"
 
 #include <aws/core/utils/logging/AWSLogging.h>
 #include <aws/core/utils/logging/LogLevel.h>
 #include <aws/core/utils/logging/LogSystemInterface.h>
 #include <catch2/catch_test_macros.hpp>
 
+#include <Windows.h> // GetCurrentProcessId, GetTickCount, SetLastError, GetLastError
+
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <system_error>
 
 namespace {
