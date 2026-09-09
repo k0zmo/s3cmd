@@ -6,7 +6,7 @@
 #undef GetObject
 
 #include <aws/core/auth/bearer-token-provider/SSOBearerTokenProvider.h>
-#include <aws/core/auth/AWSCredentialsProvider.h>
+#include <aws/core/auth/AWSCredentials.h>
 #include <aws/core/auth/AWSCredentialsProvider.h>
 #include <aws/core/client/ClientConfiguration.h>
 #include <aws/core/utils/Array.h>
@@ -513,7 +513,9 @@ void perform_sso_login(PluginHost& plugin_host, const Aws::Config::Profile& prof
 
     Aws::Client::ClientConfiguration configuration;
     configuration.region = region;
-    Aws::SSOOIDC::SSOOIDCClient oidc(configuration);
+    // Use empty AWS credentials to prevent SigV4 signing.
+    // These OIDC flows authenticate with the client secret.
+    Aws::SSOOIDC::SSOOIDCClient oidc(Aws::Auth::AWSCredentials{}, configuration);
 
     try
     {
