@@ -26,6 +26,7 @@ public:
 };
 
 void perform_sso_login(PluginHost& plugin_host,
-                       const Aws::Config::Profile& profile);
+                       const Aws::Config::Profile& profile,
+                       bool prefer_device_code);
 
 } // namespace s3cmd

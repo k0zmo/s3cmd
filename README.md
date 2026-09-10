@@ -40,9 +40,9 @@ aws configure sso --profile work
 
 The profile must reference an `[sso-session]` section.
 
-When an SSO session is missing or expired, the plugin opens the AWS PKCE browser login flow,
+By default, when an SSO session is missing or expired, the plugin opens the AWS PKCE browser login flow,
 receives the callback on `127.0.0.1`, and stores the token in the standard AWS SSO cache.
-If PKCE fails, the plugin offers device-code login as a fallback. The AWS CLI is not required.
+If PKCE fails, the plugin offers device-code login as a fallback.
 
 ## Use
 
@@ -102,6 +102,16 @@ The level defaults to `Info`.
 # Off, Fatal, Error, Warn, Info, Debug, or Trace
 AwsLogLevel = "Debug"
 ```
+
+To use device-code login directly, set `PreferSsoDeviceCode` under `[settings]`:
+
+```toml
+[settings]
+PreferSsoDeviceCode = true
+```
+
+The default is `false`, which selects PKCE with device-code fallback.
+Restart the file manager after changing this setting.
 
 ## Limitations
 

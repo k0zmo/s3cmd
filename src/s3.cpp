@@ -124,6 +124,7 @@ struct RuntimeConfig
     };
 
     bool dry_run{};
+    bool prefer_sso_device_code{};
     std::string aws_log_level{"Info"};
     std::map<std::string, ProfileSettings, std::less<>> profiles;
 
@@ -206,6 +207,8 @@ RuntimeConfig& RuntimeConfig::get()
     {
         // Deserialize TOML document into RuntimeConfig
         runtime_config->dry_run = (*document)["settings"]["DryRun"].value_or(false);
+        runtime_config->prefer_sso_device_code =
+            (*document)["settings"]["PreferSsoDeviceCode"].value_or(false);
         runtime_config->aws_log_level =
             (*document)["settings"]["AwsLogLevel"].value_or("Info");
 
@@ -236,8 +239,9 @@ bool RuntimeConfig::flush_to_disk()
 {
     // Serialize our config to TOML document and write it to disk
     toml::table document;
-    document.emplace("settings",
-                     toml::table{{"DryRun", dry_run}, {"AwsLogLevel", aws_log_level}});
+    document.emplace("settings", toml::table{{"DryRun", dry_run},
+                                             {"AwsLogLevel", aws_log_level},
+                                             {"PreferSsoDeviceCode", prefer_sso_device_code}});
 
     toml::table profile_tables;
     for (const auto& [profile_name, profile] : profiles)
@@ -349,7 +353,11 @@ std::shared_ptr<Aws::S3::S3Client> get_client(const RemotePath& path,
                                                 to_wide(message).c_str());
                 throw SsoLoginFailed(message);
             }
-            perform_sso_login(*plugin_host, profile);
+            const auto prefer_device_code = [] {
+                std::scoped_lock lock(config_mtx);
+                return RuntimeConfig::get().prefer_sso_device_code;
+            }();
+            perform_sso_login(*plugin_host, profile, prefer_device_code);
 
             auto refreshed = make_client(configuration, path);
             if (refreshed->credentials->GetAWSCredentials().IsEmpty())

@@ -2,7 +2,7 @@
 #include "core.hpp"
 #include "log.hpp"
 
-// Windows defines GetObject as GetObjectA, including in the AWS JSON API.
+// Windows defines GetObject as GetObjectA
 #undef GetObject
 
 #include <aws/core/auth/bearer-token-provider/SSOBearerTokenProvider.h>
@@ -334,7 +334,6 @@ void perform_pkce_sso_login(PluginHost& plugin_host, std::string_view profile_na
             }
         }
     });
-    // stop() only closes the socket once listen_after_bind() has started.
     server.wait_until_ready();
 
     std::optional<std::string> code;
@@ -483,7 +482,9 @@ void perform_device_sso_login(PluginHost& plugin_host, std::string_view profile_
 
 } // namespace
 
-void perform_sso_login(PluginHost& plugin_host, const Aws::Config::Profile& profile)
+void perform_sso_login(PluginHost& plugin_host,
+                       const Aws::Config::Profile& profile,
+                       bool prefer_device_code)
 {
     assert(profile.IsSsoSessionSet());
 
@@ -517,24 +518,28 @@ void perform_sso_login(PluginHost& plugin_host, const Aws::Config::Profile& prof
     // These OIDC flows authenticate with the client secret.
     Aws::SSOOIDC::SSOOIDCClient oidc(Aws::Auth::AWSCredentials{}, configuration);
 
-    try
+    if (!prefer_device_code)
     {
-        perform_pkce_sso_login(plugin_host, profile_name, start_url, region, oidc);
-        return;
-    }
-    catch (const SsoLoginCancelled&)
-    {
-        throw;
-    }
-    catch (const SsoLoginFailed& error)
-    {
-        log("[s3cmd] AWS SSO PKCE login failed: {}", error.what());
-        if (!plugin_host.notify_message_box(PluginHost::message_box_type::msg_yes_no, title,
-                                            L"AWS SSO browser login failed:\n{}\n\n"
-                                            L"Try device-code login instead?",
-                                            to_wide(error.what())))
+        try
+        {
+            perform_pkce_sso_login(plugin_host, profile_name, start_url, region, oidc);
+            return;
+        }
+        catch (const SsoLoginCancelled&)
         {
             throw;
+        }
+        catch (const SsoLoginFailed& error)
+        {
+            log("[s3cmd] AWS SSO PKCE login failed: {}", error.what());
+            if (!plugin_host.notify_message_box(PluginHost::message_box_type::msg_yes_no, title,
+                                                L"AWS SSO browser login failed:\n{}\n\n"
+                                                L"Try device-code login instead?",
+                                                to_wide(error.what())))
+            {
+                throw;
+            }
+            // Fallthrough to device code
         }
     }
 
