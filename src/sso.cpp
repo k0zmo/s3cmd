@@ -425,11 +425,15 @@ void perform_device_sso_login(PluginHost& plugin_host, std::string_view profile_
                           ? device.GetVerificationUri()
                           : device.GetVerificationUriComplete();
     const auto browser_opened = open_url(url);
-    if (!plugin_host.notify_message_box(
-            PluginHost::message_box_type::msg_ok_cancel, title,
-            L"Complete AWS SSO login for profile '{}' in your browser.\n\n"
-            L"URL: {}\nCode: {}\n\nClick OK after AWS reports success.",
-            to_wide(profile_name), to_wide(url), to_wide(device.GetUserCode())))
+    auto url_buffer = to_wide(url);
+    url_buffer.push_back(L'\0'); // RequestProc's maxlen includes the terminator.
+    const auto message = std::format(
+        L"Complete AWS SSO login for profile '{}' in your browser.\n\n"
+        L"Code: {}\n\nYou can copy the URL from the field below.\n\n"
+        L"Click OK after AWS reports success.",
+        to_wide(profile_name), to_wide(device.GetUserCode()));
+    if (!plugin_host.notify_message_box_result(
+            PluginHost::message_box_type::url, title, message.c_str(), url_buffer))
     {
         throw SsoLoginCancelled(profile_name);
     }
