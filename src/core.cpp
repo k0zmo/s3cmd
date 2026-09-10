@@ -1,11 +1,112 @@
 #include "core.hpp"
+#include "fsplugin.h"
 
 #include <Windows.h>
 
 #include <algorithm>
+#include <array>
+#include <cstdlib>
+#include <filesystem>
+#include <format>
+#include <iterator>
+#include <memory>
 #include <stdexcept>
+#include <string>
+#include <string_view>
 
 namespace s3cmd {
+
+const std::filesystem::path& config_directory_path()
+{
+    static std::filesystem::path value = [] {
+#ifdef _WIN32
+        wchar_t* app_data{};
+        std::size_t size{};
+        // _wdupenv_s allocates a correctly sized UTF-16 copy.
+        if (_wdupenv_s(&app_data, &size, L"APPDATA") != 0 || !app_data || !*app_data)
+        {
+            std::free(app_data);
+            throw std::runtime_error("APPDATA is not set");
+        }
+        std::unique_ptr<wchar_t, decltype(&std::free)> releaser(app_data, &std::free);
+        return std::filesystem::path(releaser.get()) / L"s3cmd";
+#else
+        if (const auto* config_home = std::getenv("XDG_CONFIG_HOME"); config_home && *config_home)
+            return std::filesystem::path(config_home) / "s3cmd";
+        if (const auto* home = std::getenv("HOME"); home && *home)
+            return std::filesystem::path(home) / ".config" / "s3cmd";
+        throw std::runtime_error("XDG_CONFIG_HOME and HOME are not set");
+#endif
+    }();
+    return value;
+}
+
+PluginHost::PluginHost(int plugin_number, tProgressProcW progress_proc, tLogProcW log_proc,
+                       tRequestProcW request_proc)
+    : plugin_number_(plugin_number),
+      progress_proc_(progress_proc),
+      log_proc_(log_proc),
+      request_proc_(request_proc)
+{
+
+}
+
+bool PluginHost::notify_progress(const wchar_t* source, const wchar_t* target, int percent_done)
+{
+    if (!progress_proc_)
+        return false;
+    return progress_proc_(plugin_number_,
+                          const_cast<wchar_t*>(source),
+                          const_cast<wchar_t*>(target),
+                          percent_done);
+}
+
+void PluginHost::notify_log(const wchar_t* message)
+{
+    if (!log_proc_)
+        return;
+    log_proc_(plugin_number_, MSGTYPE_IMPORTANTERROR, const_cast<wchar_t*>(message));
+}
+
+bool PluginHost::notify_message_box(message_box_type type,
+                                    const wchar_t* title,
+                                    const wchar_t* text)
+{
+    if (!request_proc_)
+        return false;
+    std::array<wchar_t, 1> ignored;
+    return request_proc_(plugin_number_,
+                         static_cast<int>(type),
+                         const_cast<wchar_t*>(title),
+                         const_cast<wchar_t*>(text),
+                         ignored.data(),
+                         static_cast<int>(ignored.size()));
+}
+
+bool PluginHost::vnotify_message_box(message_box_type type,
+                                    const wchar_t* title,
+                                    std::wstring_view format_str,
+                                    std::wformat_args args)
+{
+    std::wstring buf;
+    std::vformat_to(std::back_inserter(buf), format_str, args);
+    return notify_message_box(type, title, buf.c_str());
+}
+
+bool PluginHost::notify_message_box_result(message_box_type type,
+                                           const wchar_t* title,
+                                           const wchar_t* text,
+                                           std::wstring& out)
+{
+    if (!request_proc_)
+        return false;
+    return request_proc_(plugin_number_,
+                         static_cast<int>(type),
+                         const_cast<wchar_t*>(title),
+                         const_cast<wchar_t*>(text),
+                         out.data(),
+                         static_cast<int>(out.size()));
+}
 
 RemotePathView RemotePathView::make(std::wstring_view path) noexcept
 {

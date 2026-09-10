@@ -1,9 +1,93 @@
 #pragma once
 
+#include "fsplugin.h"
+
+#include <format>
 #include <string>
 #include <string_view>
 
+namespace std::filesystem {
+
+class path;
+} // namespace std::filesystem
+
 namespace s3cmd {
+
+// Returns a path to config directory of the plugin
+const std::filesystem::path& config_directory_path();
+
+class PluginHost
+{
+public:
+    PluginHost(int plugin_number,
+               tProgressProcW progress_proc,
+               tLogProcW log_proc,
+               tRequestProcW request_proc);
+
+    // Reports progress; returns true if the host requests cancellation.
+    // Returns false when no progress callback is available.
+    bool notify_progress(const wchar_t* source, const wchar_t* target, int percent);
+
+    // Logs an important error; does nothing when no log callback is available.
+    void notify_log(const wchar_t* message);
+
+	// Request types matching the WFX RT_* constants.
+	enum class message_box_type : int
+	{
+		other,
+		user_name,
+		password,
+		account,
+		user_name_firewall,
+		password_firewall,
+		target_dir,
+		url,
+		msg_ok,
+		msg_yes_no,
+		msg_ok_cancel
+	};
+
+    // Returns whether the host supplied a request callback.
+    bool is_notify_message_box_available() const { return request_proc_ != nullptr; }
+
+    // Shows a host dialog without text input.
+    // Returns value depends on the type of dialog that was shown and what user selected
+    bool notify_message_box(message_box_type type,
+                            const wchar_t* title,
+                            const wchar_t* text);
+
+    // Formats the dialog text, then calls notify_message_box().
+    template <typename... Args>
+    bool notify_message_box(message_box_type type,
+                            const wchar_t* title,
+                            std::wstring_view format_str,
+                            const Args&... args)
+    {
+        return vnotify_message_box(type, title, format_str,
+                                   std::make_wformat_args(args...));
+    }
+
+    // Shows a host dialog using `out` as the text input buffer.
+    // `out` must be pre-sized with a room for terminating null.
+    // Its size is passed to the host and is not adjusted after the call.
+    // Returns value depends on the type of dialog that was shown and what user selected
+    bool notify_message_box_result(message_box_type type,
+                                   const wchar_t* title,
+                                   const wchar_t* text,
+                                   std::wstring& out);
+
+private:
+    bool vnotify_message_box(message_box_type type,
+                             const wchar_t* title,
+                             std::wstring_view format_str,
+                             std::wformat_args args);
+
+private:
+    int plugin_number_;
+    tProgressProcW progress_proc_;
+    tLogProcW log_proc_;
+    tRequestProcW request_proc_;
+};
 
 struct RemotePathView
 {

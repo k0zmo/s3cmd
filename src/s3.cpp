@@ -1,21 +1,27 @@
 #include "s3.hpp"
 #include "core.hpp"
+#include "fsplugin.h"
 #include "log.hpp"
+#include "sso.hpp"
 
+#include <aws/core/AmazonWebServiceRequest.h>
 #include <aws/core/Aws.h>
 #include <aws/core/auth/AWSCredentialsProvider.h>
 #include <aws/core/auth/AWSCredentialsProviderChain.h>
 #include <aws/core/client/ClientConfiguration.h>
 #include <aws/core/config/ConfigAndCredentialsCacheManager.h>
+#include <aws/core/http/HttpRequest.h>
 #include <aws/core/http/HttpResponse.h>
 #include <aws/core/utils/DateTime.h>
 #include <aws/core/utils/logging/FormattedLogSystem.h>
+#include <aws/core/utils/logging/LogLevel.h>
 #include <aws/core/utils/memory/AWSMemory.h>
 #include <aws/core/utils/memory/stl/AWSAllocator.h>
 #include <aws/core/utils/memory/stl/AWSString.h>
 #include <aws/core/utils/memory/stl/AWSStringStream.h>
 #include <aws/s3/S3Client.h>
 #include <aws/s3/S3ClientConfiguration.h>
+#include <aws/s3/model/BucketLocationConstraint.h>
 #include <aws/s3/model/CopyObjectRequest.h>
 #include <aws/s3/model/DeleteObjectRequest.h>
 #include <aws/s3/model/GetBucketLocationRequest.h>
@@ -24,7 +30,11 @@
 #include <aws/s3/model/ListBucketsRequest.h>
 #include <aws/s3/model/ListObjectsV2Request.h>
 #include <aws/s3/model/PutObjectRequest.h>
+
 #include <toml++/toml.hpp>
+
+// FIXME: This should be removed
+#include <Windows.h> // GetCurrentThreadId, SetLastError, GetTempFileNameW, MoveFileExW
 
 #include <algorithm>
 #include <array>
@@ -39,7 +49,9 @@
 #include <filesystem>
 #include <format>
 #include <fstream>
+#include <functional>
 #include <ios>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -49,12 +61,14 @@
 #include <string>
 #include <string_view>
 #include <system_error>
+#include <thread>
 #include <utility>
 #include <vector>
 
 namespace s3cmd {
 
 namespace {
+
 constexpr std::uint64_t max_single_part_size = 5ULL * 1024 * 1024 * 1024;
 
 class AwsLogSystem final : public Aws::Utils::Logging::FormattedLogSystem
@@ -62,6 +76,24 @@ class AwsLogSystem final : public Aws::Utils::Logging::FormattedLogSystem
 public:
     using FormattedLogSystem::FormattedLogSystem;
     void Flush() override {}
+
+    static Aws::Utils::Logging::LogLevel parse_log_level(std::string_view value)
+    {
+        using enum Aws::Utils::Logging::LogLevel;
+        if (value == "Off")
+            return Off;
+        if (value == "Fatal")
+            return Fatal;
+        if (value == "Error")
+            return Error;
+        if (value == "Warn")
+            return Warn;
+        if (value == "Debug")
+            return Debug;
+        if (value == "Trace")
+            return Trace;
+        return Info;
+    }
 
 private:
     void ProcessFormattedStatement(Aws::String&& statement) override
@@ -71,33 +103,11 @@ private:
     }
 };
 
-Aws::Utils::Logging::LogLevel parse_log_level(std::string_view value)
-{
-    using enum Aws::Utils::Logging::LogLevel;
-    if (value == "Off")
-        return Off;
-    if (value == "Fatal")
-        return Fatal;
-    if (value == "Error")
-        return Error;
-    if (value == "Warn")
-        return Warn;
-    if (value == "Debug")
-        return Debug;
-    if (value == "Trace")
-        return Trace;
-    return Info;
-}
-
-int plugin_number{};
-tProgressProcW progress_proc{};
-tLogProcW log_proc{};
-tRequestProcW request_proc{};
-
 std::shared_mutex aws_lifecycle_mtx;
 Aws::SDKOptions aws_options;
-DWORD aws_init_thread_id{};
+std::thread::id aws_init_thread_id{};
 bool aws_initialized{};
+std::optional<PluginHost> plugin_host{};
 
 // All operations on RuntimeConfig requires a `config_mtx` mutex to be held
 struct RuntimeConfig
@@ -114,12 +124,15 @@ struct RuntimeConfig
     };
 
     bool dry_run{};
+    bool prefer_sso_device_code{};
     std::string aws_log_level{"Info"};
     std::map<std::string, ProfileSettings, std::less<>> profiles;
 
-private:
-    // Returns a path to the config file
-    static const std::filesystem::path& path();
+    static const std::filesystem::path& path()
+    {
+        static const std::filesystem::path value = s3cmd::config_directory_path() / "s3cmd.toml";
+        return value;
+    }
 };
 
 std::mutex config_mtx;
@@ -139,6 +152,7 @@ struct ClientEntry
 std::mutex client_mutex;
 using ClientKey = std::pair<std::string, std::string>; // (profile, region)
 std::map<ClientKey, std::shared_ptr<ClientEntry>> clients;
+std::mutex sso_login_mutex;
 
 // AwsLease has two jobs:
 // 1. Verify the SDK is initialized.
@@ -156,18 +170,6 @@ struct AwsLease
     AwsLease& operator=(const AwsLease&) = delete;
 
     std::shared_lock<std::shared_mutex> lock;
-};
-
-class SsoLoginRequired : public std::runtime_error
-{
-public:
-    explicit SsoLoginRequired(std::string_view profile)
-        : std::runtime_error(std::format(
-              "AWS SSO credentials for profile '{}' are unavailable or expired.\n\nRun:\naws "
-              "sso login --profile {}\n\nThen retry the operation.",
-              profile, profile))
-    {
-    }
 };
 
 std::optional<toml::table> read_document(const std::filesystem::path& file_path)
@@ -205,6 +207,8 @@ RuntimeConfig& RuntimeConfig::get()
     {
         // Deserialize TOML document into RuntimeConfig
         runtime_config->dry_run = (*document)["settings"]["DryRun"].value_or(false);
+        runtime_config->prefer_sso_device_code =
+            (*document)["settings"]["PreferSsoDeviceCode"].value_or(false);
         runtime_config->aws_log_level =
             (*document)["settings"]["AwsLogLevel"].value_or("Info");
 
@@ -235,8 +239,9 @@ bool RuntimeConfig::flush_to_disk()
 {
     // Serialize our config to TOML document and write it to disk
     toml::table document;
-    document.emplace("settings",
-                     toml::table{{"DryRun", dry_run}, {"AwsLogLevel", aws_log_level}});
+    document.emplace("settings", toml::table{{"DryRun", dry_run},
+                                             {"AwsLogLevel", aws_log_level},
+                                             {"PreferSsoDeviceCode", prefer_sso_device_code}});
 
     toml::table profile_tables;
     for (const auto& [profile_name, profile] : profiles)
@@ -256,33 +261,28 @@ bool RuntimeConfig::flush_to_disk()
     }
     if (!profile_tables.empty())
         document.emplace("profiles", std::move(profile_tables));
-    
+
     return write_document(document, path());
 }
 
-const std::filesystem::path& RuntimeConfig::path()
+// Factory function for creating a new S3Client.
+// Credentials (whether SSO token has expired) are checked later
+std::shared_ptr<ClientEntry> make_client(const Aws::S3::S3ClientConfiguration& configuration,
+                                         const RemotePath& path)
 {
-    static std::filesystem::path value = [] {
-#ifdef _WIN32
-        wchar_t* app_data{};
-        std::size_t size{};
-        // _wdupenv_s allocates a correctly sized UTF-16 copy.
-        if (_wdupenv_s(&app_data, &size, L"APPDATA") != 0 || !app_data || !*app_data)
-        {
-            std::free(app_data);
-            throw std::runtime_error("APPDATA is not set");
-        }
-        std::unique_ptr<wchar_t, decltype(&std::free)> releaser(app_data, &std::free);
-        return std::filesystem::path(releaser.get()) / L"s3cmd" / L"s3cmd.toml";
-#else
-        if (const auto* config_home = std::getenv("XDG_CONFIG_HOME"); config_home && *config_home)
-            return std::filesystem::path(config_home) / "s3cmd" / "s3cmd.toml";
-        if (const auto* home = std::getenv("HOME"); home && *home)
-            return std::filesystem::path(home) / ".config" / "s3cmd" / "s3cmd.toml";
-        throw std::runtime_error("XDG_CONFIG_HOME and HOME are not set");
-#endif
-    }();
-    return value;
+    Aws::Client::ClientConfiguration::CredentialProviderConfiguration credentials_configuration;
+    credentials_configuration.profile = path.profile;
+    credentials_configuration.region = configuration.region;
+    auto credentials = Aws::MakeShared<Aws::Auth::DefaultAWSCredentialsProviderChain>(
+        "s3cmd", credentials_configuration);
+
+    const auto profile = Aws::Config::GetCachedConfigProfile(path.profile);
+    const bool uses_sso = profile.IsSsoSessionSet() || !profile.GetSsoStartUrl().empty();
+    return std::make_shared<ClientEntry>(
+        credentials,
+        Aws::MakeShared<Aws::S3::S3Client>(/*allocationTag*/ "s3cmd", credentials, nullptr,
+                                           configuration),
+        uses_sso);
 }
 
 std::shared_ptr<Aws::S3::S3Client> get_client(const RemotePath& path,
@@ -291,37 +291,29 @@ std::shared_ptr<Aws::S3::S3Client> get_client(const RemotePath& path,
     Aws::S3::S3ClientConfiguration configuration(path.profile.c_str());
     if (!region_override.empty())
     {
-        configuration.region.assign(region_override.data(), region_override.size());
+        configuration.region = region_override;
     }
     else if (!path.bucket.empty())
     {
+        // Get region for the client from the 'active' bucket's region
         const auto region = ProfileConfig(path.profile).bucket_region(path.bucket);
         if (!region.empty())
-            configuration.region = region.c_str();
+            configuration.region = region;
     }
 
-    const ClientKey key{path.profile, {configuration.region.data(), configuration.region.size()}};
-    std::shared_ptr<ClientEntry> entry;
-    {
+    // Clients are cached and keyed by (profile, region)
+    const ClientKey key{path.profile, configuration.region};
+
+    auto entry = [&] {
         std::scoped_lock lock(client_mutex);
         if (const auto found = clients.find(key); found != clients.end())
-            entry = found->second;
-    }
+            return found->second;
+        return std::shared_ptr<ClientEntry>{};
+    }();
 
     if (!entry)
     {
-        Aws::Client::ClientConfiguration::CredentialProviderConfiguration credentials_configuration;
-        credentials_configuration.profile = path.profile.c_str();
-        credentials_configuration.region = configuration.region;
-        auto credentials = Aws::MakeShared<Aws::Auth::DefaultAWSCredentialsProviderChain>(
-            "s3cmd", credentials_configuration);
-
-        const auto profile = Aws::Config::GetCachedConfigProfile(path.profile.c_str());
-        auto candidate = std::make_shared<ClientEntry>(
-            credentials,
-            Aws::MakeShared<Aws::S3::S3Client>("s3cmd", credentials, nullptr, configuration),
-            profile.IsSsoSessionSet() || !profile.GetSsoStartUrl().empty()
-        );
+        auto candidate = make_client(configuration, path);
 
         std::scoped_lock lock(client_mutex);
         entry = clients.try_emplace(key, std::move(candidate)).first->second;
@@ -329,18 +321,53 @@ std::shared_ptr<Aws::S3::S3Client> get_client(const RemotePath& path,
 
     if (entry->uses_sso && entry->credentials->GetAWSCredentials().IsEmpty())
     {
-        // Expired SSO credentials
-        const SsoLoginRequired error(path.profile);
-        if (request_proc)
+        const auto failed_entry = entry;
+
+        // Profile is SSO based but the credentials are expired and couldn't be refreshed
+        std::scoped_lock login_lock(sso_login_mutex);
         {
-            const auto title = std::wstring(L"Amazon S3");
-            const auto message = to_wide(error.what());
-            std::array<wchar_t, 1> ignored{};
-            request_proc(plugin_number, RT_MsgOK, const_cast<wchar_t*>(title.data()),
-                         const_cast<wchar_t*>(message.data()), ignored.data(),
-                         static_cast<int>(ignored.size()));
+            // While this thread waits for sso_login_mutex another one might've
+            // completed login and replace clients[key]. Hence we compare newEntry
+            // with entry down below to detect this scenario and check for
+            // possibly refreshed and valid credentials
+            std::scoped_lock lock(client_mutex);
+            entry = clients.at(key);
         }
-        throw error;
+
+        // Don't call GetAWSCredentials() twice on the same provider which could
+        // potentially just repeat a failed refresh request.
+        if (entry == failed_entry || entry->credentials->GetAWSCredentials().IsEmpty())
+        {
+            const auto profile = Aws::Config::GetCachedConfigProfile(path.profile);
+            if (!profile.IsSsoSessionSet())
+            {
+                const auto message = std::format(
+                    "AWS SSO profile '{}' uses legacy configuration. Built-in login needs a "
+                    "sso_session entry that points to an [sso-session] section.\n\n"
+                    "To update this profile, run:\naws configure sso --profile \"{}\"\n"
+                    "When prompted, enter an SSO session name. Then retry the operation.\n\n"
+                    "To keep the legacy configuration, sign in with AWS CLI instead:\n"
+                    "aws sso login --profile \"{}\"\nThen retry the operation.",
+                    path.profile, path.profile, path.profile);
+                plugin_host->notify_message_box(PluginHost::message_box_type::msg_ok, L"Amazon S3",
+                                                to_wide(message).c_str());
+                throw SsoLoginFailed(message);
+            }
+            const auto prefer_device_code = [] {
+                std::scoped_lock lock(config_mtx);
+                return RuntimeConfig::get().prefer_sso_device_code;
+            }();
+            perform_sso_login(*plugin_host, profile, prefer_device_code);
+
+            auto refreshed = make_client(configuration, path);
+            if (refreshed->credentials->GetAWSCredentials().IsEmpty())
+            {
+                throw SsoLoginFailed(std::format(
+                    "AWS SSO login for profile '{}' did not produce credentials", path.profile));
+            }
+            std::scoped_lock lock(client_mutex);
+            entry = clients.insert_or_assign(key, std::move(refreshed)).first->second;
+        }
     }
     return entry->client;
 }
@@ -348,9 +375,8 @@ std::shared_ptr<Aws::S3::S3Client> get_client(const RemotePath& path,
 void log_error(std::string_view operation, std::string_view message)
 {
     const auto text = std::format("{}: {}", operation, message);
-    if (log_proc)
-        log_proc(plugin_number, MSGTYPE_IMPORTANTERROR, to_wide(text).data());
-
+    assert(plugin_host);
+    plugin_host->notify_log(to_wide(text).data());
     log("[s3cmd] {}", text);
 }
 
@@ -378,8 +404,8 @@ void log_local_operation(std::string_view operation, const wchar_t* path, bool d
 
 bool report_progress(const wchar_t* source, const wchar_t* target, int percent)
 {
-    return progress_proc && progress_proc(plugin_number, const_cast<wchar_t*>(source),
-                                          const_cast<wchar_t*>(target), percent) != 0;
+    assert(plugin_host);
+    return plugin_host->notify_progress(source, target, percent);
 }
 
 // Notifies totalcmd about the transfer progress. Used in both get and put operations
@@ -780,24 +806,21 @@ int initialize(int number, tProgressProcW progress, tLogProcW log, tRequestProcW
         {
             std::scoped_lock config_lock(config_mtx);
             aws_options.loggingOptions.logLevel =
-                parse_log_level(RuntimeConfig::get().aws_log_level);
+                AwsLogSystem::parse_log_level(RuntimeConfig::get().aws_log_level);
         }
         aws_options.loggingOptions.logger_create_fn = [] {
             return Aws::MakeShared<AwsLogSystem>("s3cmd", aws_options.loggingOptions.logLevel);
         };
         Aws::InitAPI(aws_options);
-        aws_init_thread_id = GetCurrentThreadId();
+        aws_init_thread_id = std::this_thread::get_id();
         aws_initialized = true;
     }
     else
     {
-        assert(aws_init_thread_id == GetCurrentThreadId());
+        assert(aws_init_thread_id == std::this_thread::get_id());
     }
 
-    plugin_number = number;
-    progress_proc = progress;
-    log_proc = log;
-    request_proc = request;
+    plugin_host.emplace(number, progress, log, request);
     return 0;
 }
 
@@ -810,7 +833,7 @@ void shutdown()
     if (!aws_initialized)
         return;
 
-    const auto same_thread = aws_init_thread_id == GetCurrentThreadId();
+    const auto same_thread = aws_init_thread_id == std::this_thread::get_id();
     assert(same_thread);
     if (!same_thread)
         return;
@@ -821,7 +844,7 @@ void shutdown()
     }
     Aws::ShutdownAPI(aws_options);
     aws_initialized = false;
-    aws_init_thread_id = 0;
+    aws_init_thread_id = std::thread::id{};
 }
 
 HANDLE find_first(const wchar_t* path, WIN32_FIND_DATAW* find_data)
@@ -842,7 +865,13 @@ HANDLE find_first(const wchar_t* path, WIN32_FIND_DATAW* find_data)
         }
         return state.release();
     }
-    catch (const SsoLoginRequired& error)
+    catch (const SsoLoginCancelled& error)
+    {
+        log_unexpected("FsFindFirstW", error);
+        SetLastError(ERROR_CANCELLED);
+        return INVALID_HANDLE_VALUE;
+    }
+    catch (const SsoLoginFailed& error)
     {
         log_unexpected("FsFindFirstW", error);
         SetLastError(ERROR_LOGON_FAILURE);
@@ -955,6 +984,10 @@ try
     report_progress(remote_name, local_name, 100);
     return FS_FILE_OK;
 }
+catch (const SsoLoginCancelled&)
+{
+    return FS_FILE_USERABORT;
+}
 catch (const std::exception& error)
 {
     log_unexpected("FsGetFileW", error);
@@ -1036,6 +1069,10 @@ try
     report_progress(local_name, remote_name, 100);
     return FS_FILE_OK;
 }
+catch (const SsoLoginCancelled&)
+{
+    return FS_FILE_USERABORT;
+}
 catch (const std::exception& error)
 {
     log_unexpected("FsPutFileW", error);
@@ -1103,19 +1140,18 @@ try
                 region = configuration.region;
             }
 
-            if (request_proc)
+            assert(plugin_host);
+            if (plugin_host->is_notify_message_box_available())
             {
-                std::array<wchar_t, 128> value{};
-                const auto default_region = to_wide(region);
-                std::copy_n(default_region.data(),
-                            std::min(default_region.size(), value.size() - 1), value.data());
-
-                std::wstring title = L"Register S3 bucket";
-                std::wstring prompt =
-                    std::format(L"Region for AWS profile '{}:", to_wide(path.profile));
-                if (!request_proc(plugin_number, RT_Other, title.data(), prompt.data(),
-                                  value.data(), static_cast<int>(value.size())))
+                auto value = to_wide(region);
+                value.resize(64); // Max length for out value for the user
+                if (!plugin_host->notify_message_box_result(
+                        PluginHost::message_box_type::other, L"Register S3 bucket",
+                        std::format(L"Region for AWS profile '{}:", to_wide(path.profile)).c_str(),
+                        /*out*/ value))
+                {
                     return false;
+                }
 
                 region = to_utf8(value.data());
             }
@@ -1294,6 +1330,10 @@ try
 
     report_progress(old_name, new_name, 100);
     return FS_FILE_OK;
+}
+catch (const SsoLoginCancelled&)
+{
+    return FS_FILE_USERABORT;
 }
 catch (const std::exception& error)
 {

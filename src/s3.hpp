@@ -2,9 +2,11 @@
 
 #include "fsplugin.h"
 
+#include <functional>
 #include <map>
 #include <string>
 #include <string_view>
+#include <utility>
 
 namespace s3cmd {
 

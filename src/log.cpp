@@ -3,6 +3,11 @@
 
 #include <Windows.h>
 
+#include <format>
+#include <iterator>
+#include <string>
+#include <string_view>
+
 namespace s3cmd {
 
 void vlog(std::string_view format_str, std::format_args args)
