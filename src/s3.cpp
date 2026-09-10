@@ -147,12 +147,14 @@ struct ClientEntry
     std::shared_ptr<Aws::Auth::AWSCredentialsProvider> credentials;
     std::shared_ptr<Aws::S3::S3Client> client;
     bool uses_sso{};
+    std::uint64_t sso_generation{};
 };
 
 std::mutex client_mutex;
 using ClientKey = std::pair<std::string, std::string>; // (profile, region)
 std::map<ClientKey, std::shared_ptr<ClientEntry>> clients;
 std::mutex sso_login_mutex;
+std::atomic<std::uint64_t> sso_generation{};
 
 // AwsLease has two jobs:
 // 1. Verify the SDK is initialized.
@@ -270,6 +272,7 @@ bool RuntimeConfig::flush_to_disk()
 std::shared_ptr<ClientEntry> make_client(const Aws::S3::S3ClientConfiguration& configuration,
                                          const RemotePath& path)
 {
+    const auto generation = sso_generation.load(std::memory_order_relaxed);
     Aws::Client::ClientConfiguration::CredentialProviderConfiguration credentials_configuration;
     credentials_configuration.profile = path.profile;
     credentials_configuration.region = configuration.region;
@@ -282,7 +285,7 @@ std::shared_ptr<ClientEntry> make_client(const Aws::S3::S3ClientConfiguration& c
         credentials,
         Aws::MakeShared<Aws::S3::S3Client>(/*allocationTag*/ "s3cmd", credentials, nullptr,
                                            configuration),
-        uses_sso);
+        uses_sso, generation);
 }
 
 std::shared_ptr<Aws::S3::S3Client> get_client(const RemotePath& path,
@@ -321,22 +324,20 @@ std::shared_ptr<Aws::S3::S3Client> get_client(const RemotePath& path,
 
     if (entry->uses_sso && entry->credentials->GetAWSCredentials().IsEmpty())
     {
-        const auto failed_entry = entry;
-
         // Profile is SSO based but the credentials are expired and couldn't be refreshed
         std::scoped_lock login_lock(sso_login_mutex);
-        {
-            // While this thread waits for sso_login_mutex another one might've
-            // completed login and replace clients[key]. Hence we compare newEntry
-            // with entry down below to detect this scenario and check for
-            // possibly refreshed and valid credentials
-            std::scoped_lock lock(client_mutex);
-            entry = clients.at(key);
-        }
 
-        // Don't call GetAWSCredentials() twice on the same provider which could
-        // potentially just repeat a failed refresh request.
-        if (entry == failed_entry || entry->credentials->GetAWSCredentials().IsEmpty())
+        // While this thread waits for sso_login_mutex another one might've
+        // completed login and refreshed the shared SSO token (very uncommon situation).
+        // Recreate a fresh client if a login completed since this entry was created.
+        const bool login_required = [&] {
+            if (entry->sso_generation == sso_generation.load(std::memory_order_relaxed))
+                return true;
+            // There was a succesful login after `entry` client was created
+            entry = make_client(configuration, path);
+            return entry->credentials->GetAWSCredentials().IsEmpty();
+        }();
+        if (login_required)
         {
             const auto profile = Aws::Config::GetCachedConfigProfile(path.profile);
             if (!profile.IsSsoSessionSet())
@@ -358,6 +359,7 @@ std::shared_ptr<Aws::S3::S3Client> get_client(const RemotePath& path,
                 return RuntimeConfig::get().prefer_sso_device_code;
             }();
             perform_sso_login(*plugin_host, profile, prefer_device_code);
+            sso_generation.fetch_add(1, std::memory_order_relaxed);
 
             auto refreshed = make_client(configuration, path);
             if (refreshed->credentials->GetAWSCredentials().IsEmpty())
@@ -365,9 +367,10 @@ std::shared_ptr<Aws::S3::S3Client> get_client(const RemotePath& path,
                 throw SsoLoginFailed(std::format(
                     "AWS SSO login for profile '{}' did not produce credentials", path.profile));
             }
-            std::scoped_lock lock(client_mutex);
-            entry = clients.insert_or_assign(key, std::move(refreshed)).first->second;
+            entry = std::move(refreshed);
         }
+        std::scoped_lock lock(client_mutex);
+        clients.insert_or_assign(key, entry);
     }
     return entry->client;
 }
