@@ -80,6 +80,18 @@ set_target_properties(s3cmd PROPERTIES
     PREFIX ""
     SUFFIX ".wfx64"
 )
+if(WIN32)
+    include(VersionInfo)
+    # Kinda useless since these embedded information are not displayed for files
+    # with extensions other than .dll - but let's still embed them
+    generate_version_info(s3cmd
+        PRODUCT_NAME "s3cmd"
+        COMPANY_NAME "k0zmo"
+        FILE_DESCRIPTION "S3 file-system plugin for Total Commander"
+        VERSION "${CMAKE_PROJECT_VERSION}"
+        VERSION_SUFFIX "${S3CMD_VERSION_SUFFIX}"
+    )
+endif()
 
 include(CTest)
 if(BUILD_TESTING)

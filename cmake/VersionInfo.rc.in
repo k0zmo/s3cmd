@@ -1,0 +1,56 @@
+#include "winresrc.h"
+
+#cmakedefine01 VI_COMMENTS
+#cmakedefine01 VI_LEGAL_COPYRIGHT
+#cmakedefine01 VI_LEGAL_TRADEMARKS
+#cmakedefine01 VI_PRIVATE_BUILD
+#cmakedefine01 VI_SPECIAL_BUILD
+
+LANGUAGE LANG_ENGLISH, SUBLANG_ENGLISH_US
+
+VS_VERSION_INFO VERSIONINFO
+    FILEVERSION @VI_FILE_VERSION@
+    PRODUCTVERSION @VI_PRODUCT_VERSION@
+    FILEFLAGSMASK VS_FFI_FILEFLAGSMASK
+#ifdef _DEBUG
+    FILEFLAGS @VI_FILE_FLAGS@|VS_FF_DEBUG
+#else
+    FILEFLAGS @VI_FILE_FLAGS@
+#endif
+    FILEOS VOS__WINDOWS32
+    FILETYPE @VI_FILETYPE@
+    FILESUBTYPE 0x0L
+BEGIN
+    BLOCK "StringFileInfo"
+    BEGIN
+        BLOCK "040904b0"
+        BEGIN
+            VALUE "ProductName", "@VI_PRODUCT_NAME@"
+            VALUE "CompanyName", "@VI_COMPANY_NAME@"
+            VALUE "FileDescription", "@VI_FILE_DESCRIPTION@"
+            VALUE "OriginalFilename", "@VI_ORIGINAL_FILENAME@"
+            VALUE "InternalName", "@VI_INTERNAL_NAME@"
+            VALUE "FileVersion", "@VI_FILE_VERSION_STR@\0"
+            VALUE "ProductVersion", "@VI_PRODUCT_VERSION_STR@\0"
+#if VI_COMMENTS == 1
+            VALUE "Comments", "@VI_COMMENTS@"
+#endif
+#if VI_LEGAL_COPYRIGHT == 1
+            VALUE "LegalCopyright", "@VI_LEGAL_COPYRIGHT@"
+#endif
+#if VI_LEGAL_TRADEMARKS == 1
+            VALUE "LegalTrademarks", "@VI_LEGAL_TRADEMARKS@"
+#endif
+#if VI_PRIVATE_BUILD == 1
+            VALUE "PrivateBuild", "@VI_PRIVATE_BUILD@"
+#endif
+#if VI_SPECIAL_BUILD == 1
+            VALUE "SpecialBuild", "@VI_SPECIAL_BUILD@"
+#endif
+        END
+    END
+    BLOCK "VarFileInfo"
+    BEGIN
+        VALUE "Translation", 0x409, 1200
+    END
+END
