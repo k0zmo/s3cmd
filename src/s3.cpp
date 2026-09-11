@@ -1,5 +1,6 @@
 #include "s3.hpp"
 #include "core.hpp"
+#include "creds.hpp"
 #include "fsplugin.h"
 #include "log.hpp"
 #include "sso.hpp"
@@ -12,6 +13,7 @@
 #include <aws/core/config/ConfigAndCredentialsCacheManager.h>
 #include <aws/core/http/HttpRequest.h>
 #include <aws/core/http/HttpResponse.h>
+#include <aws/core/internal/AWSHttpResourceClient.h>
 #include <aws/core/utils/DateTime.h>
 #include <aws/core/utils/logging/FormattedLogSystem.h>
 #include <aws/core/utils/logging/LogLevel.h>
@@ -107,6 +109,7 @@ std::shared_mutex aws_lifecycle_mtx;
 Aws::SDKOptions aws_options;
 std::thread::id aws_init_thread_id{};
 bool aws_initialized{};
+bool imds_enabled{};
 std::optional<PluginHost> plugin_host{};
 
 // All operations on RuntimeConfig requires a `config_mtx` mutex to be held
@@ -125,6 +128,7 @@ struct RuntimeConfig
 
     bool dry_run{};
     bool prefer_sso_device_code{};
+    bool enable_imds{};
     std::string aws_log_level{"Info"};
     std::map<std::string, ProfileSettings, std::less<>> profiles;
 
@@ -211,6 +215,7 @@ RuntimeConfig& RuntimeConfig::get()
         runtime_config->dry_run = (*document)["settings"]["DryRun"].value_or(false);
         runtime_config->prefer_sso_device_code =
             (*document)["settings"]["PreferSsoDeviceCode"].value_or(false);
+        runtime_config->enable_imds = (*document)["settings"]["EnableIMDS"].value_or(false);
         runtime_config->aws_log_level =
             (*document)["settings"]["AwsLogLevel"].value_or("Info");
 
@@ -243,7 +248,8 @@ bool RuntimeConfig::flush_to_disk()
     toml::table document;
     document.emplace("settings", toml::table{{"DryRun", dry_run},
                                              {"AwsLogLevel", aws_log_level},
-                                             {"PreferSsoDeviceCode", prefer_sso_device_code}});
+                                             {"PreferSsoDeviceCode", prefer_sso_device_code},
+                                             {"EnableIMDS", enable_imds}});
 
     toml::table profile_tables;
     for (const auto& [profile_name, profile] : profiles)
@@ -273,11 +279,10 @@ std::shared_ptr<ClientEntry> make_client(const Aws::S3::S3ClientConfiguration& c
                                          const RemotePath& path)
 {
     const auto generation = sso_generation.load(std::memory_order_relaxed);
-    Aws::Client::ClientConfiguration::CredentialProviderConfiguration credentials_configuration;
-    credentials_configuration.profile = path.profile;
-    credentials_configuration.region = configuration.region;
-    auto credentials = Aws::MakeShared<Aws::Auth::DefaultAWSCredentialsProviderChain>(
-        "s3cmd", credentials_configuration);
+    auto credentials_configuration = configuration;
+    credentials_configuration.credentialProviderConfig.profile = path.profile;
+    credentials_configuration.credentialProviderConfig.region = configuration.region;
+    auto credentials = Aws::MakeShared<CredentialsProviderChain>("s3cmd", credentials_configuration);
 
     const auto profile = Aws::Config::GetCachedConfigProfile(path.profile);
     const bool uses_sso = profile.IsSsoSessionSet() || !profile.GetSsoStartUrl().empty();
@@ -291,7 +296,7 @@ std::shared_ptr<ClientEntry> make_client(const Aws::S3::S3ClientConfiguration& c
 std::shared_ptr<Aws::S3::S3Client> get_client(const RemotePath& path,
                                               std::string_view region_override = {})
 {
-    Aws::S3::S3ClientConfiguration configuration(path.profile.c_str());
+    Aws::S3::S3ClientConfiguration configuration(path.profile.c_str(), !imds_enabled);
     if (!region_override.empty())
     {
         configuration.region = region_override;
@@ -810,11 +815,21 @@ int initialize(int number, tProgressProcW progress, tLogProcW log, tRequestProcW
             std::scoped_lock config_lock(config_mtx);
             aws_options.loggingOptions.logLevel =
                 AwsLogSystem::parse_log_level(RuntimeConfig::get().aws_log_level);
+            imds_enabled = RuntimeConfig::get().enable_imds;
         }
         aws_options.loggingOptions.logger_create_fn = [] {
             return Aws::MakeShared<AwsLogSystem>("s3cmd", aws_options.loggingOptions.logLevel);
         };
         Aws::InitAPI(aws_options);
+        if (!imds_enabled)
+        {
+            // SDK SSO token and container providers construct default configurations internally.
+            // Configure their shared metadata client before any providers or worker threads exist.
+            Aws::Internal::CleanupEC2MetadataClient();
+            Aws::Client::ClientConfiguration::CredentialProviderConfiguration config{};
+            config.imdsConfig.disableImds = true;
+            Aws::Internal::InitEC2MetadataClient(config);
+        }
         aws_init_thread_id = std::this_thread::get_id();
         aws_initialized = true;
     }

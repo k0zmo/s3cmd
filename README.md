@@ -101,6 +101,8 @@ The level defaults to `Info`.
 [settings]
 # Off, Fatal, Error, Warn, Info, Debug, or Trace
 AwsLogLevel = "Debug"
+# Use EC2 instance metadata for region and credentials.
+EnableIMDS = false
 ```
 
 To use device-code login directly, set `PreferSsoDeviceCode` under `[settings]`:
@@ -112,6 +114,12 @@ PreferSsoDeviceCode = true
 
 The default is `false`, which selects PKCE with device-code fallback.
 Restart the file manager after changing this setting.
+
+EC2 instance metadata access is disabled by default, for both IMDSv1 and IMDSv2.
+`EnableIMDS = false` has the same effect as `AWS_EC2_METADATA_DISABLED=true`
+but just for the plugin - without changing the plugin host environment.
+Set `EnableIMDS = true` to let the AWS SDK use it to look up the region and credentials.
+This setting does not override `AWS_EC2_METADATA_DISABLED=true`.
 
 ## Limitations
 

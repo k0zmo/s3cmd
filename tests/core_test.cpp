@@ -1,8 +1,14 @@
 #include "s3.hpp"
+#include "creds.hpp"
+#include <aws/core/auth/GeneralHTTPCredentialsProvider.h>
+#include <aws/core/auth/SSOCredentialsProvider.h>
+#include <aws/core/auth/STSCredentialsProvider.h>
+#include <aws/core/internal/AWSHttpResourceClient.h>
 #include "core.hpp"
 #include "fsplugin.h"
 
 #include <aws/core/utils/logging/AWSLogging.h>
+#include <aws/core/platform/Environment.h>
 #include <aws/core/utils/logging/LogLevel.h>
 #include <aws/core/utils/logging/LogSystemInterface.h>
 #include <catch2/catch_test_macros.hpp>
@@ -157,6 +163,89 @@ TEST_CASE("AWS log level comes from configuration", "[unit]")
         REQUIRE(Aws::Utils::Logging::GetLogSystem());
         CHECK(Aws::Utils::Logging::GetLogSystem()->GetLogLevel() ==
               Aws::Utils::Logging::LogLevel::Trace);
+    }
+}
+
+TEST_CASE("IMDS is opt-in without changing the environment", "[unit]")
+{
+    auto& config = temporary_config();
+    TemporaryEnvironment metadata("AWS_EC2_METADATA_DISABLED", "original");
+    bool enabled = false;
+    std::string setting;
+    SECTION("missing") {}
+    SECTION("disabled") { setting = "EnableIMDS = false"; }
+    SECTION("invalid type") { setting = "EnableIMDS = \"true\""; }
+    SECTION("enabled")
+    {
+        setting = "EnableIMDS = true";
+        enabled = true;
+    }
+    std::filesystem::create_directories(config.path.parent_path());
+    std::ofstream(config.path) << "[settings]\n" << setting << '\n';
+    {
+        PluginSession session;
+        CHECK(Aws::Environment::GetEnv("AWS_EC2_METADATA_DISABLED") == "original");
+        if (!enabled)
+        {
+            const auto metadata_client = Aws::Internal::GetEC2MetadataClient();
+            REQUIRE(metadata_client);
+            CHECK(metadata_client->GetCurrentRegion().empty());
+            CHECK(metadata_client->GetDefaultCredentialsSecurely().empty());
+        }
+        REQUIRE(s3cmd::ProfileConfig("work").register_bucket("bucket", "eu-central-1"));
+    }
+    CHECK(Aws::Environment::GetEnv("AWS_EC2_METADATA_DISABLED") == "original");
+    {
+        PluginSession session;
+        CHECK(Aws::Environment::GetEnv("AWS_EC2_METADATA_DISABLED") == "original");
+        if (!enabled)
+            CHECK(Aws::Internal::GetEC2MetadataClient()->GetCurrentRegion().empty());
+    }
+    CHECK(Aws::Environment::GetEnv("AWS_EC2_METADATA_DISABLED") == "original");
+}
+
+TEST_CASE("credential chain preserves provider order and gates IMDS", "[unit]")
+{
+    using namespace Aws::Auth;
+    temporary_config();
+    TemporaryEnvironment relative("AWS_CONTAINER_CREDENTIALS_RELATIVE_URI", "");
+    TemporaryEnvironment absolute("AWS_CONTAINER_CREDENTIALS_FULL_URI", "");
+    TemporaryEnvironment metadata("AWS_EC2_METADATA_DISABLED", "false");
+    PluginSession session;
+    Aws::Client::ClientConfiguration config(
+        Aws::Client::ClientConfigurationInitValues{.shouldDisableIMDS = true});
+    std::size_t expected = 5;
+    SECTION("disabled") {}
+    SECTION("enabled")
+    {
+        config.disableIMDS = false;
+        config.credentialProviderConfig.imdsConfig.disableImds = false;
+        expected = 6;
+    }
+    SECTION("environment still disables IMDS")
+    {
+        config.disableIMDS = false;
+        REQUIRE(_putenv_s("AWS_EC2_METADATA_DISABLED", "true") == 0);
+    }
+    SECTION("container credentials remain available")
+    {
+        REQUIRE(_putenv_s("AWS_CONTAINER_CREDENTIALS_RELATIVE_URI", "/credentials") == 0);
+        expected = 6;
+    }
+    const s3cmd::CredentialsProviderChain chain(config);
+    const auto& providers = chain.GetProviders();
+    REQUIRE(providers.size() == expected);
+    CHECK(dynamic_cast<EnvironmentAWSCredentialsProvider*>(providers[0].get()));
+    CHECK(dynamic_cast<ProfileConfigFileAWSCredentialsProvider*>(providers[1].get()));
+    CHECK(dynamic_cast<ProcessCredentialsProvider*>(providers[2].get()));
+    CHECK(dynamic_cast<STSAssumeRoleWebIdentityCredentialsProvider*>(providers[3].get()));
+    CHECK(dynamic_cast<SSOCredentialsProvider*>(providers[4].get()));
+    if (expected == 6)
+    {
+        if (config.disableIMDS)
+            CHECK(dynamic_cast<GeneralHTTPCredentialsProvider*>(providers[5].get()));
+        else
+            CHECK(dynamic_cast<InstanceProfileCredentialsProvider*>(providers[5].get()));
     }
 }
 

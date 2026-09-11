@@ -36,10 +36,11 @@ find_package(httplib CONFIG REQUIRED)
 
 add_library(s3cmd-core STATIC
     src/fsplugin.h
-    src/core.hpp    src/core.cpp
-    src/log.cpp     src/log.hpp
-    src/s3.cpp      src/s3.hpp
-    src/sso.cpp     src/sso.hpp
+    src/core.hpp   src/core.cpp
+    src/creds.hpp  src/creds.cpp
+    src/log.cpp    src/log.hpp
+    src/s3.cpp     src/s3.hpp
+    src/sso.cpp    src/sso.hpp
 )
 target_compile_features(s3cmd-core PUBLIC cxx_std_20)
 target_compile_definitions(s3cmd-core PUBLIC NOMINMAX WIN32_LEAN_AND_MEAN)
