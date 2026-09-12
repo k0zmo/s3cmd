@@ -43,6 +43,7 @@
 #include <atomic>
 #include <cassert>
 #include <charconv>
+#include <chrono>
 #include <cstdint>
 #include <cstring>
 #include <cstdlib>
@@ -52,6 +53,7 @@
 #include <format>
 #include <fstream>
 #include <functional>
+#include <future>
 #include <ios>
 #include <map>
 #include <memory>
@@ -66,6 +68,8 @@
 #include <thread>
 #include <utility>
 #include <vector>
+
+using namespace std::chrono_literals;
 
 namespace s3cmd {
 
@@ -416,13 +420,17 @@ bool report_progress(const wchar_t* source, const wchar_t* target, int percent)
     return plugin_host->notify_progress(source, target, percent);
 }
 
-// Notifies totalcmd about the transfer progress. Used in both get and put operations
-// Only calls the calback when value of the progress changes (i.e. from 34% to 35%).
-// Naturally supports pause transfers when totalcmd blocks the `report_progress` function
-// on their end
+// Keep tracks of SDK callbacks that run on AWS SDK worker thread(s)
 class TransferProgress
 {
 public:
+    // Constructor for Head request
+    TransferProgress(const wchar_t* source, const wchar_t* target,
+                     Aws::S3::Model::HeadObjectRequest& request)
+        : TransferProgress{source, target, 0, request}
+    {
+    }
+
     // Constructor for Get request
     TransferProgress(const wchar_t* source, const wchar_t* target,
                      Aws::S3::Model::GetObjectRequest& request, std::uint64_t transferred = 0)
@@ -454,6 +462,29 @@ public:
     bool is_canceled() const { return canceled_.load(); }
     bool has_response_error() const { return response_error_; }
 
+    template <typename Outcome>
+    Outcome wait(std::future<Outcome> future)
+    {
+        try
+        {
+            while (future.wait_for(100ms) != std::future_status::ready)
+            {
+                // Pause is implemented by plugin host blocking progress callback.
+                std::scoped_lock lock(pause_mutex_);
+                if (!canceled_ && report_progress(source_, target_, percent_.load()))
+                    canceled_ = true;
+            }
+        }
+        catch (...)
+        {
+            canceled_ = true;
+            // Drain the worker before unwinding - callbacks we set up captured `this`
+            future.wait();
+            throw;
+        }
+        return future.get();
+    }
+
 private:
     // Common constructor for both Get and Put requests
     template <typename Request>
@@ -468,7 +499,10 @@ private:
         request.SetRequestRetryHandler(
             [this](const Aws::AmazonWebServiceRequest&) { transferred_ = initial_transferred_; });
         request.SetContinueRequestHandler(
-            [this](const Aws::Http::HttpRequest*) { return !canceled_.load(); });
+            [this](const Aws::Http::HttpRequest*) {
+                std::scoped_lock lock(pause_mutex_);
+                return !canceled_.load();
+            });
     }
 
     // Calculate percentage of the transfer. Never returns 100 as that's reserved for a completed transfer
@@ -479,19 +513,15 @@ private:
                    : std::min(99, static_cast<int>(std::min(transferred, total) * 100 / total));
     }
 
-    // Called whenever `bytes` data is transferred. Recalculates a percentage and if it changed
-    // since last time, notifies totalcmd about that.
+    // Worker-only counters; publish the percentage for the calling thread.
     void add(long long bytes)
     {
+        std::scoped_lock lock(pause_mutex_);
         if (bytes > 0)
             transferred_ += static_cast<std::uint64_t>(bytes);
         const auto next = transfer_percent(transferred_, total_);
         if (next > percent_)
-        {
             percent_ = next;
-            if (report_progress(source_, target_, percent_))
-                canceled_ = true;
-        }
     }
 
     const wchar_t* source_;
@@ -499,7 +529,8 @@ private:
     std::uint64_t total_{};
     const std::uint64_t initial_transferred_{};
     std::uint64_t transferred_{};
-    int percent_{};
+    std::atomic<int> percent_{};
+    std::mutex pause_mutex_;
     std::atomic<bool> canceled_{};
     bool response_error_{};
 };
@@ -994,7 +1025,10 @@ try
             Aws::S3::Model::HeadObjectRequest request;
             request.SetBucket(path.bucket);
             request.SetKey(path.key);
-            const auto outcome = client->HeadObject(request);
+            TransferProgress progress{remote_name, local_name, request};
+            const auto outcome = progress.wait(client->HeadObjectCallable(request));
+            if (progress.is_canceled())
+                return FS_FILE_USERABORT;
             if (!outcome.IsSuccess())
             {
                 log_aws_error("HeadObject", outcome.GetError());
@@ -1050,7 +1084,7 @@ try
             });
 
             TransferProgress progress{remote_name, local_name, request, offset};
-            const auto outcome = client->GetObject(request);
+            const auto outcome = progress.wait(client->GetObjectCallable(request));
             if (!outcome.IsSuccess())
             {
                 // Error bodies use the same stream; only retain bytes from object responses.
@@ -1069,6 +1103,8 @@ try
                            ? FS_FILE_NOTFOUND
                            : FS_FILE_READERROR;
             }
+            if (progress.is_canceled())
+                return FS_FILE_USERABORT;
         }
     }
 
@@ -1142,7 +1178,7 @@ try
             request.SetIfNoneMatch("*");
 
         TransferProgress progress{local_name, remote_name, request};
-        const auto outcome = client->PutObject(request);
+        const auto outcome = progress.wait(client->PutObjectCallable(request));
         if (!outcome.IsSuccess())
         {
             if (progress.is_canceled())
@@ -1153,6 +1189,8 @@ try
                        ? FS_FILE_EXISTS
                        : FS_FILE_WRITEERROR;
         }
+        if (progress.is_canceled())
+            return FS_FILE_USERABORT;
     }
 
     if ((copy_flags & FS_COPYFLAGS_MOVE) != 0)

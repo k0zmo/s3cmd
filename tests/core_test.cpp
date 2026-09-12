@@ -17,6 +17,7 @@
 #include <Windows.h> // GetCurrentProcessId, GetTickCount, SetLastError, GetLastError
 
 #include <atomic>
+#include <chrono>
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
@@ -34,6 +35,19 @@ int request_type{};
 bool request_accept{true};
 std::wstring request_text;
 std::wstring log_text;
+std::atomic<bool> transfer_waiting{};
+std::atomic<bool> transfer_canceled{};
+DWORD transfer_caller{};
+bool transfer_wrong_thread{};
+
+int __stdcall cancel_stalled_transfer(int, wchar_t*, wchar_t*, int)
+{
+    transfer_wrong_thread |= GetCurrentThreadId() != transfer_caller;
+    if (!transfer_waiting)
+        return 0;
+    transfer_canceled = true;
+    return 1;
+}
 
 BOOL __stdcall capture_request(int, int type, wchar_t*, wchar_t* text, wchar_t*, int)
 {
@@ -143,8 +157,20 @@ TEST_CASE("Get discards HTTP error bodies before another resume", "[unit]")
     auto& config = temporary_config();
     const std::string object = "prefix and the rest of the object";
     std::atomic<bool> reject{true};
+    std::atomic<bool> stall{};
+    transfer_waiting = false;
+    transfer_canceled = false;
+    transfer_wrong_thread = false;
+    transfer_caller = GetCurrentThreadId();
     httplib::Server server;
-    server.Get("/bucket/object", [&](const httplib::Request& request, httplib::Response& response) {
+    const auto respond = [&](const httplib::Request& request, httplib::Response& response) {
+        if (stall)
+        {
+            transfer_waiting = true;
+            const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+            while (!transfer_canceled && std::chrono::steady_clock::now() < deadline)
+                std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        }
         response.set_header("ETag", "\"test\"");
         if (request.method == "HEAD")
             response.set_content(object, "application/octet-stream");
@@ -155,7 +181,9 @@ TEST_CASE("Get discards HTTP error bodies before another resume", "[unit]")
         }
         else
             response.set_content(object, "application/octet-stream");
-    });
+    };
+    server.Get("/bucket/object", respond);
+    server.Put("/bucket/object", respond);
     const auto port = server.bind_to_any_port("127.0.0.1");
     REQUIRE(port > 0);
     std::jthread worker([&](std::stop_token stop) {
@@ -169,17 +197,38 @@ TEST_CASE("Get discards HTTP error bodies before another resume", "[unit]")
     TemporaryEnvironment access("AWS_ACCESS_KEY_ID", "test");
     TemporaryEnvironment secret("AWS_SECRET_ACCESS_KEY", "test");
     TemporaryEnvironment region("AWS_DEFAULT_REGION", "us-east-1");
-    PluginSession session;
+    TemporaryEnvironment checksum("AWS_REQUEST_CHECKSUM_CALCULATION", "when_required");
+    PluginSession session(0, cancel_stalled_transfer);
 
     const auto local = config.root / L"download";
     std::string prefix;
     int flags{};
     SECTION("new download") {}
+    SECTION("cancel while waiting for response headers")
+    {
+        stall = true;
+        CHECK(s3cmd::get_file(L"\\resume-test\\bucket\\object", local.c_str(), 0, nullptr) ==
+              FS_FILE_USERABORT);
+        CHECK(transfer_canceled);
+        CHECK_FALSE(transfer_wrong_thread);
+        return;
+    }
     SECTION("resumed download")
     {
         prefix = object.substr(0, 6);
         flags = FS_COPYFLAGS_RESUME;
         std::ofstream(local, std::ios::binary) << prefix;
+    }
+    SECTION("cancel upload while waiting for response headers")
+    {
+        stall = true;
+        std::ofstream(local, std::ios::binary) << object;
+        CHECK(s3cmd::put_file(local.c_str(), L"\\resume-test\\bucket\\object",
+                             FS_COPYFLAGS_MOVE) == FS_FILE_USERABORT);
+        CHECK(transfer_canceled);
+        CHECK_FALSE(transfer_wrong_thread);
+        CHECK(std::filesystem::exists(local));
+        return;
     }
     const auto read_local = [&] {
         std::ifstream file(local, std::ios::binary);
