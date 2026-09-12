@@ -432,6 +432,7 @@ public:
     {
         request.SetHeadersReceivedEventHandler(
             [this, transferred](const Aws::Http::HttpRequest*, Aws::Http::HttpResponse* response) {
+                response_error_ = static_cast<int>(response->GetResponseCode()) >= 300;
                 const auto& length = response->GetHeader(Aws::Http::CONTENT_LENGTH_HEADER);
                 std::uint64_t remaining{};
                 std::from_chars(length.data(), length.data() + length.size(), remaining);
@@ -453,6 +454,7 @@ public:
     }
 
     bool is_canceled() const { return canceled_.load(); }
+    bool has_response_error() const { return response_error_; }
 
 private:
     // Common constructor for both Get and Put requests
@@ -501,6 +503,7 @@ private:
     std::uint64_t transferred_{};
     int percent_{};
     std::atomic<bool> canceled_{};
+    bool response_error_{};
 };
 
 // Checks whether an object at `path` exists
@@ -1082,6 +1085,14 @@ try
             const auto outcome = client->GetObject(request);
             if (!outcome.IsSuccess())
             {
+                // Error bodies use the same stream; only retain bytes from object responses.
+                // Use the received status even if cancellation masks it in the SDK error.
+                if (progress.has_response_error())
+                {
+                    std::filesystem::resize_file(local, offset, error);
+                    if (error)
+                        return FS_FILE_WRITEERROR;
+                }
                 if (progress.is_canceled())
                     return FS_FILE_USERABORT;
                 log_aws_error("GetObject", outcome.GetError());
