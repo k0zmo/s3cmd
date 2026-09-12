@@ -211,6 +211,17 @@ TEST_CASE("Get discards HTTP error bodies before another resume", "[unit]")
     std::string prefix;
     int flags{};
     SECTION("new download") {}
+    SECTION("equal size cannot be resumed without listing metadata")
+    {
+        std::ofstream(local, std::ios::binary) << std::string(object.size(), 'x');
+        CHECK(s3cmd::get_file(L"\\resume-test\\bucket\\object", local.c_str(),
+                             FS_COPYFLAGS_RESUME | FS_COPYFLAGS_MOVE, nullptr) ==
+              FS_FILE_NOTSUPPORTED);
+        std::ifstream file(local, std::ios::binary);
+        CHECK(std::string(std::istreambuf_iterator<char>(file), {}) ==
+              std::string(object.size(), 'x'));
+        return;
+    }
     SECTION("resume percentage persists while HEAD and GET are pending")
     {
         reject = false;
@@ -615,7 +626,19 @@ TEST_CASE("runtime dry run completes S3 operations without side effects", "[unit
         file << "partial";
     }
     auto partial_name = partial.wstring();
-    CHECK(s3cmd::get_file(object, partial_name.data(), 0, nullptr) == FS_FILE_EXISTSRESUMEALLOWED);
+    CHECK(s3cmd::get_file(object, partial_name.data(), 0, nullptr) == FS_FILE_EXISTS);
+    RemoteInfoStruct info{};
+    for (DWORD size : {6u, 7u, 8u})
+    {
+        info.SizeLow = size;
+        CHECK(s3cmd::get_file(object, partial_name.data(), 0, &info) ==
+              (size > 7 ? FS_FILE_EXISTSRESUMEALLOWED : FS_FILE_EXISTS));
+        CHECK(s3cmd::get_file(object, partial_name.data(), FS_COPYFLAGS_RESUME, &info) ==
+              (size > 7 ? FS_FILE_OK : FS_FILE_NOTSUPPORTED));
+    }
+    info.SizeLow = 0;
+    info.SizeHigh = 1;
+    CHECK(s3cmd::get_file(object, partial_name.data(), 0, &info) == FS_FILE_EXISTSRESUMEALLOWED);
     CHECK(s3cmd::get_file(object, partial_name.data(), FS_COPYFLAGS_RESUME, nullptr) == FS_FILE_OK);
     CHECK(std::filesystem::file_size(partial) == 7);
     CHECK(s3cmd::put_file(upload_name.data(), object, FS_COPYFLAGS_MOVE) == FS_FILE_OK);

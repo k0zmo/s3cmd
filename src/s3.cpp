@@ -980,16 +980,22 @@ try
 {
     const auto local = std::filesystem::path(local_name);
     const auto resume = (copy_flags & FS_COPYFLAGS_RESUME) != 0;
+    const auto listed_size = info ? static_cast<std::uint64_t>(info->SizeLow) |
+                                       (static_cast<std::uint64_t>(info->SizeHigh) << 32)
+                                 : 0;
     std::error_code error;
     const auto local_exists = std::filesystem::exists(local, error);
     if (error)
         return FS_FILE_WRITEERROR;
     if (!resume && (copy_flags & FS_COPYFLAGS_OVERWRITE) == 0 && local_exists)
     {
-        // If the local file already exists and it's a regular file return we support resuming transfer
-        return std::filesystem::is_regular_file(local, error) && !error
-                   ? FS_FILE_EXISTSRESUMEALLOWED
-                   : FS_FILE_EXISTS;
+        // Only offer resume for a known incomplete file; equal size does not prove identity.
+        if (!info || !std::filesystem::is_regular_file(local, error) || error)
+            return FS_FILE_EXISTS;
+        const auto size = std::filesystem::file_size(local, error);
+        if (error)
+            return FS_FILE_WRITEERROR;
+        return size < listed_size ? FS_FILE_EXISTSRESUMEALLOWED : FS_FILE_EXISTS;
     }
 
     std::uint64_t offset{};
@@ -1001,10 +1007,9 @@ try
         offset = std::filesystem::file_size(local, error);
         if (error)
             return FS_FILE_WRITEERROR;
+        if (info && offset >= listed_size)
+            return FS_FILE_NOTSUPPORTED;
     }
-    const auto listed_size = info ? static_cast<std::uint64_t>(info->SizeLow) |
-                                       (static_cast<std::uint64_t>(info->SizeHigh) << 32)
-                                 : 0;
     if (report_progress(remote_name, local_name, transfer_percent(offset, listed_size)))
         return FS_FILE_USERABORT;
 
@@ -1054,7 +1059,7 @@ try
             remote_size = static_cast<std::uint64_t>(length);
             if (info && listed_size != remote_size)
                 return FS_FILE_READERROR;
-            if (offset > remote_size)
+            if (offset >= remote_size)
                 return FS_FILE_NOTSUPPORTED;
             if (report_progress(remote_name, local_name, transfer_percent(offset, remote_size)))
                 return FS_FILE_USERABORT;
