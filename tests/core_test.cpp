@@ -27,6 +27,7 @@
 #include <string_view>
 #include <system_error>
 #include <thread>
+#include <vector>
 
 namespace {
 
@@ -39,9 +40,11 @@ std::atomic<bool> transfer_waiting{};
 std::atomic<bool> transfer_canceled{};
 DWORD transfer_caller{};
 bool transfer_wrong_thread{};
+std::vector<int> transfer_percentages;
 
-int __stdcall cancel_stalled_transfer(int, wchar_t*, wchar_t*, int)
+int __stdcall cancel_stalled_transfer(int, wchar_t*, wchar_t*, int percent)
 {
+    transfer_percentages.push_back(percent);
     transfer_wrong_thread |= GetCurrentThreadId() != transfer_caller;
     if (!transfer_waiting)
         return 0;
@@ -158,12 +161,16 @@ TEST_CASE("Get discards HTTP error bodies before another resume", "[unit]")
     const std::string object = "prefix and the rest of the object";
     std::atomic<bool> reject{true};
     std::atomic<bool> stall{};
+    std::atomic<bool> delay{};
+    transfer_percentages.clear();
     transfer_waiting = false;
     transfer_canceled = false;
     transfer_wrong_thread = false;
     transfer_caller = GetCurrentThreadId();
     httplib::Server server;
     const auto respond = [&](const httplib::Request& request, httplib::Response& response) {
+        if (delay)
+            std::this_thread::sleep_for(std::chrono::milliseconds(250));
         if (stall)
         {
             transfer_waiting = true;
@@ -204,6 +211,36 @@ TEST_CASE("Get discards HTTP error bodies before another resume", "[unit]")
     std::string prefix;
     int flags{};
     SECTION("new download") {}
+    SECTION("resume percentage persists while HEAD and GET are pending")
+    {
+        reject = false;
+        delay = true;
+        std::ofstream(local, std::ios::binary) << object.substr(0, 6);
+        RemoteInfoStruct info{};
+        info.SizeLow = static_cast<DWORD>(object.size());
+        const RemoteInfoStruct* listed = &info;
+        SECTION("listed size available") {}
+        SECTION("size discovered by HEAD") { listed = nullptr; }
+        REQUIRE(s3cmd::get_file(L"\\resume-test\\bucket\\object", local.c_str(),
+                               FS_COPYFLAGS_RESUME, listed) == FS_FILE_OK);
+        REQUIRE(transfer_percentages.size() >= 4);
+        const auto expected = static_cast<int>(6 * 100 / object.size());
+        CHECK(transfer_percentages.front() == (listed ? expected : 0));
+        bool validated = listed != nullptr;
+        int resumed_reports{};
+        for (const auto percent : transfer_percentages)
+        {
+            if (percent == expected)
+                ++resumed_reports;
+            if (percent >= expected)
+                validated = true;
+            if (validated)
+                CHECK(percent >= expected);
+        }
+        CHECK(resumed_reports >= 2);
+        CHECK(transfer_percentages.back() == 100);
+        return;
+    }
     SECTION("cancel while waiting for response headers")
     {
         stall = true;

@@ -420,21 +420,30 @@ bool report_progress(const wchar_t* source, const wchar_t* target, int percent)
     return plugin_host->notify_progress(source, target, percent);
 }
 
+// Reserve 100 for a completed transfer, including when a resumed file is already full size.
+int transfer_percent(std::uint64_t transferred, std::uint64_t total)
+{
+    return total == 0 ? 0
+                     : std::min(99, static_cast<int>(std::min(transferred, total) * 100 / total));
+}
+
 // Keep tracks of SDK callbacks that run on AWS SDK worker thread(s)
 class TransferProgress
 {
 public:
     // Constructor for Head request
     TransferProgress(const wchar_t* source, const wchar_t* target,
-                     Aws::S3::Model::HeadObjectRequest& request)
-        : TransferProgress{source, target, 0, request}
+                     Aws::S3::Model::HeadObjectRequest& request, std::uint64_t total,
+                     std::uint64_t transferred)
+        : TransferProgress{source, target, total, request, transferred}
     {
     }
 
     // Constructor for Get request
     TransferProgress(const wchar_t* source, const wchar_t* target,
-                     Aws::S3::Model::GetObjectRequest& request, std::uint64_t transferred = 0)
-        : TransferProgress{source, target, 0, request, transferred}
+                     Aws::S3::Model::GetObjectRequest& request, std::uint64_t transferred = 0,
+                     std::uint64_t total = 0)
+        : TransferProgress{source, target, total, request, transferred}
     {
         request.SetHeadersReceivedEventHandler(
             [this, transferred](const Aws::Http::HttpRequest*, Aws::Http::HttpResponse* response) {
@@ -494,7 +503,8 @@ private:
           target_{target},
           total_{total},
           initial_transferred_{transferred},
-          transferred_{transferred}
+          transferred_{transferred},
+          percent_{transfer_percent(transferred, total)}
     {
         request.SetRequestRetryHandler(
             [this](const Aws::AmazonWebServiceRequest&) { transferred_ = initial_transferred_; });
@@ -505,15 +515,8 @@ private:
             });
     }
 
-    // Calculate percentage of the transfer. Never returns 100 as that's reserved for a completed transfer
-    int transfer_percent(std::uint64_t transferred, std::uint64_t total)
-    {
-        return total == 0
-                   ? 0
-                   : std::min(99, static_cast<int>(std::min(transferred, total) * 100 / total));
-    }
-
-    // Worker-only counters; publish the percentage for the calling thread.
+    // TC is notified about new value of progress in `wait` function
+    // This is to guarantee we don't call plugin host on different thread that he called us
     void add(long long bytes)
     {
         std::scoped_lock lock(pause_mutex_);
@@ -982,20 +985,27 @@ try
     if (error)
         return FS_FILE_WRITEERROR;
     if (!resume && (copy_flags & FS_COPYFLAGS_OVERWRITE) == 0 && local_exists)
+    {
+        // If the local file already exists and it's a regular file return we support resuming transfer
         return std::filesystem::is_regular_file(local, error) && !error
                    ? FS_FILE_EXISTSRESUMEALLOWED
                    : FS_FILE_EXISTS;
+    }
 
     std::uint64_t offset{};
     if (resume)
     {
         if (!std::filesystem::is_regular_file(local, error) || error)
             return FS_FILE_NOTSUPPORTED;
+        // Check how much we already downloaded
         offset = std::filesystem::file_size(local, error);
         if (error)
             return FS_FILE_WRITEERROR;
     }
-    if (report_progress(remote_name, local_name, 0))
+    const auto listed_size = info ? static_cast<std::uint64_t>(info->SizeLow) |
+                                       (static_cast<std::uint64_t>(info->SizeHigh) << 32)
+                                 : 0;
+    if (report_progress(remote_name, local_name, transfer_percent(offset, listed_size)))
         return FS_FILE_USERABORT;
 
     const auto path = RemotePath::make(remote_name);
@@ -1025,7 +1035,7 @@ try
             Aws::S3::Model::HeadObjectRequest request;
             request.SetBucket(path.bucket);
             request.SetKey(path.key);
-            TransferProgress progress{remote_name, local_name, request};
+            TransferProgress progress{remote_name, local_name, request, listed_size, offset};
             const auto outcome = progress.wait(client->HeadObjectCallable(request));
             if (progress.is_canceled())
                 return FS_FILE_USERABORT;
@@ -1042,13 +1052,12 @@ try
             if (length < 0)
                 return FS_FILE_READERROR;
             remote_size = static_cast<std::uint64_t>(length);
-            const auto listed_size = info ? static_cast<std::uint64_t>(info->SizeLow) |
-                                                (static_cast<std::uint64_t>(info->SizeHigh) << 32)
-                                          : remote_size;
-            if (listed_size != remote_size)
+            if (info && listed_size != remote_size)
                 return FS_FILE_READERROR;
             if (offset > remote_size)
                 return FS_FILE_NOTSUPPORTED;
+            if (report_progress(remote_name, local_name, transfer_percent(offset, remote_size)))
+                return FS_FILE_USERABORT;
             e_tag = outcome.GetResult().GetETag();
         }
 
@@ -1083,7 +1092,7 @@ try
                 return stream;
             });
 
-            TransferProgress progress{remote_name, local_name, request, offset};
+            TransferProgress progress{remote_name, local_name, request, offset, remote_size};
             const auto outcome = progress.wait(client->GetObjectCallable(request));
             if (!outcome.IsSuccess())
             {
