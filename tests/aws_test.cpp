@@ -177,8 +177,15 @@ TEST_CASE("a bucket can be entered using its own region", "[integration]")
 
     auto profile_path = L"\\" + s3cmd::to_wide(*profile);
     const auto bucket_name = s3cmd::to_wide(*bucket);
+    auto directory = profile_path + L"\\" + bucket_name;
+
+    // Total Commander may open a saved bucket path without listing its profile first.
     WIN32_FIND_DATAW entry{};
-    auto handle = s3cmd::find_first(profile_path.data(), &entry);
+    auto handle = s3cmd::find_first(directory.data(), &entry);
+    REQUIRE(handle != INVALID_HANDLE_VALUE);
+    s3cmd::find_close(handle);
+
+    handle = s3cmd::find_first(profile_path.data(), &entry);
     REQUIRE(handle != INVALID_HANDLE_VALUE);
 
     bool found = false;
@@ -189,7 +196,6 @@ TEST_CASE("a bucket can be entered using its own region", "[integration]")
     s3cmd::find_close(handle);
     REQUIRE(found);
 
-    auto directory = profile_path + L"\\" + bucket_name;
     for (std::size_t index = 0; index < components.size(); ++index)
     {
         const auto expected = s3cmd::to_wide(components[index]);

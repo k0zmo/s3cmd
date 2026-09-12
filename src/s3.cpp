@@ -593,8 +593,6 @@ class FindState
 public:
     explicit FindState(const RemotePath& path)
     {
-        AwsLease lease;
-
         // Path is at "profile level", just list all the detected profiles
         if (path.profile.empty())
         {
@@ -669,6 +667,7 @@ private:
 
     void list_profiles()
     {
+        AwsLease lease;
         std::set<std::string> profiles{"default"};
         const auto selected = Aws::Auth::GetConfigProfileName();
         profiles.emplace(selected);
@@ -683,6 +682,7 @@ private:
 
     void list_buckets(const RemotePath& path)
     {
+        AwsLease lease;
         BucketMap buckets;
         bool discovered{};
         // Force us-east-1 region because global endpoint returns the original bucket creation time
@@ -728,7 +728,13 @@ private:
     void list_objects(const RemotePath& path)
     {
         const auto prefix = path.directory_prefix();
-        auto client = get_client(path);
+        auto region = ProfileConfig(path.profile).bucket_region(path.bucket);
+        // Might happen if we skip bucket listing - i.e. jump straight into bucket listing
+        if (region.empty())
+            region = discover_bucket_region(path.profile, path.bucket);
+
+        AwsLease lease;
+        auto client = get_client(path, region);
         Aws::S3::Model::ListObjectsV2Request request;
         request.SetBucket(path.bucket);
         request.SetDelimiter("/");
