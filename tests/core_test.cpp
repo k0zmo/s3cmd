@@ -162,6 +162,8 @@ TEST_CASE("Get discards HTTP error bodies before another resume", "[unit]")
     std::atomic<bool> reject{true};
     std::atomic<bool> stall{};
     std::atomic<bool> delay{};
+    std::atomic<int> invalid_response{};
+    std::atomic<int> head_requests{};
     transfer_percentages.clear();
     transfer_waiting = false;
     transfer_canceled = false;
@@ -169,6 +171,8 @@ TEST_CASE("Get discards HTTP error bodies before another resume", "[unit]")
     transfer_caller = GetCurrentThreadId();
     httplib::Server server;
     const auto respond = [&](const httplib::Request& request, httplib::Response& response) {
+        if (request.method == "HEAD")
+            ++head_requests;
         if (delay)
             std::this_thread::sleep_for(std::chrono::milliseconds(250));
         if (stall)
@@ -179,6 +183,18 @@ TEST_CASE("Get discards HTTP error bodies before another resume", "[unit]")
                 std::this_thread::sleep_for(std::chrono::milliseconds(10));
         }
         response.set_header("ETag", "\"test\"");
+        if (invalid_response)
+        {
+            // Keep httplib from repairing the intentionally invalid range response.
+            const_cast<httplib::Request&>(request).ranges.clear();
+            response.status = invalid_response == 1 ? 200 : 206;
+            response.set_content(object, "application/octet-stream");
+            if (invalid_response == 3)
+                response.set_header("Content-Range", "bytes 0-31/32");
+            if (invalid_response == 4)
+                response.set_header("Content-Range", "bytes 6-31/32junk");
+            return;
+        }
         if (request.method == "HEAD")
             response.set_content(object, "application/octet-stream");
         else if (reject)
@@ -186,6 +202,12 @@ TEST_CASE("Get discards HTTP error bodies before another resume", "[unit]")
             response.status = 412;
             response.set_content("<Error><Code>PreconditionFailed</Code></Error>", "application/xml");
         }
+        else if (delay)
+            response.set_content_provider(object.size(), "application/octet-stream",
+                [&](size_t offset, size_t length, httplib::DataSink& sink) {
+                    std::this_thread::sleep_for(std::chrono::milliseconds(250));
+                    return sink.write(object.data() + offset, length);
+                });
         else
             response.set_content(object, "application/octet-stream");
     };
@@ -213,6 +235,7 @@ TEST_CASE("Get discards HTTP error bodies before another resume", "[unit]")
     SECTION("new download") {}
     SECTION("equal size cannot be resumed without listing metadata")
     {
+        reject = false;
         std::ofstream(local, std::ios::binary) << std::string(object.size(), 'x');
         CHECK(s3cmd::get_file(L"\\resume-test\\bucket\\object", local.c_str(),
                              FS_COPYFLAGS_RESUME | FS_COPYFLAGS_MOVE, nullptr) ==
@@ -222,7 +245,21 @@ TEST_CASE("Get discards HTTP error bodies before another resume", "[unit]")
               std::string(object.size(), 'x'));
         return;
     }
-    SECTION("resume percentage persists while HEAD and GET are pending")
+    SECTION("invalid ranged responses leave the prefix intact")
+    {
+        SECTION("range ignored") { invalid_response = 1; }
+        SECTION("missing content range") { invalid_response = 2; }
+        SECTION("wrong start offset") { invalid_response = 3; }
+        SECTION("malformed total size") { invalid_response = 4; }
+        std::ofstream(local, std::ios::binary) << "prefix";
+        CHECK(s3cmd::get_file(L"\\resume-test\\bucket\\object", local.c_str(),
+                             FS_COPYFLAGS_RESUME, nullptr) == FS_FILE_READERROR);
+        std::ifstream file(local, std::ios::binary);
+        CHECK(std::string(std::istreambuf_iterator<char>(file), {}) == "prefix");
+        CHECK(head_requests == 0);
+        return;
+    }
+    SECTION("resume percentage persists while GET is pending")
     {
         reject = false;
         delay = true;
@@ -231,7 +268,7 @@ TEST_CASE("Get discards HTTP error bodies before another resume", "[unit]")
         info.SizeLow = static_cast<DWORD>(object.size());
         const RemoteInfoStruct* listed = &info;
         SECTION("listed size available") {}
-        SECTION("size discovered by HEAD") { listed = nullptr; }
+        SECTION("size discovered by GET") { listed = nullptr; }
         REQUIRE(s3cmd::get_file(L"\\resume-test\\bucket\\object", local.c_str(),
                                FS_COPYFLAGS_RESUME, listed) == FS_FILE_OK);
         REQUIRE(transfer_percentages.size() >= 4);
@@ -250,6 +287,7 @@ TEST_CASE("Get discards HTTP error bodies before another resume", "[unit]")
         }
         CHECK(resumed_reports >= 2);
         CHECK(transfer_percentages.back() == 100);
+        CHECK(head_requests == 0);
         return;
     }
     SECTION("cancel while waiting for response headers")

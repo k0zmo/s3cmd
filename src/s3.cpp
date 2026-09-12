@@ -431,26 +431,57 @@ int transfer_percent(std::uint64_t transferred, std::uint64_t total)
 class TransferProgress
 {
 public:
-    // Constructor for Head request
-    TransferProgress(const wchar_t* source, const wchar_t* target,
-                     Aws::S3::Model::HeadObjectRequest& request, std::uint64_t total,
-                     std::uint64_t transferred)
-        : TransferProgress{source, target, total, request, transferred}
-    {
-    }
-
     // Constructor for Get request
     TransferProgress(const wchar_t* source, const wchar_t* target,
                      Aws::S3::Model::GetObjectRequest& request, std::uint64_t transferred = 0,
-                     std::uint64_t total = 0)
+                     std::uint64_t total = 0, bool resume = false)
         : TransferProgress{source, target, total, request, transferred}
     {
         request.SetHeadersReceivedEventHandler(
-            [this, transferred](const Aws::Http::HttpRequest*, Aws::Http::HttpResponse* response) {
+            [this, transferred, resume](const Aws::Http::HttpRequest*, Aws::Http::HttpResponse* response) {
                 response_error_ = static_cast<int>(response->GetResponseCode()) >= 300;
-                const auto& length = response->GetHeader(Aws::Http::CONTENT_LENGTH_HEADER);
+                invalid_range_ = false;
+                const std::string_view length = response->HasHeader(Aws::Http::CONTENT_LENGTH_HEADER)
+                                                    ? std::string_view(response->GetHeader(Aws::Http::CONTENT_LENGTH_HEADER))
+                                                    : std::string_view("");
                 std::uint64_t remaining{};
-                std::from_chars(length.data(), length.data() + length.size(), remaining);
+                const auto parsed_length = std::from_chars(length.data(), length.data() + length.size(), remaining);
+                if (resume && !response_error_)
+                {
+                    // Validate before the transport writes any response bytes into the local prefix.
+                    std::string_view range = response->HasHeader("content-range")
+                                                 ? response->GetHeader("content-range")
+                                                 : std::string_view{};
+                    std::uint64_t first{}, last{}, size{};
+                    const auto number = [&range](std::uint64_t& value, char delimiter) {
+                        const auto result = std::from_chars(range.data(), range.data() + range.size(), value);
+                        if (result.ec != std::errc{})
+                            return false;
+                        range.remove_prefix(result.ptr - range.data());
+                        if (delimiter == '\0')
+                            return range.empty();
+                        if (range.empty() || range.front() != delimiter)
+                            return false;
+                        range.remove_prefix(1);
+                        return true;
+                    };
+                    invalid_range_ = parsed_length.ec != std::errc{} ||
+                                     parsed_length.ptr != length.data() + length.size() ||
+                                     response->GetResponseCode() != Aws::Http::HttpResponseCode::PARTIAL_CONTENT ||
+                                     !range.starts_with("bytes ");
+                    if (!invalid_range_)
+                    {
+                        range.remove_prefix(6);
+                        invalid_range_ = !number(first, '-') || !number(last, '/') || !number(size, '\0') ||
+                                         first != transferred || first > last || size == 0 ||
+                                         last != size - 1 || remaining != size - first;
+                    }
+                    if (invalid_range_)
+                        return;
+                    total_ = size;
+                    percent_ = transfer_percent(transferred_, total_);
+                    return;
+                }
                 total_ = transferred + remaining;
             });
         request.SetDataReceivedEventHandler([this](const Aws::Http::HttpRequest*,
@@ -470,6 +501,8 @@ public:
 
     bool is_canceled() const { return canceled_.load(); }
     bool has_response_error() const { return response_error_; }
+    bool has_invalid_range() const { return invalid_range_; }
+    std::uint64_t total() const { return total_; }
 
     template <typename Outcome>
     Outcome wait(std::future<Outcome> future)
@@ -511,7 +544,7 @@ private:
         request.SetContinueRequestHandler(
             [this](const Aws::Http::HttpRequest*) {
                 std::scoped_lock lock(pause_mutex_);
-                return !canceled_.load();
+                return !canceled_.load() && !invalid_range_;
             });
     }
 
@@ -536,6 +569,7 @@ private:
     std::mutex pause_mutex_;
     std::atomic<bool> canceled_{};
     bool response_error_{};
+    bool invalid_range_{};
 };
 
 // Checks whether an object at `path` exists
@@ -1032,51 +1066,15 @@ try
         AwsLease lease;
         auto client = get_client(path);
 
-        Aws::String e_tag;
-        if (resume)
-        {
-            // ponytail: the existing prefix is trusted; persist object identity if provenance checks matter.
-            log_operation("HeadObject", path, false);
-            Aws::S3::Model::HeadObjectRequest request;
-            request.SetBucket(path.bucket);
-            request.SetKey(path.key);
-            TransferProgress progress{remote_name, local_name, request, listed_size, offset};
-            const auto outcome = progress.wait(client->HeadObjectCallable(request));
-            if (progress.is_canceled())
-                return FS_FILE_USERABORT;
-            if (!outcome.IsSuccess())
-            {
-                log_aws_error("HeadObject", outcome.GetError());
-                return outcome.GetError().GetResponseCode() ==
-                               Aws::Http::HttpResponseCode::NOT_FOUND
-                           ? FS_FILE_NOTFOUND
-                           : FS_FILE_READERROR;
-            }
-
-            const auto length = outcome.GetResult().GetContentLength();
-            if (length < 0)
-                return FS_FILE_READERROR;
-            remote_size = static_cast<std::uint64_t>(length);
-            if (info && listed_size != remote_size)
-                return FS_FILE_READERROR;
-            if (offset >= remote_size)
-                return FS_FILE_NOTSUPPORTED;
-            if (report_progress(remote_name, local_name, transfer_percent(offset, remote_size)))
-                return FS_FILE_USERABORT;
-            e_tag = outcome.GetResult().GetETag();
-        }
-
-        if (!resume || offset < remote_size)
         {
             Aws::S3::Model::GetObjectRequest request;
             request.SetBucket(path.bucket.c_str());
             request.SetKey(path.key.c_str());
             if (resume)
             {
+                // ponytail: trust the existing prefix; persist identity if provenance checks matter.
                 const auto range = std::format("bytes={}-", offset);
                 request.SetRange(range.c_str());
-                if (!e_tag.empty())
-                    request.SetIfMatch(e_tag);
             }
             request.SetResponseStreamFactory([local, offset] {
                 auto stream = Aws::New<std::fstream>("s3cmd");
@@ -1097,8 +1095,10 @@ try
                 return stream;
             });
 
-            TransferProgress progress{remote_name, local_name, request, offset, remote_size};
+            TransferProgress progress{remote_name, local_name, request, offset, listed_size, resume};
             const auto outcome = progress.wait(client->GetObjectCallable(request));
+            if (progress.has_invalid_range())
+                return FS_FILE_READERROR;
             if (!outcome.IsSuccess())
             {
                 // Error bodies use the same stream; only retain bytes from object responses.
@@ -1112,6 +1112,9 @@ try
                 if (progress.is_canceled())
                     return FS_FILE_USERABORT;
                 log_aws_error("GetObject", outcome.GetError());
+                if (resume && outcome.GetError().GetResponseCode() ==
+                                  Aws::Http::HttpResponseCode::REQUESTED_RANGE_NOT_SATISFIABLE)
+                    return FS_FILE_NOTSUPPORTED;
                 return outcome.GetError().GetResponseCode() ==
                                Aws::Http::HttpResponseCode::NOT_FOUND
                            ? FS_FILE_NOTFOUND
@@ -1119,13 +1122,14 @@ try
             }
             if (progress.is_canceled())
                 return FS_FILE_USERABORT;
+            remote_size = progress.total();
         }
     }
 
     if (resume)
     {
-        std::filesystem::resize_file(local, remote_size, error);
-        if (error)
+        const auto size = std::filesystem::file_size(local, error);
+        if (error || size != remote_size)
             return FS_FILE_WRITEERROR;
     }
     if ((copy_flags & FS_COPYFLAGS_MOVE) != 0 && !delete_file(remote_name))
