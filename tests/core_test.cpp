@@ -12,16 +12,20 @@
 #include <aws/core/utils/logging/LogLevel.h>
 #include <aws/core/utils/logging/LogSystemInterface.h>
 #include <catch2/catch_test_macros.hpp>
+#include <httplib.h>
 
 #include <Windows.h> // GetCurrentProcessId, GetTickCount, SetLastError, GetLastError
 
+#include <atomic>
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
+#include <iterator>
 #include <stdexcept>
 #include <string>
 #include <string_view>
 #include <system_error>
+#include <thread>
 
 namespace {
 
@@ -133,6 +137,62 @@ TemporaryConfig& temporary_config()
 }
 
 } // namespace
+
+TEST_CASE("Get discards HTTP error bodies before another resume", "[unit]")
+{
+    auto& config = temporary_config();
+    const std::string object = "prefix and the rest of the object";
+    std::atomic<bool> reject{true};
+    httplib::Server server;
+    server.Get("/bucket/object", [&](const httplib::Request& request, httplib::Response& response) {
+        response.set_header("ETag", "\"test\"");
+        if (request.method == "HEAD")
+            response.set_content(object, "application/octet-stream");
+        else if (reject)
+        {
+            response.status = 412;
+            response.set_content("<Error><Code>PreconditionFailed</Code></Error>", "application/xml");
+        }
+        else
+            response.set_content(object, "application/octet-stream");
+    });
+    const auto port = server.bind_to_any_port("127.0.0.1");
+    REQUIRE(port > 0);
+    std::jthread worker([&](std::stop_token stop) {
+        std::stop_callback shutdown(stop, [&] { server.stop(); });
+        server.listen_after_bind();
+    });
+    server.wait_until_ready();
+    const auto endpoint = "http://127.0.0.1:" + std::to_string(port);
+    TemporaryEnvironment url("AWS_ENDPOINT_URL_S3", endpoint.c_str());
+    TemporaryEnvironment endpoints("AWS_IGNORE_CONFIGURED_ENDPOINT_URLS", "false");
+    TemporaryEnvironment access("AWS_ACCESS_KEY_ID", "test");
+    TemporaryEnvironment secret("AWS_SECRET_ACCESS_KEY", "test");
+    TemporaryEnvironment region("AWS_DEFAULT_REGION", "us-east-1");
+    PluginSession session;
+
+    const auto local = config.root / L"download";
+    std::string prefix;
+    int flags{};
+    SECTION("new download") {}
+    SECTION("resumed download")
+    {
+        prefix = object.substr(0, 6);
+        flags = FS_COPYFLAGS_RESUME;
+        std::ofstream(local, std::ios::binary) << prefix;
+    }
+    const auto read_local = [&] {
+        std::ifstream file(local, std::ios::binary);
+        return std::string(std::istreambuf_iterator<char>(file), {});
+    };
+    REQUIRE(s3cmd::get_file(L"\\resume-test\\bucket\\object", local.c_str(), flags, nullptr) ==
+            FS_FILE_READERROR);
+    REQUIRE(read_local() == prefix);
+    reject = false;
+    REQUIRE(s3cmd::get_file(L"\\resume-test\\bucket\\object", local.c_str(),
+                           FS_COPYFLAGS_RESUME, nullptr) == FS_FILE_OK);
+    CHECK(read_local() == object);
+}
 
 TEST_CASE("AWS SDK lifecycle is idempotent on its owner thread", "[unit]")
 {

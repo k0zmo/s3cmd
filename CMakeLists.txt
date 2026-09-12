@@ -102,7 +102,7 @@ if(BUILD_TESTING)
         tests/aws_test.cpp
         tests/core_test.cpp
     )
-    target_link_libraries(s3cmd-test PRIVATE s3cmd-core Catch2::Catch2WithMain)
+    target_link_libraries(s3cmd-test PRIVATE s3cmd-core Catch2::Catch2WithMain httplib::httplib)
 
     add_test(NAME s3cmd-unit COMMAND s3cmd-test "[unit]")
     set_tests_properties(s3cmd-unit PROPERTIES LABELS unit)
