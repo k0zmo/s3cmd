@@ -36,6 +36,7 @@ find_package(httplib CONFIG REQUIRED)
 
 add_library(s3cmd-core STATIC
     src/fsplugin.h
+    src/prereq.h
     src/core.hpp   src/core.cpp
     src/creds.hpp  src/creds.cpp
     src/log.cpp    src/log.hpp

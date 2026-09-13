@@ -1,4 +1,5 @@
 #include "s3.hpp"
+#include "prereq.h"
 #include "core.hpp"
 #include "creds.hpp"
 #include "fsplugin.h"
@@ -355,7 +356,7 @@ std::shared_ptr<Aws::S3::S3Client> get_client(const RemotePath& path,
                     "To keep the legacy configuration, sign in with AWS CLI instead:\n"
                     "aws sso login --profile \"{}\"\nThen retry the operation.",
                     path.profile, path.profile, path.profile);
-                plugin_host->notify_message_box(PluginHost::message_box_type::msg_ok, L"Amazon S3",
+                plugin_host->notify_message_box(PluginHost::message_box_type::msg_ok, title,
                                                 to_wide(message).c_str());
                 throw SsoLoginFailed(message);
             }
@@ -1361,11 +1362,10 @@ catch (const std::exception& error)
 
 void get_default_root_name(char* name, int max_length)
 {
-    constexpr std::string_view root_name = "Amazon S3";
     if (!name || max_length <= 0)
         return;
-    const auto length = std::min(root_name.size(), static_cast<std::size_t>(max_length - 1));
-    std::memcpy(name, root_name.data(), length);
+    const auto length = std::min(plugin_name.size(), static_cast<std::size_t>(max_length - 1));
+    std::memcpy(name, plugin_name.data(), length);
     name[length] = '\0';
 }
 

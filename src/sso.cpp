@@ -1,4 +1,5 @@
 #include "sso.hpp"
+#include "prereq.h"
 #include "core.hpp"
 #include "log.hpp"
 
@@ -65,8 +66,6 @@ SsoLoginCancelled::SsoLoginCancelled(std::string_view profile)
 }
 
 namespace {
-
-constexpr const wchar_t* title = L"Amazon S3";
 
 bool wait_for_sso(PluginHost& host,
                   std::string_view profile,

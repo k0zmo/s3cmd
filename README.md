@@ -47,7 +47,7 @@ If PKCE fails, the plugin offers device-code login as a fallback.
 ## Use
 
 1. Open Network Neighborhood (`\\`) in Total Commander.
-2. Open Amazon S3.
+2. Open S3.
 3. Open an AWS profile.
 4. Open a bucket.
 5. Use the usual Total Commander copy, move, rename, create-directory, and delete commands.
