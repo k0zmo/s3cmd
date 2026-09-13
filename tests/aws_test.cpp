@@ -1,5 +1,6 @@
 #include "s3.hpp"
 #include "core.hpp"
+#include "utils.hpp"
 
 #include <aws/core/Aws.h>
 #include <aws/core/auth/AWSCredentialsProviderChain.h>

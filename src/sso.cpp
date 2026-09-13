@@ -2,6 +2,7 @@
 #include "prereq.h"
 #include "core.hpp"
 #include "log.hpp"
+#include "utils.hpp"
 
 // Windows defines GetObject as GetObjectA
 #undef GetObject

@@ -13,7 +13,7 @@
 #include <aws/core/utils/logging/LogSystemInterface.h>
 #include <catch2/catch_test_macros.hpp>
 
-#include <Windows.h> // GetCurrentProcessId, GetTickCount, SetLastError, GetLastError
+#include <Windows.h> // GetCurrentProcessId, GetTickCount64, SetLastError, GetLastError
 
 #include <cstdlib>
 #include <filesystem>
@@ -329,8 +329,10 @@ TEST_CASE("directory prefixes use S3 separators", "[unit]")
 TEST_CASE("remote files are delegated to the host for opening", "[unit]")
 {
     CHECK(s3cmd::execute_file(L"\\work\\bucket\\file.txt", L"open") == FS_EXEC_YOURSELF);
+    CHECK(s3cmd::execute_file(L"\\work\\bucket\\file.txt", L"OPEN") == FS_EXEC_YOURSELF);
     CHECK(s3cmd::execute_file(L"\\work\\bucket", L"open") == FS_EXEC_OK);
     CHECK(s3cmd::execute_file(L"\\work\\bucket\\file.txt", L"properties") == FS_EXEC_YOURSELF);
+    CHECK(s3cmd::execute_file(L"\\work\\bucket\\file.txt", L"MODE I") == FS_EXEC_YOURSELF);
 }
 
 TEST_CASE("bucket registry only unregisters registered buckets", "[unit]")

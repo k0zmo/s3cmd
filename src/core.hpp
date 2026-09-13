@@ -117,7 +117,4 @@ struct RemotePath
     bool operator==(const RemotePath&) const = default;
 };
 
-std::wstring to_wide(std::string_view text);
-std::string to_utf8(std::wstring_view text);
-
 } // namespace s3cmd
