@@ -63,7 +63,7 @@ Press F7 and then enter an existing bucket name. The plugin finds its region or 
 
 Bucket registration is stored locally. F7 does not create an S3 bucket and removing a registered bucket doesn't delete it from AWS.
 
-The plugin exposes a `Region` content field for bucket entries. If you need region data, add this field to a custom-column view.
+The plugin exposes `Region` for bucket entries and `Storage class` plus `ETag` for object entries as Total Commander content fields. Add them to a custom-column view when needed.
 
 ## Features
 
@@ -86,7 +86,7 @@ The plugin exposes a `Region` content field for bucket entries. If you need regi
 - Creates S3 directory markers for directories created with F7.
 - Removes a directory marker only after the directory contents are removed.
 - Registers and unregisters existing buckets when automatic bucket discovery is unavailable.
-- Exposes the bucket region as a `Region` content field.
+- Exposes `Region`, `Storage class`, and `ETag` as content fields.
 - Reuses S3 clients and supports concurrent background transfers during one plugin session.
 
 ## Configuration file

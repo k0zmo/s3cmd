@@ -1,17 +1,18 @@
 #include "s3.hpp"
 #include "creds.hpp"
+#include "core.hpp"
+#include "fsplugin.h"
+
 #include <aws/core/auth/GeneralHTTPCredentialsProvider.h>
 #include <aws/core/auth/SSOCredentialsProvider.h>
 #include <aws/core/auth/STSCredentialsProvider.h>
 #include <aws/core/internal/AWSHttpResourceClient.h>
-#include "core.hpp"
-#include "fsplugin.h"
-
-#include <aws/core/utils/logging/AWSLogging.h>
 #include <aws/core/platform/Environment.h>
+#include <aws/core/utils/logging/AWSLogging.h>
 #include <aws/core/utils/logging/LogLevel.h>
 #include <aws/core/utils/logging/LogSystemInterface.h>
 #include <catch2/catch_test_macros.hpp>
+#include <httplib.h>
 
 #include <Windows.h> // GetCurrentProcessId, GetTickCount64, SetLastError, GetLastError
 
@@ -420,7 +421,11 @@ TEST_CASE("Region is exposed as a Total Commander content field", "[unit]")
     CHECK(s3cmd::content_get_supported_field(0, name, units, sizeof(name)) == ft_string);
     CHECK(std::string_view(name) == "Region");
     CHECK(std::string_view(units).empty());
-    CHECK(s3cmd::content_get_supported_field(1, name, units, sizeof(name)) == ft_nomorefields);
+    CHECK(s3cmd::content_get_supported_field(1, name, units, sizeof(name)) == ft_string);
+    CHECK(std::string_view(name) == "Storage class");
+    CHECK(s3cmd::content_get_supported_field(2, name, units, sizeof(name)) == ft_string);
+    CHECK(std::string_view(name) == "ETag");
+    CHECK(s3cmd::content_get_supported_field(3, name, units, sizeof(name)) == ft_nomorefields);
 
     wchar_t bucket_path[] = L"\\work\\owned-bucket";
     wchar_t value[32]{};
@@ -438,6 +443,67 @@ TEST_CASE("Region is exposed as a Total Commander content field", "[unit]")
 
     PluginSession session;
     CHECK(s3cmd::content_get_value(bucket_path, 0, value, sizeof(value)) == ft_fieldempty);
+}
+
+TEST_CASE("ListObjectsV2 metadata is exposed as content fields", "[unit]")
+{
+    temporary_config();
+    const s3cmd::ProfileConfig profile("work");
+    REQUIRE(profile.register_bucket("owned-bucket", "us-east-1"));
+
+    std::atomic<int> list_requests{};
+    httplib::Server server;
+    server.Get("/owned-bucket", [&](const httplib::Request&, httplib::Response& response) {
+        ++list_requests;
+        response.set_content(
+            R"xml(<?xml version="1.0" encoding="UTF-8"?>
+<ListBucketResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/">
+  <Name>owned-bucket</Name>
+  <Prefix>folder/</Prefix>
+  <Delimiter>/</Delimiter>
+  <KeyCount>1</KeyCount>
+  <MaxKeys>1000</MaxKeys>
+  <IsTruncated>false</IsTruncated>
+  <Contents>
+    <Key>folder/file.txt</Key>
+    <LastModified>2026-09-13T00:00:00.000Z</LastModified>
+    <ETag>&quot;abc123&quot;</ETag>
+    <Size>3</Size>
+    <StorageClass>STANDARD</StorageClass>
+  </Contents>
+</ListBucketResult>)xml",
+            "application/xml");
+    });
+    const auto port = server.bind_to_any_port("127.0.0.1");
+    REQUIRE(port > 0);
+    std::jthread worker([&](std::stop_token stop) {
+        std::stop_callback shutdown(stop, [&] { server.stop(); });
+        server.listen_after_bind();
+    });
+    server.wait_until_ready();
+
+    const auto endpoint = "http://127.0.0.1:" + std::to_string(port);
+    TemporaryEnvironment url("AWS_ENDPOINT_URL_S3", endpoint.c_str());
+    TemporaryEnvironment endpoints("AWS_IGNORE_CONFIGURED_ENDPOINT_URLS", "false");
+    TemporaryEnvironment access("AWS_ACCESS_KEY_ID", "test");
+    TemporaryEnvironment secret("AWS_SECRET_ACCESS_KEY", "test");
+    TemporaryEnvironment region("AWS_DEFAULT_REGION", "us-east-1");
+    PluginSession session;
+
+    wchar_t path[] = L"\\work\\owned-bucket\\folder";
+    WIN32_FIND_DATAW entry{};
+    const auto handle = s3cmd::find_first(path, &entry);
+    REQUIRE(handle != INVALID_HANDLE_VALUE);
+    CHECK(std::wstring_view(entry.cFileName) == L"file.txt");
+    s3cmd::find_close(handle);
+
+    wchar_t object_path[] = L"\\work\\owned-bucket\\folder\\file.txt";
+    wchar_t value[32]{};
+    CHECK(s3cmd::content_get_value(object_path, 1, value, sizeof(value)) == ft_stringw);
+    CHECK(std::wstring_view(value) == L"STANDARD");
+    CHECK(s3cmd::content_get_value(object_path, 2, value, sizeof(value)) == ft_stringw);
+    CHECK(std::wstring_view(value) == L"abc123");
+    CHECK(list_requests == 1);
 }
 
 TEST_CASE("runtime dry run completes S3 operations without side effects", "[unit]")
@@ -524,7 +590,7 @@ TEST_CASE("expired SSO profiles require supported login configuration", "[unit]"
     wchar_t path[] = L"\\expired";
     WIN32_FIND_DATAW entry{};
     CHECK(s3cmd::find_first(path, &entry) == INVALID_HANDLE_VALUE);
-    CHECK(GetLastError() == (legacy ? ERROR_LOGON_FAILURE : ERROR_CANCELLED));
+    CHECK(GetLastError() == (legacy ? (DWORD)ERROR_LOGON_FAILURE : (DWORD)ERROR_CANCELLED));
     CHECK(request_count == 1);
     if (legacy)
     {
