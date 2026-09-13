@@ -326,6 +326,13 @@ TEST_CASE("directory prefixes use S3 separators", "[unit]")
     CHECK(s3cmd::RemotePath{"work", "bucket", "one/two/"}.directory_prefix() == "one/two/");
 }
 
+TEST_CASE("remote files are delegated to the host for opening", "[unit]")
+{
+    CHECK(s3cmd::execute_file(L"\\work\\bucket\\file.txt", L"open") == FS_EXEC_YOURSELF);
+    CHECK(s3cmd::execute_file(L"\\work\\bucket", L"open") == FS_EXEC_OK);
+    CHECK(s3cmd::execute_file(L"\\work\\bucket\\file.txt", L"properties") == FS_EXEC_YOURSELF);
+}
+
 TEST_CASE("bucket registry only unregisters registered buckets", "[unit]")
 {
     auto& ini = temporary_config();

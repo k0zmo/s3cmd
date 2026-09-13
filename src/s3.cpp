@@ -938,6 +938,29 @@ void status_info(const wchar_t* remote_directory, int start_end, int operation)
     suppress_delete_listing = path.bucket.empty();
 }
 
+int execute_file(const wchar_t* remote_name, const wchar_t* verb)
+{
+    if (!remote_name || !verb)
+        return FS_EXEC_ERROR;
+
+    std::wstring_view verb_{verb};
+    if (verb_ == L"open")
+    {
+        const auto path = RemotePathView::make(remote_name);
+        if (path.profile.empty() || path.bucket.empty() || path.key.empty())
+            return FS_EXEC_OK;
+        return FS_EXEC_YOURSELF;
+    }
+    else if (verb_ == L"properties" || verb_.starts_with(L"quote ") || verb_.starts_with(L"chmod "))
+    {
+        return FS_EXEC_YOURSELF;
+    }
+    else
+    {
+        log("Unknown verb to execute file: {} for file: {}", to_utf8(verb), to_utf8(remote_name));
+    }
+}
+
 int get_file(const wchar_t* remote_name, const wchar_t* local_name, int copy_flags,
              [[maybe_unused]] const RemoteInfoStruct* info)
 try

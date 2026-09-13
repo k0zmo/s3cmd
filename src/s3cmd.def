@@ -4,6 +4,7 @@ EXPORTS
     FsFindNextW
     FsFindClose
     FsStatusInfoW
+    FsExecuteFileW
     FsGetFileW
     FsPutFileW
     FsGetBackgroundFlags
