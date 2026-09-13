@@ -4,6 +4,7 @@
 #include "creds.hpp"
 #include "fsplugin.h"
 #include "log.hpp"
+#include "object_metadata.hpp"
 #include "sso.hpp"
 #include "utils.hpp"
 
@@ -33,6 +34,7 @@
 #include <aws/s3/model/HeadObjectRequest.h>
 #include <aws/s3/model/ListBucketsRequest.h>
 #include <aws/s3/model/ListObjectsV2Request.h>
+#include <aws/s3/model/ObjectStorageClass.h>
 #include <aws/s3/model/PutObjectRequest.h>
 
 #include <toml++/toml.hpp>
@@ -75,38 +77,6 @@ namespace {
 
 constexpr std::uint64_t max_single_part_size = 5ULL * 1024 * 1024 * 1024;
 
-class AwsLogSystem final : public Aws::Utils::Logging::FormattedLogSystem
-{
-public:
-    using FormattedLogSystem::FormattedLogSystem;
-    void Flush() override {}
-
-    static Aws::Utils::Logging::LogLevel parse_log_level(std::string_view value)
-    {
-        using enum Aws::Utils::Logging::LogLevel;
-        if (value == "Off")
-            return Off;
-        if (value == "Fatal")
-            return Fatal;
-        if (value == "Error")
-            return Error;
-        if (value == "Warn")
-            return Warn;
-        if (value == "Debug")
-            return Debug;
-        if (value == "Trace")
-            return Trace;
-        return Info;
-    }
-
-private:
-    void ProcessFormattedStatement(Aws::String&& statement) override
-    {
-        statement.pop_back(); // FormattedLogSystem always appends a newline
-        log("{}", statement);
-    }
-};
-
 std::shared_mutex aws_lifecycle_mtx;
 Aws::SDKOptions aws_options;
 std::thread::id aws_init_thread_id{};
@@ -144,9 +114,13 @@ struct RuntimeConfig
 std::mutex config_mtx;
 std::optional<RuntimeConfig> runtime_config;
 
-// Total Commander recursively lists directories before calling FsRemoveDir. Profiles and buckets
-// are virtual directories, so their delete operations must see an empty listing.
+// TC recursively lists directories before calling FsRemoveDir.
+// Profiles and buckets are virtual directories, so their delete operations must
+// see an empty listing.
 thread_local bool suppress_delete_listing{};
+
+std::mutex object_metadata_mutex;
+ObjectMetadataCache object_metadata;
 
 struct ClientEntry
 {
@@ -165,7 +139,9 @@ std::atomic<std::uint64_t> sso_generation{};
 // AwsLease has two jobs:
 // 1. Verify the SDK is initialized.
 // 2. Hold a shared lifecycle lock for the entire AWS operation.
-// Multiple operations can hold it concurrently, but shutdown() needs the exclusive lock.
+// Multiple operations can hold it concurrently, but shutdown() needs the
+// exclusive lock. This way shutdown() will wait for any outstanding S3 operation
+// without a need to keep track of them
 struct AwsLease
 {
     AwsLease() : lock(aws_lifecycle_mtx)
@@ -574,12 +550,22 @@ private:
             name.size() < MAX_PATH;
     }
 
-    void append_entry(std::string_view name, bool directory, std::uint64_t size = 0,
+    // Convert S3-style path to totalcmd (windows forward slashes) style path
+    static std::wstring totalcmd_object_key(std::string_view key)
+    {
+        auto result = to_wide(key);
+        std::replace(result.begin(), result.end(), L'/', L'\\');
+        return result;
+    }
+
+    bool append_entry(std::string_view name, bool directory, std::uint64_t size = 0,
                       FILETIME modified = {})
     {
         auto wide_name = to_wide(name);
-        if (valid_entry_name(wide_name))
-            entries_.push_back({std::move(wide_name), size, modified, directory});
+        if (!valid_entry_name(wide_name))
+            return false;
+        entries_.push_back({std::move(wide_name), size, modified, directory});
+        return true;
     }
 
     FILETIME to_file_time(const Aws::Utils::DateTime& value)
@@ -602,7 +588,7 @@ private:
             profiles.emplace(name);
 
         for (const auto& profile : profiles)
-            append_entry(profile, true);
+            append_entry(profile, /*directory=*/true);
     }
 
     void list_buckets(const RemotePath& path)
@@ -617,12 +603,13 @@ private:
         Aws::S3::Model::ListBucketsRequest request;
         request.SetMaxBuckets(10'000);
         log_operation("ListBuckets", path, false);
+        ProfileConfig pc{path.profile};
         for (;;)
         {
             const auto outcome = client->ListBuckets(request);
             if (!outcome.IsSuccess())
             {
-                buckets = ProfileConfig(path.profile).registered_buckets();
+                buckets = pc.registered_buckets();
                 if (outcome.GetError().GetResponseCode() != Aws::Http::HttpResponseCode::FORBIDDEN)
                     log_aws_error("ListBuckets", outcome.GetError());
                 break;
@@ -642,12 +629,12 @@ private:
         }
 
         // We either want to list discovered buckets, or registered, never both
-        ProfileConfig(path.profile).set_discovered_buckets(discovered ? buckets : BucketMap{});
+        pc.set_discovered_buckets(discovered ? buckets : BucketMap{});
 
         if (!discovered)
-            append_entry("_F7=register bucket.txt", false);
+            append_entry("_F7=register bucket.txt", /*directory=*/false);
         for (const auto& [name, bucket] : buckets)
-            append_entry(name, true, 0, bucket.created);
+            append_entry(name, /*directory=*/true, 0, bucket.created);
     }
 
     void list_objects(const RemotePath& path)
@@ -665,6 +652,7 @@ private:
         request.SetDelimiter("/");
         request.SetPrefix(prefix);
         log_operation("ListObjectsV2", {path.profile, path.bucket, prefix}, false);
+        ObjectMetadataMap metadata;
 
         for (;;)
         {
@@ -681,8 +669,9 @@ private:
                 const auto& value = common_prefix.GetPrefix();
                 if (value.size() <= prefix.size() + 1)
                     continue;
-                append_entry({value.data() + prefix.size(), value.size() - prefix.size() - 1},
-                             true);
+                auto prefix_name = std::string_view{value}.substr(prefix.size());
+                prefix_name.remove_suffix(1); // Remove the trailing '/'
+                append_entry(prefix_name, /*directory=*/true);
             }
 
             for (const auto& object : result.GetContents())
@@ -692,15 +681,28 @@ private:
                 {
                     continue;
                 }
-                append_entry({key.data() + prefix.size(), key.size() - prefix.size()}, false,
-                             static_cast<std::uint64_t>(object.GetSize()),
-                             to_file_time(object.GetLastModified()));
+
+                // Strip prefix from the object_name
+                const auto object_name = std::string_view{key}.substr(prefix.size());
+                if (append_entry(object_name, /*directory=*/false,
+                                 static_cast<std::uint64_t>(object.GetSize()),
+                                 to_file_time(object.GetLastModified())))
+                {
+                    metadata[entries_.back().name] = {object.GetStorageClass(),
+                                                      to_wide(object.GetETag())};
+                }
             }
 
             if (!result.GetIsTruncated())
                 break;
             request.SetContinuationToken(result.GetNextContinuationToken());
         }
+
+        // Update metadata for this directory
+        std::scoped_lock lock(object_metadata_mutex);
+        object_metadata.add(
+            {to_wide(path.profile), to_wide(path.bucket), totalcmd_object_key(prefix)},
+            std::move(metadata));
     }
 
 private:
@@ -714,6 +716,8 @@ void reset_config()
 {
     std::scoped_lock lock(config_mtx);
     runtime_config.reset();
+    std::scoped_lock metadata_lock(object_metadata_mutex);
+    object_metadata.clear();
 }
 
 bool is_dry_run()
@@ -819,6 +823,32 @@ int initialize(int number, tProgressProcW progress, tLogProcW log, tRequestProcW
     std::unique_lock lock(aws_lifecycle_mtx);
     if (!aws_initialized)
     {
+        class AwsLogSystem final : public Aws::Utils::Logging::FormattedLogSystem
+        {
+        public:
+            using FormattedLogSystem::FormattedLogSystem;
+            void Flush() override {}
+
+            static Aws::Utils::Logging::LogLevel parse_log_level(std::string_view value)
+            {
+                using enum Aws::Utils::Logging::LogLevel;
+                if (value == "Off")   return Off;
+                if (value == "Fatal") return Fatal;
+                if (value == "Error") return Error;
+                if (value == "Warn")  return Warn;
+                if (value == "Debug") return Debug;
+                if (value == "Trace") return Trace;
+                return Info;
+            }
+
+        private:
+            void ProcessFormattedStatement(Aws::String&& statement) override
+            {
+                statement.pop_back(); // FormattedLogSystem always appends a newline
+                s3cmd::log("{}", statement);
+            }
+        };
+
         {
             std::scoped_lock config_lock(config_mtx);
             aws_options.loggingOptions.logLevel =
@@ -1254,14 +1284,15 @@ try
 
     if (path.key.empty())
     {
-        if (ProfileConfig(path.profile).has_discovered_buckets())
+        ProfileConfig pc{path.profile};
+        if (pc.has_discovered_buckets())
             return false;
 
         const auto is_dry = is_dry_run();
         log_operation("UnregisterBucket", path, is_dry);
         if (is_dry)
-            return ProfileConfig(path.profile).registered_buckets().contains(path.bucket);
-        return ProfileConfig(path.profile).unregister_bucket(path.bucket);
+            return pc.registered_buckets().contains(path.bucket);
+        return pc.unregister_bucket(path.bucket);
     }
 
     const auto prefix = path.directory_prefix();
@@ -1402,12 +1433,13 @@ void get_default_root_name(char* name, int max_length)
 
 int content_get_supported_field(int field_index, char* field_name, char* units, int max_length)
 {
-    if (field_index != 0)
+    constexpr std::string_view fields[]{"Region", "Storage class", "ETag"};
+    if (field_index < 0 || field_index >= static_cast<int>(std::size(fields)))
         return ft_nomorefields;
     if (!field_name || !units || max_length <= 0)
         return ft_nomorefields;
 
-    constexpr std::string_view name = "Region";
+    const auto name = fields[field_index];
     const auto length = std::min(name.size(), static_cast<std::size_t>(max_length - 1));
     std::memcpy(field_name, name.data(), length);
     field_name[length] = '\0';
@@ -1417,28 +1449,74 @@ int content_get_supported_field(int field_index, char* field_name, char* units, 
 
 int content_get_value(const wchar_t* file_name, int field_index, void* field_value, int max_length)
 {
-    if (field_index != 0)
+    if (field_index < 0 || field_index >= 3)
         return ft_nosuchfield;
     if (!file_name || !field_value || max_length < static_cast<int>(sizeof(wchar_t)))
         return ft_fileerror;
 
+    const auto copy_value = [&](std::wstring_view value) {
+        if (value.empty())
+            return ft_fieldempty;
+        auto* output = static_cast<wchar_t*>(field_value);
+        const auto capacity = static_cast<std::size_t>(max_length) / sizeof(wchar_t);
+        const auto length = std::min(value.size(), capacity - 1);
+        std::copy_n(value.data(), length, output);
+        output[length] = L'\0';
+        return ft_stringw;
+    };
+
     const auto path = RemotePathView::make(file_name);
-    // Region is only available at buckets view
-    if (path.profile.empty() || path.bucket.empty() || !path.key.empty())
-        return ft_fieldempty;
 
-    // Get region from a cached config
-    const auto region = ProfileConfig(to_utf8(path.profile)).bucket_region(to_utf8(path.bucket));
-    if (region.empty())
-        return ft_fieldempty;
+    // Bucket fields
+    if (field_index == 0) // Region
+    {
+        if (path.profile.empty() || path.bucket.empty())
+            return ft_fieldempty; // No region for keys
+        // Get region from a cached config
+        return copy_value(to_wide(
+            ProfileConfig(to_utf8(path.profile)).bucket_region(to_utf8(path.bucket))));
+    }
+    // Keys fields
+    else
+    {
+        if (path.profile.empty() || path.bucket.empty() || path.key.empty())
+            return ft_fieldempty;
+        const auto separator = path.key.rfind(L'\\');
+        const auto name_start = separator == std::wstring_view::npos ? 0 : separator + 1;
+        std::scoped_lock lock(object_metadata_mutex);
+        const auto* found = object_metadata.find(
+            MetadataDirectory<std::wstring_view>{path.profile, path.bucket,
+                                                 path.key.substr(0, name_start)},
+            path.key.substr(name_start));
 
-    const auto value = to_wide(region);
-    auto* output = static_cast<wchar_t*>(field_value);
-    const auto capacity = static_cast<std::size_t>(max_length) / sizeof(wchar_t);
-    const auto length = std::min(value.size(), capacity - 1);
-    std::copy_n(value.data(), length, output);
-    output[length] = L'\0';
-    return ft_stringw;
+        // Both TC and Double Commander can request these fields again after a
+        // column-layout change, even without relisting. If metadata was already
+        // evicted, return empty until the next listing. We deliberately avoid
+        // refetching for this uncommon case as this complicates matter.
+        if (!found)
+            return ft_fieldempty;
+
+        switch (field_index)
+        {
+        case 1: // Storage class
+        {
+            const auto storage_class =
+                Aws::S3::Model::ObjectStorageClassMapper::GetNameForObjectStorageClass(
+                    found->storage_class);
+            return copy_value(to_wide(storage_class));
+        }
+        case 2: // Etag
+        {
+            std::wstring_view etag{found->etag};
+            if (etag.size() > 2 && etag.starts_with(L'"') && etag.ends_with(L'"'))
+                return copy_value(etag.substr(1, etag.size() - 2));
+            return copy_value(etag);
+        }
+        }
+    }
+
+    // Unreachable
+    return ft_nosuchfield;
 }
 
 } // namespace s3cmd

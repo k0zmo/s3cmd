@@ -1,17 +1,19 @@
 #include "s3.hpp"
 #include "creds.hpp"
+#include "core.hpp"
+#include "fsplugin.h"
+#include "object_metadata.hpp"
+
 #include <aws/core/auth/GeneralHTTPCredentialsProvider.h>
 #include <aws/core/auth/SSOCredentialsProvider.h>
 #include <aws/core/auth/STSCredentialsProvider.h>
 #include <aws/core/internal/AWSHttpResourceClient.h>
-#include "core.hpp"
-#include "fsplugin.h"
-
-#include <aws/core/utils/logging/AWSLogging.h>
 #include <aws/core/platform/Environment.h>
+#include <aws/core/utils/logging/AWSLogging.h>
 #include <aws/core/utils/logging/LogLevel.h>
 #include <aws/core/utils/logging/LogSystemInterface.h>
 #include <catch2/catch_test_macros.hpp>
+#include <httplib.h>
 
 #include <Windows.h> // GetCurrentProcessId, GetTickCount64, SetLastError, GetLastError
 
@@ -420,7 +422,11 @@ TEST_CASE("Region is exposed as a Total Commander content field", "[unit]")
     CHECK(s3cmd::content_get_supported_field(0, name, units, sizeof(name)) == ft_string);
     CHECK(std::string_view(name) == "Region");
     CHECK(std::string_view(units).empty());
-    CHECK(s3cmd::content_get_supported_field(1, name, units, sizeof(name)) == ft_nomorefields);
+    CHECK(s3cmd::content_get_supported_field(1, name, units, sizeof(name)) == ft_string);
+    CHECK(std::string_view(name) == "Storage class");
+    CHECK(s3cmd::content_get_supported_field(2, name, units, sizeof(name)) == ft_string);
+    CHECK(std::string_view(name) == "ETag");
+    CHECK(s3cmd::content_get_supported_field(3, name, units, sizeof(name)) == ft_nomorefields);
 
     wchar_t bucket_path[] = L"\\work\\owned-bucket";
     wchar_t value[32]{};
@@ -438,6 +444,233 @@ TEST_CASE("Region is exposed as a Total Commander content field", "[unit]")
 
     PluginSession session;
     CHECK(s3cmd::content_get_value(bucket_path, 0, value, sizeof(value)) == ft_fieldempty);
+}
+
+TEST_CASE("Object metadata retention is bounded by entry count", "[unit]")
+{
+    using namespace s3cmd;
+    using Aws::S3::Model::ObjectStorageClass;
+    const MetadataDirectory<> a{L"work", L"bucket", L"a\\"};
+    const MetadataDirectory<> b{L"work", L"bucket", L"b\\"};
+    const MetadataDirectory<> c{L"work", L"bucket", L"c\\"};
+    const ObjectMetadataMap objects{
+        {L"file.txt", {ObjectStorageClass::STANDARD, L"abc123"}}};
+    ObjectMetadataCache cache(4);
+    cache.add(a, objects);
+    cache.add(b, objects);
+    REQUIRE(cache.retained_entries() == 4);
+
+    SECTION("a successful lookup retains the older directory")
+    {
+        REQUIRE(cache.find(a, L"file.txt"));
+        cache.add(c, objects);
+        CHECK(cache.find(b, L"file.txt") == nullptr);
+        CHECK(cache.find(a, L"file.txt") != nullptr);
+        CHECK(cache.find(c, L"file.txt") != nullptr);
+        CHECK(cache.retained_entries() == 4);
+        cache.add(b, objects);
+        CHECK(cache.find(b, L"file.txt") != nullptr);
+    }
+    SECTION("misses do not update recency")
+    {
+        CHECK(cache.find(a, L"missing") == nullptr);
+        cache.add(c, objects);
+        CHECK(cache.find(a, L"file.txt") == nullptr);
+        CHECK(cache.find(b, L"file.txt") != nullptr);
+    }
+    SECTION("replacement updates recency without accumulating entries")
+    {
+        cache.add(a, objects);
+        CHECK(cache.retained_entries() == 4);
+        cache.add(c, objects);
+        CHECK(cache.find(b, L"file.txt") == nullptr);
+        CHECK(cache.find(a, L"file.txt") != nullptr);
+    }
+    SECTION("an oversized directory stays complete until a new publication")
+    {
+        ObjectMetadataMap large{
+            {L"one", {ObjectStorageClass::STANDARD, L"first"}},
+            {L"two", {ObjectStorageClass::STANDARD, L"second"}},
+            {L"three", {ObjectStorageClass::STANDARD, L"third"}},
+            {L"four", {ObjectStorageClass::STANDARD, L"fourth"}}};
+        cache.add(c, std::move(large));
+        CHECK(cache.retained_entries() == 5);
+        CHECK(cache.find(a, L"file.txt") == nullptr);
+        CHECK(cache.find(b, L"file.txt") == nullptr);
+        CHECK(cache.find(c, L"one") != nullptr);
+        CHECK(cache.find(c, L"two") != nullptr);
+        cache.add(a, objects);
+        CHECK(cache.find(c, L"one") == nullptr);
+        CHECK(cache.retained_entries() == 2);
+    }
+    SECTION("empty replacements still consume one entry and clear old objects")
+    {
+        cache.add(a, {});
+        CHECK(cache.find(a, L"file.txt") == nullptr);
+        CHECK(cache.retained_entries() == 3);
+        ObjectMetadataCache empty_cache(1);
+        empty_cache.add(a, {});
+        empty_cache.add(b, {});
+        CHECK(empty_cache.retained_entries() == 1);
+    }
+    SECTION("clear resets accounting and permits reuse")
+    {
+        cache.clear();
+        CHECK(cache.retained_entries() == 0);
+        CHECK(cache.find(a, L"file.txt") == nullptr);
+        cache.add(a, objects);
+        CHECK(cache.retained_entries() == 2);
+    }
+}
+
+TEST_CASE("ListObjectsV2 metadata is exposed as content fields", "[unit]")
+{
+    temporary_config();
+    const s3cmd::ProfileConfig profile("work");
+    REQUIRE(profile.register_bucket("owned-bucket", "us-east-1"));
+
+    std::atomic<int> list_requests{};
+    // 0: original, 1: empty, 2: two pages, 3: second page fails.
+    std::atomic<int> listing_mode{};
+    std::atomic<bool> saw_previous_snapshot{};
+    httplib::Server server;
+    server.Get("/owned-bucket", [&](const httplib::Request& request, httplib::Response& response) {
+        ++list_requests;
+        const auto mode = listing_mode.load();
+        const auto second_page = request.has_param("continuation-token");
+        if (second_page)
+        {
+            wchar_t value[32]{};
+            saw_previous_snapshot =
+                s3cmd::content_get_value(L"\\work\\owned-bucket\\folder\\file.txt", 2,
+                                         value, sizeof(value)) == ft_stringw &&
+                std::wstring_view(value) == L"abc123";
+        }
+        if (mode == 3 && second_page)
+        {
+            response.status = 403;
+            response.set_content("<Error><Code>AccessDenied</Code><Message>test</Message></Error>",
+                                 "application/xml");
+            return;
+        }
+        if (mode != 0)
+        {
+            std::string xml = "<ListBucketResult>";
+            xml += mode >= 2 && !second_page
+                       ? "<IsTruncated>true</IsTruncated><NextContinuationToken>next</NextContinuationToken>"
+                       : "<IsTruncated>false</IsTruncated>";
+            if (mode >= 2)
+            {
+                xml += "<Contents><Key>folder/";
+                xml += second_page ? "other.txt" : "file.txt";
+                xml += "</Key><ETag>&quot;updated&quot;</ETag><Size>3</Size>"
+                       "<StorageClass>STANDARD_IA</StorageClass></Contents>";
+            }
+            response.set_content(xml + "</ListBucketResult>", "application/xml");
+            return;
+        }
+        response.set_content(
+            R"xml(<?xml version="1.0" encoding="UTF-8"?>
+<ListBucketResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/">
+  <Name>owned-bucket</Name>
+  <Prefix>folder/</Prefix>
+  <Delimiter>/</Delimiter>
+  <KeyCount>1</KeyCount>
+  <MaxKeys>1000</MaxKeys>
+  <IsTruncated>false</IsTruncated>
+  <Contents>
+    <Key>folder/file.txt</Key>
+    <LastModified>2026-09-13T00:00:00.000Z</LastModified>
+    <ETag>&quot;abc123&quot;</ETag>
+    <Size>3</Size>
+    <StorageClass>STANDARD</StorageClass>
+  </Contents>
+</ListBucketResult>)xml",
+            "application/xml");
+    });
+    const auto port = server.bind_to_any_port("127.0.0.1");
+    REQUIRE(port > 0);
+    std::jthread worker([&](std::stop_token stop) {
+        std::stop_callback shutdown(stop, [&] { server.stop(); });
+        server.listen_after_bind();
+    });
+    server.wait_until_ready();
+
+    const auto endpoint = "http://127.0.0.1:" + std::to_string(port);
+    TemporaryEnvironment url("AWS_ENDPOINT_URL_S3", endpoint.c_str());
+    TemporaryEnvironment endpoints("AWS_IGNORE_CONFIGURED_ENDPOINT_URLS", "false");
+    TemporaryEnvironment access("AWS_ACCESS_KEY_ID", "test");
+    TemporaryEnvironment secret("AWS_SECRET_ACCESS_KEY", "test");
+    TemporaryEnvironment region("AWS_DEFAULT_REGION", "us-east-1");
+    PluginSession session;
+
+    wchar_t path[] = L"\\work\\owned-bucket\\folder";
+    WIN32_FIND_DATAW entry{};
+    const auto handle = s3cmd::find_first(path, &entry);
+    REQUIRE(handle != INVALID_HANDLE_VALUE);
+    CHECK(std::wstring_view(entry.cFileName) == L"file.txt");
+    s3cmd::find_close(handle);
+
+    wchar_t object_path[] = L"\\work\\owned-bucket\\folder\\file.txt";
+    wchar_t value[32]{};
+    CHECK(s3cmd::content_get_value(object_path, 1, value, sizeof(value)) == ft_stringw);
+    CHECK(std::wstring_view(value) == L"STANDARD");
+    CHECK(s3cmd::content_get_value(object_path, 2, value, sizeof(value)) == ft_stringw);
+    CHECK(std::wstring_view(value) == L"abc123");
+    CHECK(list_requests == 1);
+
+    SECTION("an empty listing removes previous metadata")
+    {
+        listing_mode = 1;
+        CHECK(s3cmd::find_first(path, &entry) == INVALID_HANDLE_VALUE);
+        CHECK(GetLastError() == ERROR_NO_MORE_FILES);
+        CHECK(s3cmd::content_get_value(object_path, 2, value, sizeof(value)) == ft_fieldempty);
+        CHECK(list_requests == 2);
+    }
+    SECTION("all pages are published together")
+    {
+        listing_mode = 2;
+        const auto refreshed = s3cmd::find_first(path, &entry);
+        REQUIRE(refreshed != INVALID_HANDLE_VALUE);
+        s3cmd::find_close(refreshed);
+        CHECK(saw_previous_snapshot);
+        CHECK(s3cmd::content_get_value(object_path, 2, value, sizeof(value)) == ft_stringw);
+        CHECK(std::wstring_view(value) == L"updated");
+        CHECK(s3cmd::content_get_value(L"\\work\\owned-bucket\\folder\\other.txt", 1,
+                                       value, sizeof(value)) == ft_stringw);
+        CHECK(std::wstring_view(value) == L"STANDARD_IA");
+        CHECK(list_requests == 3);
+    }
+    SECTION("a later page failure preserves the previous snapshot")
+    {
+        listing_mode = 3;
+        CHECK(s3cmd::find_first(path, &entry) == INVALID_HANDLE_VALUE);
+        CHECK(saw_previous_snapshot);
+        CHECK(s3cmd::content_get_value(object_path, 2, value, sizeof(value)) == ft_stringw);
+        CHECK(std::wstring_view(value) == L"abc123");
+        CHECK(s3cmd::content_get_value(L"\\work\\owned-bucket\\folder\\other.txt", 2,
+                                       value, sizeof(value)) == ft_fieldempty);
+        CHECK(list_requests == 3);
+    }
+    SECTION("missing metadata stays empty until normal listing restores it")
+    {
+        s3cmd::reset_config();
+        CHECK(s3cmd::content_get_value(object_path, 1, value, sizeof(value)) == ft_fieldempty);
+        CHECK(s3cmd::content_get_value(object_path, 2, value, sizeof(value)) == ft_fieldempty);
+        CHECK(list_requests == 1);
+        const auto refreshed = s3cmd::find_first(path, &entry);
+        REQUIRE(refreshed != INVALID_HANDLE_VALUE);
+        s3cmd::find_close(refreshed);
+        CHECK(s3cmd::content_get_value(object_path, 2, value, sizeof(value)) == ft_stringw);
+        CHECK(std::wstring_view(value) == L"abc123");
+        CHECK(list_requests == 2);
+    }
+    SECTION("shutdown clears metadata")
+    {
+        s3cmd::shutdown();
+        CHECK(s3cmd::content_get_value(object_path, 2, value, sizeof(value)) == ft_fieldempty);
+        CHECK(list_requests == 1);
+    }
 }
 
 TEST_CASE("runtime dry run completes S3 operations without side effects", "[unit]")
@@ -524,7 +757,7 @@ TEST_CASE("expired SSO profiles require supported login configuration", "[unit]"
     wchar_t path[] = L"\\expired";
     WIN32_FIND_DATAW entry{};
     CHECK(s3cmd::find_first(path, &entry) == INVALID_HANDLE_VALUE);
-    CHECK(GetLastError() == (legacy ? ERROR_LOGON_FAILURE : ERROR_CANCELLED));
+    CHECK(GetLastError() == (legacy ? (DWORD)ERROR_LOGON_FAILURE : (DWORD)ERROR_CANCELLED));
     CHECK(request_count == 1);
     if (legacy)
     {
