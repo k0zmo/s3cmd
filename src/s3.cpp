@@ -78,6 +78,7 @@ namespace s3cmd {
 namespace {
 
 constexpr std::uint64_t max_single_part_size = 5ULL * 1024 * 1024 * 1024;
+constexpr std::string_view download_suffix = ".s3cmddownload";
 
 class AwsLogSystem final : public Aws::Utils::Logging::FormattedLogSystem
 {
@@ -217,6 +218,25 @@ struct ResumeRecord
     std::string e_tag;
     std::uint64_t size{};
 };
+
+std::filesystem::path download_path(const std::filesystem::path& local)
+{
+    auto result = local;
+    result += download_suffix;
+    return result;
+}
+
+bool commit_download(const std::filesystem::path& download, const std::filesystem::path& local)
+{
+#ifdef _WIN32
+    return MoveFileExW(download.c_str(), local.c_str(),
+                       MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH);
+#else
+    std::error_code error;
+    std::filesystem::rename(download, local, error);
+    return !error;
+#endif
+}
 
 const std::filesystem::path& resume_path()
 {
@@ -1145,6 +1165,7 @@ int get_file(const wchar_t* remote_name, const wchar_t* local_name, int copy_fla
 try
 {
     const auto local = std::filesystem::path(local_name);
+    const auto download = download_path(local);
     const auto remote = to_utf8(remote_name);
     const auto resume = (copy_flags & FS_COPYFLAGS_RESUME) != 0;
     const auto listed_size = info ? static_cast<std::uint64_t>(info->SizeLow) |
@@ -1154,26 +1175,30 @@ try
     const auto local_exists = std::filesystem::exists(local, error);
     if (error)
         return FS_FILE_WRITEERROR;
-    if (!resume && (copy_flags & FS_COPYFLAGS_OVERWRITE) == 0 && local_exists)
+    const auto download_exists = std::filesystem::exists(download, error);
+    if (error)
+        return FS_FILE_WRITEERROR;
+    if (!resume && (copy_flags & FS_COPYFLAGS_OVERWRITE) == 0 && (local_exists || download_exists))
     {
-        if (!std::filesystem::is_regular_file(local, error) || error)
-            return FS_FILE_EXISTS;
-        const auto size = std::filesystem::file_size(local, error);
-        if (error)
-            return FS_FILE_WRITEERROR;
-        const auto record = read_resume_record(local, remote);
-        return record && (!info || record->size == listed_size) && size < record->size
-                   ? FS_FILE_EXISTSRESUMEALLOWED
-                   : FS_FILE_EXISTS;
+        if (download_exists && std::filesystem::is_regular_file(download, error) && !error)
+        {
+            const auto size = std::filesystem::file_size(download, error);
+            if (error)
+                return FS_FILE_WRITEERROR;
+            const auto record = read_resume_record(local, remote);
+            if (record && (!info || record->size == listed_size) && size < record->size)
+                return FS_FILE_EXISTSRESUMEALLOWED;
+        }
+        return error ? FS_FILE_WRITEERROR : FS_FILE_EXISTS;
     }
 
     std::uint64_t offset{};
     std::optional<ResumeRecord> resume_record;
     if (resume)
     {
-        if (!std::filesystem::is_regular_file(local, error) || error)
+        if (!std::filesystem::is_regular_file(download, error) || error)
             return FS_FILE_NOTSUPPORTED;
-        offset = std::filesystem::file_size(local, error);
+        offset = std::filesystem::file_size(download, error);
         if (error)
             return FS_FILE_WRITEERROR;
         resume_record = read_resume_record(local, remote);
@@ -1217,19 +1242,19 @@ try
                 request.SetRange(range.c_str());
                 request.SetIfMatch(resume_record->e_tag.c_str());
             }
-            request.SetResponseStreamFactory([local, offset] {
+            request.SetResponseStreamFactory([download, offset] {
                 auto stream = Aws::New<std::fstream>("s3cmd");
                 if (offset == 0)
                 {
-                    stream->open(local, std::ios::out | std::ios::binary | std::ios::trunc);
+                    stream->open(download, std::ios::out | std::ios::binary | std::ios::trunc);
                 }
                 else
                 {
                     std::error_code error;
-                    std::filesystem::resize_file(local, offset, error);
+                    std::filesystem::resize_file(download, offset, error);
                     if (!error)
                     {
-                        stream->open(local, std::ios::in | std::ios::out | std::ios::binary);
+                        stream->open(download, std::ios::in | std::ios::out | std::ios::binary);
                         stream->seekp(static_cast<std::streamoff>(offset));
                     }
                 }
@@ -1239,9 +1264,9 @@ try
             TransferProgress progress{
                 remote_name, local_name, request, offset,
                 resume ? resume_record->size : listed_size, resume,
-                [local, remote](std::string_view e_tag, std::uint64_t size) {
+                [local, download, remote](std::string_view e_tag, std::uint64_t size) {
                     std::error_code error;
-                    if (std::filesystem::file_size(local, error) == 0 && !error)
+                    if (std::filesystem::file_size(download, error) == 0 && !error)
                         write_resume_record(local, remote, e_tag, size);
                 }};
             const auto outcome = progress.wait(client->GetObjectCallable(request));
@@ -1253,7 +1278,7 @@ try
                 // Use the received status even if cancellation masks it in the SDK error.
                 if (progress.has_response_error())
                 {
-                    std::filesystem::resize_file(local, offset, error);
+                    std::filesystem::resize_file(download, offset, error);
                     if (error)
                         return FS_FILE_WRITEERROR;
                 }
@@ -1282,12 +1307,9 @@ try
         }
     }
 
-    if (resume)
-    {
-        const auto size = std::filesystem::file_size(local, error);
-        if (error || size != remote_size)
-            return FS_FILE_WRITEERROR;
-    }
+    const auto size = std::filesystem::file_size(download, error);
+    if (error || size != remote_size || !commit_download(download, local))
+        return FS_FILE_WRITEERROR;
     erase_resume_record(local);
     if ((copy_flags & FS_COPYFLAGS_MOVE) != 0 && !delete_file(remote_name))
         return FS_FILE_WRITEERROR;

@@ -74,7 +74,7 @@ The plugin exposes a `Region` content field for bucket entries. If you need regi
 - Uses registered buckets as a fallback when an account cannot call `ListBuckets`.
 - Finds and caches each bucket region for region-correct S3 requests.
 - Lists objects and directory prefixes with pagination, file sizes, and modification times.
-- Downloads objects through a temporary file, then replaces the destination after a successful transfer.
+- Downloads objects through a sibling `.s3cmddownload` file, then replaces the destination after a successful transfer.
 - Uploads objects with overwrite protection.
 - Reports upload and download progress and supports cancellation from Total Commander.
 - Advertises background upload and download support to compatible hosts.
