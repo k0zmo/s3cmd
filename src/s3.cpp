@@ -228,14 +228,9 @@ std::filesystem::path download_path(const std::filesystem::path& local)
 
 bool commit_download(const std::filesystem::path& download, const std::filesystem::path& local)
 {
-#ifdef _WIN32
-    return MoveFileExW(download.c_str(), local.c_str(),
-                       MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH);
-#else
-    std::error_code error;
-    std::filesystem::rename(download, local, error);
-    return !error;
-#endif
+    std::error_code ec;
+    std::filesystem::rename(download, local, ec);
+    return !ec;
 }
 
 const std::filesystem::path& resume_path()
@@ -307,9 +302,9 @@ try
         return true;
     if (downloads->empty())
     {
-        std::error_code error;
-        std::filesystem::remove(resume_path(), error);
-        return !error;
+        std::error_code ec;
+        std::filesystem::remove(resume_path(), ec);
+        return !ec;
     }
     return write_document(*document, resume_path());
 }
@@ -1169,44 +1164,47 @@ try
     const auto remote = to_utf8(remote_name);
     const auto resume = (copy_flags & FS_COPYFLAGS_RESUME) != 0;
     const auto listed_size = info ? static_cast<std::uint64_t>(info->SizeLow) |
-                                       (static_cast<std::uint64_t>(info->SizeHigh) << 32)
-                                 : 0;
-    std::error_code error;
-    const auto local_exists = std::filesystem::exists(local, error);
-    if (error)
-        return FS_FILE_WRITEERROR;
-    const auto download_exists = std::filesystem::exists(download, error);
-    if (error)
-        return FS_FILE_WRITEERROR;
-    if (!resume && (copy_flags & FS_COPYFLAGS_OVERWRITE) == 0 && (local_exists || download_exists))
+                                        (static_cast<std::uint64_t>(info->SizeHigh) << 32)
+                                  : 0;
+
+    try
     {
-        if (download_exists && std::filesystem::is_regular_file(download, error) && !error)
+        // FIXME: We have the TOCTOU behavior here
+        const auto local_exists = std::filesystem::exists(local);
+        const auto download_exists = std::filesystem::exists(download);
+        if (!resume && ((copy_flags & FS_COPYFLAGS_OVERWRITE) == 0) && (local_exists || download_exists))
         {
-            const auto size = std::filesystem::file_size(download, error);
-            if (error)
-                return FS_FILE_WRITEERROR;
-            const auto record = read_resume_record(local, remote);
-            if (record && (!info || record->size == listed_size) && size < record->size)
-                return FS_FILE_EXISTSRESUMEALLOWED;
+            if (download_exists && std::filesystem::is_regular_file(download))
+            {
+                const auto size = std::filesystem::file_size(download);
+                const auto record = read_resume_record(local, remote);
+                if (record && (!info || record->size == listed_size) && size < record->size)
+                    return FS_FILE_EXISTSRESUMEALLOWED;
+            }
+            return FS_FILE_EXISTS;
         }
-        return error ? FS_FILE_WRITEERROR : FS_FILE_EXISTS;
+    }
+    catch (const std::filesystem::filesystem_error&)
+    {
+        return FS_FILE_WRITEERROR;
     }
 
     std::uint64_t offset{};
     std::optional<ResumeRecord> resume_record;
     if (resume)
     {
-        if (!std::filesystem::is_regular_file(download, error) || error)
+        std::error_code ec;
+        if (!std::filesystem::is_regular_file(download, ec) || ec)
             return FS_FILE_NOTSUPPORTED;
-        offset = std::filesystem::file_size(download, error);
-        if (error)
+        offset = std::filesystem::file_size(download, ec);
+        if (ec)
             return FS_FILE_WRITEERROR;
         resume_record = read_resume_record(local, remote);
         if (!resume_record || offset >= resume_record->size ||
             (info && listed_size != resume_record->size))
             return FS_FILE_NOTSUPPORTED;
     }
-    const auto progress_size = resume_record ? resume_record->size : listed_size;
+    const auto progress_size = resume ? resume_record->size : listed_size;
     if (report_progress(remote_name, local_name, transfer_percent(offset, progress_size)))
         return FS_FILE_USERABORT;
 
@@ -1234,13 +1232,13 @@ try
 
         {
             Aws::S3::Model::GetObjectRequest request;
-            request.SetBucket(path.bucket.c_str());
-            request.SetKey(path.key.c_str());
+            request.SetBucket(path.bucket);
+            request.SetKey(path.key);
             if (resume)
             {
                 const auto range = std::format("bytes={}-", offset);
-                request.SetRange(range.c_str());
-                request.SetIfMatch(resume_record->e_tag.c_str());
+                request.SetRange(range);
+                request.SetIfMatch(resume_record->e_tag);
             }
             request.SetResponseStreamFactory([download, offset] {
                 auto stream = Aws::New<std::fstream>("s3cmd");
@@ -1250,9 +1248,9 @@ try
                 }
                 else
                 {
-                    std::error_code error;
-                    std::filesystem::resize_file(download, offset, error);
-                    if (!error)
+                    std::error_code ec;
+                    std::filesystem::resize_file(download, offset, ec);
+                    if (!ec)
                     {
                         stream->open(download, std::ios::in | std::ios::out | std::ios::binary);
                         stream->seekp(static_cast<std::streamoff>(offset));
@@ -1265,8 +1263,8 @@ try
                 remote_name, local_name, request, offset,
                 resume ? resume_record->size : listed_size, resume,
                 [local, download, remote](std::string_view e_tag, std::uint64_t size) {
-                    std::error_code error;
-                    if (std::filesystem::file_size(download, error) == 0 && !error)
+                    std::error_code ec;
+                    if (std::filesystem::file_size(download, ec) == 0 && !ec)
                         write_resume_record(local, remote, e_tag, size);
                 }};
             const auto outcome = progress.wait(client->GetObjectCallable(request));
@@ -1278,8 +1276,9 @@ try
                 // Use the received status even if cancellation masks it in the SDK error.
                 if (progress.has_response_error())
                 {
-                    std::filesystem::resize_file(download, offset, error);
-                    if (error)
+                    std::error_code ec;
+                    std::filesystem::resize_file(download, offset, ec);
+                    if (ec)
                         return FS_FILE_WRITEERROR;
                 }
                 if (progress.is_canceled())
@@ -1306,11 +1305,15 @@ try
             remote_size = progress.total();
         }
     }
-
-    const auto size = std::filesystem::file_size(download, error);
-    if (error || size != remote_size || !commit_download(download, local))
+    
+    // Finalize the download operation
+    std::error_code ec;
+    const auto size = std::filesystem::file_size(download, ec);
+    if (ec || size != remote_size || !commit_download(download, local))
         return FS_FILE_WRITEERROR;
     erase_resume_record(local);
+
+    // Remove the source (remote) file if it's move operation rather than copy
     if ((copy_flags & FS_COPYFLAGS_MOVE) != 0 && !delete_file(remote_name))
         return FS_FILE_WRITEERROR;
 
@@ -1333,9 +1336,9 @@ try
     if ((copy_flags & FS_COPYFLAGS_RESUME) != 0)
         return FS_FILE_NOTSUPPORTED;
 
-    std::error_code error;
-    const auto size = std::filesystem::file_size(local_name, error);
-    if (error)
+    std::error_code ec;
+    const auto size = std::filesystem::file_size(local_name, ec);
+    if (ec)
         return FS_FILE_READERROR;
     // FIXME: single-part upload stops at S3's 5 GiB limit
     if (size > max_single_part_size)
@@ -1393,10 +1396,10 @@ try
     if ((copy_flags & FS_COPYFLAGS_MOVE) != 0)
     {
         log_local_operation("DeleteLocalFile", local_name, false);
-        std::filesystem::remove(local_name, error);
-        if (error)
+        std::filesystem::remove(local_name, ec);
+        if (ec)
         {
-            log_error("Delete local source", std::format("error {}", error.value()));
+            log_error("Delete local source", std::format("error {}", ec.value()));
             return FS_FILE_READERROR;
         }
     }
