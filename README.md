@@ -88,11 +88,14 @@ The plugin exposes a `Region` content field for bucket entries. If you need regi
 - Registers and unregisters existing buckets when automatic bucket discovery is unavailable.
 - Exposes the bucket region as a `Region` content field.
 - Reuses S3 clients and supports concurrent background transfers during one plugin session.
+- Resumes interrupted downloads only while the source object still has the recorded ETag.
 
 ## Configuration file
 
 The plugin stores its own configuration in `%APPDATA%\s3cmd\s3cmd.toml`
+On Unix builds, it uses `$XDG_CONFIG_HOME/s3cmd/s3cmd.toml` or `~/.config/s3cmd/s3cmd.toml`.
 This file is created when the plugin stores a registered bucket. Otherwise, it might not exist.
+Interrupted-download state is stored separately in `resume.toml` in the same directory.
 
 Set `AwsLogLevel` under `[settings]` to control which AWS SDK messages are sent to the debugger.
 The level defaults to `Info`.
@@ -123,7 +126,7 @@ This setting does not override `AWS_EC2_METADATA_DISABLED=true`.
 
 ## Limitations
 
-- Transfer resume and multipart transfer are not supported.
+- Upload resume and multipart transfer are not supported.
 - A single upload cannot exceed 5 GiB.
 - S3 copy, rename, and move operations cannot exceed 5 GiB.
 - S3 copy, rename, and move progress changes directly from 0% to 100%.

@@ -6,6 +6,7 @@
 #include <aws/core/internal/AWSHttpResourceClient.h>
 #include "core.hpp"
 #include "fsplugin.h"
+#include "utils.hpp"
 
 #include <aws/core/utils/logging/AWSLogging.h>
 #include <aws/core/platform/Environment.h>
@@ -153,9 +154,21 @@ TemporaryConfig& temporary_config()
     return config;
 }
 
+void write_resume_record(const TemporaryConfig& config, const std::filesystem::path& local,
+                         std::wstring_view remote, std::string_view e_tag, std::uint64_t size)
+{
+    const auto key = s3cmd::to_utf8(std::filesystem::absolute(local).lexically_normal().native());
+    std::filesystem::create_directories(config.path.parent_path());
+    std::ofstream file(config.path.parent_path() / L"resume.toml");
+    file << "[downloads.'" << key << "']\n"
+         << "remote = '" << s3cmd::to_utf8(remote) << "'\n"
+         << "etag = '" << e_tag << "'\n"
+         << "size = " << size << '\n';
+}
+
 } // namespace
 
-TEST_CASE("Get discards HTTP error bodies before another resume", "[unit]")
+TEST_CASE("Get discards HTTP error bodies before retry", "[unit]")
 {
     auto& config = temporary_config();
     const std::string object = "prefix and the rest of the object";
@@ -164,6 +177,7 @@ TEST_CASE("Get discards HTTP error bodies before another resume", "[unit]")
     std::atomic<bool> delay{};
     std::atomic<int> invalid_response{};
     std::atomic<int> head_requests{};
+    std::string if_match;
     transfer_percentages.clear();
     transfer_waiting = false;
     transfer_canceled = false;
@@ -183,6 +197,7 @@ TEST_CASE("Get discards HTTP error bodies before another resume", "[unit]")
                 std::this_thread::sleep_for(std::chrono::milliseconds(10));
         }
         response.set_header("ETag", "\"test\"");
+        if_match = request.get_header_value("If-Match");
         if (invalid_response)
         {
             // Keep httplib from repairing the intentionally invalid range response.
@@ -252,6 +267,8 @@ TEST_CASE("Get discards HTTP error bodies before another resume", "[unit]")
         SECTION("wrong start offset") { invalid_response = 3; }
         SECTION("malformed total size") { invalid_response = 4; }
         std::ofstream(local, std::ios::binary) << "prefix";
+        write_resume_record(config, local, L"\\resume-test\\bucket\\object", "\"test\"",
+                            object.size());
         CHECK(s3cmd::get_file(L"\\resume-test\\bucket\\object", local.c_str(),
                              FS_COPYFLAGS_RESUME, nullptr) == FS_FILE_READERROR);
         std::ifstream file(local, std::ios::binary);
@@ -264,17 +281,19 @@ TEST_CASE("Get discards HTTP error bodies before another resume", "[unit]")
         reject = false;
         delay = true;
         std::ofstream(local, std::ios::binary) << object.substr(0, 6);
+        write_resume_record(config, local, L"\\resume-test\\bucket\\object", "\"test\"",
+                            object.size());
         RemoteInfoStruct info{};
         info.SizeLow = static_cast<DWORD>(object.size());
         const RemoteInfoStruct* listed = &info;
         SECTION("listed size available") {}
-        SECTION("size discovered by GET") { listed = nullptr; }
+        SECTION("listing size unavailable") { listed = nullptr; }
         REQUIRE(s3cmd::get_file(L"\\resume-test\\bucket\\object", local.c_str(),
                                FS_COPYFLAGS_RESUME, listed) == FS_FILE_OK);
         REQUIRE(transfer_percentages.size() >= 4);
         const auto expected = static_cast<int>(6 * 100 / object.size());
-        CHECK(transfer_percentages.front() == (listed ? expected : 0));
-        bool validated = listed != nullptr;
+        CHECK(transfer_percentages.front() == expected);
+        bool validated = true;
         int resumed_reports{};
         for (const auto percent : transfer_percentages)
         {
@@ -304,6 +323,8 @@ TEST_CASE("Get discards HTTP error bodies before another resume", "[unit]")
         prefix = object.substr(0, 6);
         flags = FS_COPYFLAGS_RESUME;
         std::ofstream(local, std::ios::binary) << prefix;
+        write_resume_record(config, local, L"\\resume-test\\bucket\\object", "\"test\"",
+                            object.size());
     }
     SECTION("cancel upload while waiting for response headers")
     {
@@ -321,12 +342,100 @@ TEST_CASE("Get discards HTTP error bodies before another resume", "[unit]")
         return std::string(std::istreambuf_iterator<char>(file), {});
     };
     REQUIRE(s3cmd::get_file(L"\\resume-test\\bucket\\object", local.c_str(), flags, nullptr) ==
-            FS_FILE_READERROR);
+            (flags == FS_COPYFLAGS_RESUME ? FS_FILE_NOTSUPPORTED : FS_FILE_READERROR));
     REQUIRE(read_local() == prefix);
+    if (flags == FS_COPYFLAGS_RESUME)
+        CHECK(if_match == "\"test\"");
     reject = false;
     REQUIRE(s3cmd::get_file(L"\\resume-test\\bucket\\object", local.c_str(),
-                           FS_COPYFLAGS_RESUME, nullptr) == FS_FILE_OK);
+                           FS_COPYFLAGS_OVERWRITE, nullptr) == FS_FILE_OK);
     CHECK(read_local() == object);
+}
+
+TEST_CASE("Get resume state survives restart and rejects a changed object", "[unit]")
+{
+    auto& config = temporary_config();
+    std::string object = "prefix and the rest of the object";
+    std::string e_tag = "\"original\"";
+    std::string if_match;
+    bool interrupt = true;
+    transfer_waiting = false;
+    transfer_canceled = false;
+    transfer_wrong_thread = false;
+    transfer_caller = GetCurrentThreadId();
+
+    httplib::Server server;
+    server.Get("/bucket/object", [&](const httplib::Request& request, httplib::Response& response) {
+        if_match = request.get_header_value("If-Match");
+        response.set_header("ETag", e_tag);
+        if (!if_match.empty() && if_match != e_tag)
+        {
+            response.status = 412;
+            response.set_content("<Error><Code>PreconditionFailed</Code></Error>", "application/xml");
+            return;
+        }
+        if (!interrupt)
+        {
+            response.set_content(object, "application/octet-stream");
+            return;
+        }
+        response.set_content_provider(
+            object.size(), "application/octet-stream",
+            [&](size_t offset, size_t length, httplib::DataSink& sink) {
+                const auto count = std::min<std::size_t>(6, length);
+                if (!sink.write(object.data() + offset, count))
+                    return false;
+                transfer_waiting = true;
+                const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+                while (!transfer_canceled && std::chrono::steady_clock::now() < deadline)
+                    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+                return false;
+            });
+    });
+    const auto port = server.bind_to_any_port("127.0.0.1");
+    REQUIRE(port > 0);
+    std::jthread worker([&](std::stop_token stop) {
+        std::stop_callback shutdown(stop, [&] { server.stop(); });
+        server.listen_after_bind();
+    });
+    server.wait_until_ready();
+
+    const auto endpoint = "http://127.0.0.1:" + std::to_string(port);
+    TemporaryEnvironment url("AWS_ENDPOINT_URL_S3", endpoint.c_str());
+    TemporaryEnvironment endpoints("AWS_IGNORE_CONFIGURED_ENDPOINT_URLS", "false");
+    TemporaryEnvironment access("AWS_ACCESS_KEY_ID", "test");
+    TemporaryEnvironment secret("AWS_SECRET_ACCESS_KEY", "test");
+    TemporaryEnvironment region("AWS_DEFAULT_REGION", "us-east-1");
+    TemporaryEnvironment checksum("AWS_REQUEST_CHECKSUM_CALCULATION", "when_required");
+    const auto local = config.root / L"download";
+
+    {
+        PluginSession session(0, cancel_stalled_transfer);
+        CHECK(s3cmd::get_file(L"\\resume-test\\bucket\\object", local.c_str(), 0, nullptr) ==
+              FS_FILE_USERABORT);
+    }
+    REQUIRE(std::filesystem::file_size(local) == 6);
+
+    interrupt = false;
+    e_tag = "\"replacement\"";
+    transfer_waiting = false;
+    transfer_canceled = false;
+    if_match.clear();
+    RemoteInfoStruct info{};
+    info.SizeLow = static_cast<DWORD>(object.size());
+    {
+        PluginSession session;
+        CHECK(s3cmd::get_file(L"\\resume-test\\bucket\\object", local.c_str(), 0, &info) ==
+              FS_FILE_EXISTSRESUMEALLOWED);
+        CHECK(s3cmd::get_file(L"\\resume-test\\bucket\\object", local.c_str(),
+                             FS_COPYFLAGS_RESUME, &info) == FS_FILE_NOTSUPPORTED);
+        CHECK(s3cmd::get_file(L"\\resume-test\\bucket\\object", local.c_str(), 0, &info) ==
+              FS_FILE_EXISTS);
+    }
+    CHECK(if_match == "\"original\"");
+    std::ifstream file(local, std::ios::binary);
+    CHECK(std::string(std::istreambuf_iterator<char>(file), {}) == "prefix");
+    CHECK_FALSE(transfer_wrong_thread);
 }
 
 TEST_CASE("AWS SDK lifecycle is idempotent on its owner thread", "[unit]")
@@ -678,6 +787,7 @@ TEST_CASE("runtime dry run completes S3 operations without side effects", "[unit
     for (DWORD size : {6u, 7u, 8u})
     {
         info.SizeLow = size;
+        write_resume_record(ini, partial, object, "\"test\"", size);
         CHECK(s3cmd::get_file(object, partial_name.data(), 0, &info) ==
               (size > 7 ? FS_FILE_EXISTSRESUMEALLOWED : FS_FILE_EXISTS));
         CHECK(s3cmd::get_file(object, partial_name.data(), FS_COPYFLAGS_RESUME, &info) ==
@@ -685,6 +795,7 @@ TEST_CASE("runtime dry run completes S3 operations without side effects", "[unit
     }
     info.SizeLow = 0;
     info.SizeHigh = 1;
+    write_resume_record(ini, partial, object, "\"test\"", std::uint64_t{1} << 32);
     CHECK(s3cmd::get_file(object, partial_name.data(), 0, &info) == FS_FILE_EXISTSRESUMEALLOWED);
     CHECK(s3cmd::get_file(object, partial_name.data(), FS_COPYFLAGS_RESUME, nullptr) == FS_FILE_OK);
     CHECK(std::filesystem::file_size(partial) == 7);

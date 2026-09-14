@@ -148,6 +148,9 @@ struct RuntimeConfig
 std::mutex config_mtx;
 std::optional<RuntimeConfig> runtime_config;
 
+// ponytail: process-local journal lock; use per-transfer files if multiple hosts share it.
+std::mutex resume_mtx;
+
 // Total Commander recursively lists directories before calling FsRemoveDir. Profiles and buckets
 // are virtual directories, so their delete operations must see an empty listing.
 thread_local bool suppress_delete_listing{};
@@ -207,6 +210,92 @@ bool write_document(const toml::table& document, const std::filesystem::path& fi
 
     std::ofstream output(file_path, std::ios::trunc);
     return output && (output << document) && output.flush();
+}
+
+struct ResumeRecord
+{
+    std::string e_tag;
+    std::uint64_t size{};
+};
+
+const std::filesystem::path& resume_path()
+{
+    static const auto value = config_directory_path() / "resume.toml";
+    return value;
+}
+
+std::string resume_key(const std::filesystem::path& path)
+{
+    const auto normalized = std::filesystem::absolute(path).lexically_normal();
+#ifdef _WIN32
+    return to_utf8(normalized.native());
+#else
+    return normalized.native();
+#endif
+}
+
+std::optional<ResumeRecord> read_resume_record(const std::filesystem::path& local,
+                                               std::string_view remote)
+try
+{
+    std::scoped_lock lock(resume_mtx);
+    const auto document = read_document(resume_path());
+    const auto* downloads = document ? document->get_as<toml::table>("downloads") : nullptr;
+    const auto* entry = downloads ? downloads->get_as<toml::table>(resume_key(local)) : nullptr;
+    const auto stored_remote = entry ? (*entry)["remote"].value<std::string>() : std::nullopt;
+    const auto e_tag = entry ? (*entry)["etag"].value<std::string>() : std::nullopt;
+    const auto size = entry ? (*entry)["size"].value<std::int64_t>() : std::nullopt;
+    if (!stored_remote || *stored_remote != remote || !e_tag || e_tag->empty() || !size || *size <= 0)
+        return std::nullopt;
+    return ResumeRecord{*e_tag, static_cast<std::uint64_t>(*size)};
+}
+catch (...)
+{
+    return std::nullopt;
+}
+
+bool write_resume_record(const std::filesystem::path& local, std::string_view remote,
+                         std::string_view e_tag, std::uint64_t size)
+try
+{
+    std::scoped_lock lock(resume_mtx);
+    auto document = read_document(resume_path()).value_or(toml::table{});
+    auto* downloads = document.get_as<toml::table>("downloads");
+    if (!downloads)
+    {
+        document.insert_or_assign("downloads", toml::table{});
+        downloads = document.get_as<toml::table>("downloads");
+    }
+    downloads->insert_or_assign(resume_key(local),
+                                toml::table{{"remote", remote},
+                                            {"etag", e_tag},
+                                            {"size", static_cast<std::int64_t>(size)}});
+    return write_document(document, resume_path());
+}
+catch (...)
+{
+    return false;
+}
+
+bool erase_resume_record(const std::filesystem::path& local)
+try
+{
+    std::scoped_lock lock(resume_mtx);
+    auto document = read_document(resume_path());
+    auto* downloads = document ? document->get_as<toml::table>("downloads") : nullptr;
+    if (!downloads || downloads->erase(resume_key(local)) == 0)
+        return true;
+    if (downloads->empty())
+    {
+        std::error_code error;
+        std::filesystem::remove(resume_path(), error);
+        return !error;
+    }
+    return write_document(*document, resume_path());
+}
+catch (...)
+{
+    return false;
 }
 
 RuntimeConfig& RuntimeConfig::get()
@@ -436,11 +525,14 @@ public:
     // Constructor for Get request
     TransferProgress(const wchar_t* source, const wchar_t* target,
                      Aws::S3::Model::GetObjectRequest& request, std::uint64_t transferred = 0,
-                     std::uint64_t total = 0, bool resume = false)
+                     std::uint64_t total = 0, bool resume = false,
+                     std::function<void(std::string_view, std::uint64_t)> headers_ready = {})
         : TransferProgress{source, target, total, request, transferred}
     {
         request.SetHeadersReceivedEventHandler(
-            [this, transferred, resume](const Aws::Http::HttpRequest*, Aws::Http::HttpResponse* response) {
+            [this, transferred, total, resume,
+             headers_ready = std::move(headers_ready)](const Aws::Http::HttpRequest*,
+                                                        Aws::Http::HttpResponse* response) {
                 response_error_ = static_cast<int>(response->GetResponseCode()) >= 300;
                 invalid_range_ = false;
                 const std::string_view length = response->HasHeader(Aws::Http::CONTENT_LENGTH_HEADER)
@@ -476,7 +568,7 @@ public:
                         range.remove_prefix(6);
                         invalid_range_ = !number(first, '-') || !number(last, '/') || !number(size, '\0') ||
                                          first != transferred || first > last || size == 0 ||
-                                         last != size - 1 || remaining != size - first;
+                                         size != total || last != size - 1 || remaining != size - first;
                     }
                     if (invalid_range_)
                         return;
@@ -485,6 +577,14 @@ public:
                     return;
                 }
                 total_ = transferred + remaining;
+                if (response->GetResponseCode() == Aws::Http::HttpResponseCode::OK &&
+                    parsed_length.ec == std::errc{} &&
+                    parsed_length.ptr == length.data() + length.size() && response->HasHeader("etag"))
+                {
+                    const auto& e_tag = response->GetHeader("etag");
+                    if (headers_ready && !e_tag.empty())
+                        headers_ready(e_tag, total_);
+                }
             });
         request.SetDataReceivedEventHandler([this](const Aws::Http::HttpRequest*,
                                                    Aws::Http::HttpResponse*,
@@ -1045,6 +1145,7 @@ int get_file(const wchar_t* remote_name, const wchar_t* local_name, int copy_fla
 try
 {
     const auto local = std::filesystem::path(local_name);
+    const auto remote = to_utf8(remote_name);
     const auto resume = (copy_flags & FS_COPYFLAGS_RESUME) != 0;
     const auto listed_size = info ? static_cast<std::uint64_t>(info->SizeLow) |
                                        (static_cast<std::uint64_t>(info->SizeHigh) << 32)
@@ -1055,28 +1156,33 @@ try
         return FS_FILE_WRITEERROR;
     if (!resume && (copy_flags & FS_COPYFLAGS_OVERWRITE) == 0 && local_exists)
     {
-        // Only offer resume for a known incomplete file; equal size does not prove identity.
-        if (!info || !std::filesystem::is_regular_file(local, error) || error)
+        if (!std::filesystem::is_regular_file(local, error) || error)
             return FS_FILE_EXISTS;
         const auto size = std::filesystem::file_size(local, error);
         if (error)
             return FS_FILE_WRITEERROR;
-        return size < listed_size ? FS_FILE_EXISTSRESUMEALLOWED : FS_FILE_EXISTS;
+        const auto record = read_resume_record(local, remote);
+        return record && (!info || record->size == listed_size) && size < record->size
+                   ? FS_FILE_EXISTSRESUMEALLOWED
+                   : FS_FILE_EXISTS;
     }
 
     std::uint64_t offset{};
+    std::optional<ResumeRecord> resume_record;
     if (resume)
     {
         if (!std::filesystem::is_regular_file(local, error) || error)
             return FS_FILE_NOTSUPPORTED;
-        // Check how much we already downloaded
         offset = std::filesystem::file_size(local, error);
         if (error)
             return FS_FILE_WRITEERROR;
-        if (info && offset >= listed_size)
+        resume_record = read_resume_record(local, remote);
+        if (!resume_record || offset >= resume_record->size ||
+            (info && listed_size != resume_record->size))
             return FS_FILE_NOTSUPPORTED;
     }
-    if (report_progress(remote_name, local_name, transfer_percent(offset, listed_size)))
+    const auto progress_size = resume_record ? resume_record->size : listed_size;
+    if (report_progress(remote_name, local_name, transfer_percent(offset, progress_size)))
         return FS_FILE_USERABORT;
 
     const auto path = RemotePath::make(remote_name);
@@ -1093,6 +1199,9 @@ try
         return FS_FILE_OK;
     }
 
+    if (!resume && !erase_resume_record(local))
+        return FS_FILE_WRITEERROR;
+
     std::uint64_t remote_size{};
     {
         AwsLease lease;
@@ -1104,9 +1213,9 @@ try
             request.SetKey(path.key.c_str());
             if (resume)
             {
-                // ponytail: trust the existing prefix; persist identity if provenance checks matter.
                 const auto range = std::format("bytes={}-", offset);
                 request.SetRange(range.c_str());
+                request.SetIfMatch(resume_record->e_tag.c_str());
             }
             request.SetResponseStreamFactory([local, offset] {
                 auto stream = Aws::New<std::fstream>("s3cmd");
@@ -1127,7 +1236,14 @@ try
                 return stream;
             });
 
-            TransferProgress progress{remote_name, local_name, request, offset, listed_size, resume};
+            TransferProgress progress{
+                remote_name, local_name, request, offset,
+                resume ? resume_record->size : listed_size, resume,
+                [local, remote](std::string_view e_tag, std::uint64_t size) {
+                    std::error_code error;
+                    if (std::filesystem::file_size(local, error) == 0 && !error)
+                        write_resume_record(local, remote, e_tag, size);
+                }};
             const auto outcome = progress.wait(client->GetObjectCallable(request));
             if (progress.has_invalid_range())
                 return FS_FILE_READERROR;
@@ -1145,6 +1261,12 @@ try
                     return FS_FILE_USERABORT;
                 log_aws_error("GetObject", outcome.GetError());
                 if (resume && outcome.GetError().GetResponseCode() ==
+                                  Aws::Http::HttpResponseCode::PRECONDITION_FAILED)
+                {
+                    erase_resume_record(local);
+                    return FS_FILE_NOTSUPPORTED;
+                }
+                if (resume && outcome.GetError().GetResponseCode() ==
                                   Aws::Http::HttpResponseCode::REQUESTED_RANGE_NOT_SATISFIABLE)
                     return FS_FILE_NOTSUPPORTED;
                 return outcome.GetError().GetResponseCode() ==
@@ -1153,7 +1275,9 @@ try
                            : FS_FILE_READERROR;
             }
             if (progress.is_canceled())
+            {
                 return FS_FILE_USERABORT;
+            }
             remote_size = progress.total();
         }
     }
@@ -1164,6 +1288,7 @@ try
         if (error || size != remote_size)
             return FS_FILE_WRITEERROR;
     }
+    erase_resume_record(local);
     if ((copy_flags & FS_COPYFLAGS_MOVE) != 0 && !delete_file(remote_name))
         return FS_FILE_WRITEERROR;
 
