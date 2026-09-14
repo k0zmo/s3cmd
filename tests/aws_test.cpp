@@ -226,7 +226,7 @@ TEST_CASE("a bucket can be entered using its own region", "[integration]")
     }
 }
 
-TEST_CASE("Get resumes a partial local file", "[integration]")
+TEST_CASE("Get rejects an untracked partial local file", "[integration]")
 {
     const auto profile = environment("S3CMD_TEST_PROFILE");
     const auto bucket = environment("S3CMD_TEST_BUCKET");
@@ -245,28 +245,18 @@ TEST_CASE("Get resumes a partial local file", "[integration]")
     auto remote = s3cmd::to_wide("\\" + *profile + "\\" + *bucket + "\\" + *object);
     std::replace(remote.begin(), remote.end(), L'/', L'\\');
     const auto local = app_data.path() / L"resumed-download";
-    const auto expected = app_data.path() / L"complete-download";
     auto local_name = local.wstring();
 
     REQUIRE(s3cmd::get_file(remote.data(), local_name.data(), 0, nullptr) == FS_FILE_OK);
     const auto size = std::filesystem::file_size(local);
     if (size == 0)
         SKIP("S3CMD_TEST_OBJECT must be non-empty");
-    REQUIRE(std::filesystem::copy_file(local, expected));
     std::filesystem::resize_file(local, size / 2);
 
     RemoteInfoStruct info{};
     info.SizeLow = static_cast<DWORD>(size);
     info.SizeHigh = static_cast<DWORD>(size >> 32);
-    CHECK(s3cmd::get_file(remote.data(), local_name.data(), 0, &info) ==
-          FS_FILE_EXISTSRESUMEALLOWED);
-    REQUIRE(s3cmd::get_file(remote.data(), local_name.data(), FS_COPYFLAGS_RESUME, &info) ==
-            FS_FILE_OK);
-
-    std::ifstream actual(local, std::ios::binary);
-    std::ifstream reference(expected, std::ios::binary);
-    REQUIRE(actual);
-    REQUIRE(reference);
-    CHECK(std::equal(std::istreambuf_iterator<char>(actual), std::istreambuf_iterator<char>(),
-                     std::istreambuf_iterator<char>(reference), std::istreambuf_iterator<char>()));
+    CHECK(s3cmd::get_file(remote.data(), local_name.data(), 0, &info) == FS_FILE_EXISTS);
+    CHECK(s3cmd::get_file(remote.data(), local_name.data(), FS_COPYFLAGS_RESUME, &info) ==
+          FS_FILE_NOTSUPPORTED);
 }

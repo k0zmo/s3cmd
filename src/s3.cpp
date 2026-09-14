@@ -1,11 +1,13 @@
 #include "s3.hpp"
 #include "config.hpp"
+#include "content_range.hpp"
 #include "prereq.h"
 #include "core.hpp"
 #include "creds.hpp"
 #include "fsplugin.h"
 #include "log.hpp"
 #include "object_metadata.hpp"
+#include "resume.hpp"
 #include "sso.hpp"
 #include "utils.hpp"
 
@@ -38,6 +40,8 @@
 #include <aws/s3/model/ObjectStorageClass.h>
 #include <aws/s3/model/PutObjectRequest.h>
 
+#include <toml++/toml.hpp>
+
 // FIXME: This should be removed
 #include <Windows.h> // GetCurrentThreadId, SetLastError
 
@@ -45,7 +49,6 @@
 #include <array>
 #include <atomic>
 #include <cassert>
-#include <charconv>
 #include <chrono>
 #include <cstdint>
 #include <cstring>
@@ -282,55 +285,46 @@ public:
     // Constructor for Get request
     TransferProgress(const wchar_t* source, const wchar_t* target,
                      Aws::S3::Model::GetObjectRequest& request, std::uint64_t transferred = 0,
-                     std::uint64_t total = 0, bool resume = false)
+                     std::uint64_t total = 0, bool resume = false,
+                     std::function<void(std::string_view, std::uint64_t)> headers_ready = {})
         : TransferProgress{source, target, total, request, transferred}
     {
         request.SetHeadersReceivedEventHandler(
-            [this, transferred, resume](const Aws::Http::HttpRequest*, Aws::Http::HttpResponse* response) {
+            [this, transferred, total, resume,
+             headers_ready = std::move(headers_ready)](const Aws::Http::HttpRequest*,
+                                                        Aws::Http::HttpResponse* response) {
                 response_error_ = static_cast<int>(response->GetResponseCode()) >= 300;
                 invalid_range_ = false;
                 const std::string_view length = response->HasHeader(Aws::Http::CONTENT_LENGTH_HEADER)
                                                     ? std::string_view(response->GetHeader(Aws::Http::CONTENT_LENGTH_HEADER))
                                                     : std::string_view("");
-                std::uint64_t remaining{};
-                const auto parsed_length = std::from_chars(length.data(), length.data() + length.size(), remaining);
+                const auto remaining = parse_number<std::uint64_t>(length);
                 if (resume && !response_error_)
                 {
-                    // Validate before the transport writes any response bytes into the local prefix.
-                    std::string_view range = response->HasHeader("content-range")
-                                                 ? response->GetHeader("content-range")
-                                                 : std::string_view{};
-                    std::uint64_t first{}, last{}, size{};
-                    const auto number = [&range](std::uint64_t& value, char delimiter) {
-                        const auto result = std::from_chars(range.data(), range.data() + range.size(), value);
-                        if (result.ec != std::errc{})
-                            return false;
-                        range.remove_prefix(result.ptr - range.data());
-                        if (delimiter == '\0')
-                            return range.empty();
-                        if (range.empty() || range.front() != delimiter)
-                            return false;
-                        range.remove_prefix(1);
-                        return true;
-                    };
-                    invalid_range_ = parsed_length.ec != std::errc{} ||
-                                     parsed_length.ptr != length.data() + length.size() ||
-                                     response->GetResponseCode() != Aws::Http::HttpResponseCode::PARTIAL_CONTENT ||
-                                     !range.starts_with("bytes ");
-                    if (!invalid_range_)
+                    if (!remaining ||
+                        response->GetResponseCode() !=
+                            Aws::Http::HttpResponseCode::PARTIAL_CONTENT ||
+                        !response->HasHeader("content-range"))
                     {
-                        range.remove_prefix(6);
-                        invalid_range_ = !number(first, '-') || !number(last, '/') || !number(size, '\0') ||
-                                         first != transferred || first > last || size == 0 ||
-                                         last != size - 1 || remaining != size - first;
+                        invalid_range_ = true;
+                        return;
                     }
+                    const auto range = parse_content_range(response->GetHeader("content-range"));
+                    invalid_range_ = !range || !range->matches(transferred, total, *remaining);
                     if (invalid_range_)
                         return;
-                    total_ = size;
+                    total_ = range->size;
                     percent_ = transfer_percent(transferred_, total_);
                     return;
                 }
-                total_ = transferred + remaining;
+                total_ = transferred + remaining.value_or(0);
+                if (response->GetResponseCode() == Aws::Http::HttpResponseCode::OK &&
+                    remaining && response->HasHeader("etag"))
+                {
+                    const auto& etag = response->GetHeader("etag");
+                    if (headers_ready && !etag.empty())
+                        headers_ready(etag, total_);
+                }
             });
         request.SetDataReceivedEventHandler([this](const Aws::Http::HttpRequest*,
                                                    Aws::Http::HttpResponse*,
@@ -868,38 +862,54 @@ int get_file(const wchar_t* remote_name, const wchar_t* local_name, int copy_fla
 try
 {
     const auto local = std::filesystem::path(local_name);
+    const auto remote = to_utf8(remote_name);
+    ResumeFile resume_file{local, remote};
+
+    const auto download = resume_file.download_path();
     const auto resume = (copy_flags & FS_COPYFLAGS_RESUME) != 0;
     const auto listed_size = info ? static_cast<std::uint64_t>(info->SizeLow) |
-                                       (static_cast<std::uint64_t>(info->SizeHigh) << 32)
-                                 : 0;
-    std::error_code error;
-    const auto local_exists = std::filesystem::exists(local, error);
-    if (error)
-        return FS_FILE_WRITEERROR;
-    if (!resume && (copy_flags & FS_COPYFLAGS_OVERWRITE) == 0 && local_exists)
+                                        (static_cast<std::uint64_t>(info->SizeHigh) << 32)
+                                  : 0;
+    const auto expected_size = info ? std::optional{listed_size} : std::nullopt;
+
+    try
     {
-        // Only offer resume for a known incomplete file; equal size does not prove identity.
-        if (!info || !std::filesystem::is_regular_file(local, error) || error)
+        // FIXME: We have the TOCTOU behavior here
+        const auto local_exists = std::filesystem::exists(local);
+        const auto download_exists = std::filesystem::exists(download);
+        if (!resume && ((copy_flags & FS_COPYFLAGS_OVERWRITE) == 0) &&
+            (local_exists || download_exists))
+        {
+            if (download_exists)
+            {
+                std::error_code ec;
+                if (resume_file.resume_state(expected_size, ec))
+                    return FS_FILE_EXISTSRESUMEALLOWED;
+                if (ec)
+                    return FS_FILE_WRITEERROR;
+            }
             return FS_FILE_EXISTS;
-        const auto size = std::filesystem::file_size(local, error);
-        if (error)
-            return FS_FILE_WRITEERROR;
-        return size < listed_size ? FS_FILE_EXISTSRESUMEALLOWED : FS_FILE_EXISTS;
+        }
+    }
+    catch (const std::filesystem::filesystem_error&)
+    {
+        return FS_FILE_WRITEERROR;
     }
 
     std::uint64_t offset{};
+    std::optional<ResumeFile::ResumeState> resume_state;
     if (resume)
     {
-        if (!std::filesystem::is_regular_file(local, error) || error)
-            return FS_FILE_NOTSUPPORTED;
-        // Check how much we already downloaded
-        offset = std::filesystem::file_size(local, error);
-        if (error)
+        std::error_code ec;
+        resume_state = resume_file.resume_state(expected_size, ec);
+        if (ec)
             return FS_FILE_WRITEERROR;
-        if (info && offset >= listed_size)
+        if (!resume_state)
             return FS_FILE_NOTSUPPORTED;
+        offset = resume_state->offset;
     }
-    if (report_progress(remote_name, local_name, transfer_percent(offset, listed_size)))
+    const auto progress_size = resume ? resume_state->record.size : listed_size;
+    if (report_progress(remote_name, local_name, transfer_percent(offset, progress_size)))
         return FS_FILE_USERABORT;
 
     const auto path = RemotePath::make(remote_name);
@@ -916,6 +926,9 @@ try
         return FS_FILE_OK;
     }
 
+    if (!resume && !resume_file.erase_resume_record())
+        return FS_FILE_WRITEERROR;
+
     std::uint64_t remote_size{};
     {
         AwsLease lease;
@@ -923,34 +936,41 @@ try
 
         {
             Aws::S3::Model::GetObjectRequest request;
-            request.SetBucket(path.bucket.c_str());
-            request.SetKey(path.key.c_str());
+            request.SetBucket(path.bucket);
+            request.SetKey(path.key);
             if (resume)
             {
-                // ponytail: trust the existing prefix; persist identity if provenance checks matter.
                 const auto range = std::format("bytes={}-", offset);
-                request.SetRange(range.c_str());
+                request.SetRange(range);
+                request.SetIfMatch(resume_state->record.etag);
             }
-            request.SetResponseStreamFactory([local, offset] {
+            request.SetResponseStreamFactory([download, offset] {
                 auto stream = Aws::New<std::fstream>("s3cmd");
                 if (offset == 0)
                 {
-                    stream->open(local, std::ios::out | std::ios::binary | std::ios::trunc);
+                    stream->open(download, std::ios::out | std::ios::binary | std::ios::trunc);
                 }
                 else
                 {
-                    std::error_code error;
-                    std::filesystem::resize_file(local, offset, error);
-                    if (!error)
+                    std::error_code ec;
+                    std::filesystem::resize_file(download, offset, ec);
+                    if (!ec)
                     {
-                        stream->open(local, std::ios::in | std::ios::out | std::ios::binary);
+                        stream->open(download, std::ios::in | std::ios::out | std::ios::binary);
                         stream->seekp(static_cast<std::streamoff>(offset));
                     }
                 }
                 return stream;
             });
 
-            TransferProgress progress{remote_name, local_name, request, offset, listed_size, resume};
+            TransferProgress progress{
+                remote_name, local_name, request, offset,
+                resume ? resume_state->record.size : listed_size, resume,
+                [&resume_file, download](std::string_view etag, std::uint64_t size) {
+                    std::error_code ec;
+                    if (std::filesystem::file_size(download, ec) == 0 && !ec)
+                        resume_file.write_resume_record({std::string{etag}, size});
+                }};
             const auto outcome = progress.wait(client->GetObjectCallable(request));
             if (progress.has_invalid_range())
                 return FS_FILE_READERROR;
@@ -960,13 +980,20 @@ try
                 // Use the received status even if cancellation masks it in the SDK error.
                 if (progress.has_response_error())
                 {
-                    std::filesystem::resize_file(local, offset, error);
-                    if (error)
+                    std::error_code ec;
+                    std::filesystem::resize_file(download, offset, ec);
+                    if (ec)
                         return FS_FILE_WRITEERROR;
                 }
                 if (progress.is_canceled())
                     return FS_FILE_USERABORT;
                 log_aws_error("GetObject", outcome.GetError());
+                if (resume && outcome.GetError().GetResponseCode() ==
+                                  Aws::Http::HttpResponseCode::PRECONDITION_FAILED)
+                {
+                    resume_file.erase_resume_record();
+                    return FS_FILE_NOTSUPPORTED;
+                }
                 if (resume && outcome.GetError().GetResponseCode() ==
                                   Aws::Http::HttpResponseCode::REQUESTED_RANGE_NOT_SATISFIABLE)
                     return FS_FILE_NOTSUPPORTED;
@@ -976,17 +1003,18 @@ try
                            : FS_FILE_READERROR;
             }
             if (progress.is_canceled())
+            {
                 return FS_FILE_USERABORT;
+            }
             remote_size = progress.total();
         }
     }
+    
+    // Finalize the download operation
+    if (!resume_file.finish_download(remote_size))
+        return FS_FILE_WRITEERROR;
 
-    if (resume)
-    {
-        const auto size = std::filesystem::file_size(local, error);
-        if (error || size != remote_size)
-            return FS_FILE_WRITEERROR;
-    }
+    // Remove the source (remote) file if it's move operation rather than copy
     if ((copy_flags & FS_COPYFLAGS_MOVE) != 0 && !delete_file(remote_name))
         return FS_FILE_WRITEERROR;
 
@@ -1009,9 +1037,9 @@ try
     if ((copy_flags & FS_COPYFLAGS_RESUME) != 0)
         return FS_FILE_NOTSUPPORTED;
 
-    std::error_code error;
-    const auto size = std::filesystem::file_size(local_name, error);
-    if (error)
+    std::error_code ec;
+    const auto size = std::filesystem::file_size(local_name, ec);
+    if (ec)
         return FS_FILE_READERROR;
     // FIXME: single-part upload stops at S3's 5 GiB limit
     if (size > max_single_part_size)
@@ -1069,10 +1097,10 @@ try
     if ((copy_flags & FS_COPYFLAGS_MOVE) != 0)
     {
         log_local_operation("DeleteLocalFile", local_name, false);
-        std::filesystem::remove(local_name, error);
-        if (error)
+        std::filesystem::remove(local_name, ec);
+        if (ec)
         {
-            log_error("Delete local source", std::format("error {}", error.value()));
+            log_error("Delete local source", std::format("error {}", ec.value()));
             return FS_FILE_READERROR;
         }
     }

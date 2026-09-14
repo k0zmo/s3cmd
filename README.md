@@ -75,7 +75,7 @@ The plugin exposes `Region` for bucket entries and `Storage class` plus `ETag` f
 - Uses registered buckets as a fallback when an account cannot call `ListBuckets`.
 - Finds and caches each bucket region for region-correct S3 requests.
 - Lists objects and directory prefixes with pagination, file sizes, and modification times.
-- Downloads objects through a temporary file, then replaces the destination after a successful transfer.
+- Downloads objects through a sibling `.s3cmddownload` file, then replaces the destination after a successful transfer.
 - Uploads objects with overwrite protection.
 - Reports upload and download progress and supports cancellation from Total Commander.
 - Advertises background upload and download support to compatible hosts.
@@ -89,11 +89,14 @@ The plugin exposes `Region` for bucket entries and `Storage class` plus `ETag` f
 - Registers and unregisters existing buckets when automatic bucket discovery is unavailable.
 - Exposes `Region`, `Storage class`, and `ETag` as content fields.
 - Reuses S3 clients and supports concurrent background transfers during one plugin session.
+- Resumes interrupted downloads only while the source object still has the recorded ETag.
 
 ## Configuration file
 
 The plugin stores its own configuration in `%APPDATA%\s3cmd\s3cmd.toml`
+On Unix builds, it uses `$XDG_CONFIG_HOME/s3cmd/s3cmd.toml` or `~/.config/s3cmd/s3cmd.toml`.
 This file is created when the plugin stores a registered bucket. Otherwise, it might not exist.
+Interrupted-download state is stored separately in `resume.toml` in the same directory.
 
 Set `AwsLogLevel` under `[settings]` to control which AWS SDK messages are sent to the debugger.
 The level defaults to `Info`.
@@ -124,7 +127,7 @@ This setting does not override `AWS_EC2_METADATA_DISABLED=true`.
 
 ## Limitations
 
-- Transfer resume and multipart transfer are not supported.
+- Upload resume and multipart transfer are not supported.
 - A single upload cannot exceed 5 GiB.
 - S3 copy, rename, and move operations cannot exceed 5 GiB.
 - S3 copy, rename, and move progress changes directly from 0% to 100%.
