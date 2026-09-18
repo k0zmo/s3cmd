@@ -1,4 +1,5 @@
 #include "s3.hpp"
+#include "config.hpp"
 #include "prereq.h"
 #include "core.hpp"
 #include "creds.hpp"
@@ -36,8 +37,6 @@
 #include <aws/s3/model/ListObjectsV2Request.h>
 #include <aws/s3/model/ObjectStorageClass.h>
 #include <aws/s3/model/PutObjectRequest.h>
-
-#include <toml++/toml.hpp>
 
 // FIXME: This should be removed
 #include <Windows.h> // GetCurrentThreadId, SetLastError, GetTempFileNameW, MoveFileExW
@@ -84,36 +83,6 @@ bool aws_initialized{};
 bool imds_enabled{};
 std::optional<PluginHost> plugin_host{};
 
-// All operations on RuntimeConfig requires a `config_mtx` mutex to be held
-struct RuntimeConfig
-{
-    static RuntimeConfig& get();
-
-    // Mirror the current config on the disk, at `path()`
-    bool flush_to_disk();
-
-    struct ProfileSettings
-    {
-        BucketMap registered_buckets;
-        BucketMap discovered_buckets;
-    };
-
-    bool dry_run{};
-    bool prefer_sso_device_code{};
-    bool enable_imds{};
-    std::string aws_log_level{"Info"};
-    std::map<std::string, ProfileSettings, std::less<>> profiles;
-
-    static const std::filesystem::path& path()
-    {
-        static const std::filesystem::path value = s3cmd::config_directory_path() / "s3cmd.toml";
-        return value;
-    }
-};
-
-std::mutex config_mtx;
-std::optional<RuntimeConfig> runtime_config;
-
 // TC recursively lists directories before calling FsRemoveDir.
 // Profiles and buckets are virtual directories, so their delete operations must
 // see an empty listing.
@@ -155,101 +124,6 @@ struct AwsLease
 
     std::shared_lock<std::shared_mutex> lock;
 };
-
-std::optional<toml::table> read_document(const std::filesystem::path& file_path)
-{
-    try
-    {
-        std::ifstream input{file_path};
-        if (input)
-            return toml::parse(input);
-    }
-    catch (const toml::parse_error&)
-    {
-    }
-    return std::nullopt;
-}
-
-bool write_document(const toml::table& document, const std::filesystem::path& file_path)
-{
-    std::error_code ec;
-    std::filesystem::create_directories(file_path.parent_path(), ec);
-    if (ec)
-        return false;
-
-    std::ofstream output(file_path, std::ios::trunc);
-    return output && (output << document) && output.flush();
-}
-
-RuntimeConfig& RuntimeConfig::get()
-{
-    if (runtime_config)
-        return *runtime_config;
-    runtime_config.emplace();
-
-    if (auto document = read_document(path()))
-    {
-        // Deserialize TOML document into RuntimeConfig
-        runtime_config->dry_run = (*document)["settings"]["DryRun"].value_or(false);
-        runtime_config->prefer_sso_device_code =
-            (*document)["settings"]["PreferSsoDeviceCode"].value_or(false);
-        runtime_config->enable_imds = (*document)["settings"]["EnableIMDS"].value_or(false);
-        runtime_config->aws_log_level =
-            (*document)["settings"]["AwsLogLevel"].value_or("Info");
-
-        if (const auto* profiles = document->get_as<toml::table>("profiles"))
-        {
-            for (const auto& [name, profile] : *profiles)
-            {
-                const auto* profile_table = profile.as_table();
-                const auto* buckets =
-                    profile_table ? profile_table->get_as<toml::table>("buckets") : nullptr;
-                if (!buckets)
-                    continue;
-                auto& registered =
-                    runtime_config->profiles[std::string(name.str())].registered_buckets;
-                for (const auto& [bucket, region] : *buckets)
-                {
-                    if (const auto value = region.value<std::string>())
-                        registered.emplace(bucket.str(), BucketInfo{*value});
-                }
-            }
-        }
-    }
-
-    return *runtime_config;
-}
-
-bool RuntimeConfig::flush_to_disk()
-{
-    // Serialize our config to TOML document and write it to disk
-    toml::table document;
-    document.emplace("settings", toml::table{{"DryRun", dry_run},
-                                             {"AwsLogLevel", aws_log_level},
-                                             {"PreferSsoDeviceCode", prefer_sso_device_code},
-                                             {"EnableIMDS", enable_imds}});
-
-    toml::table profile_tables;
-    for (const auto& [profile_name, profile] : profiles)
-    {
-        if (profile.registered_buckets.empty())
-            continue;
-
-        toml::table bucket_map;
-        for (const auto& [bucket_name, bucket_info] : profile.registered_buckets)
-        {
-            bucket_map.emplace(bucket_name, bucket_info.region);
-        }
-
-        toml::table profile_table;
-        profile_table.emplace("buckets", std::move(bucket_map));
-        profile_tables.emplace(profile_name, std::move(profile_table));
-    }
-    if (!profile_tables.empty())
-        document.emplace("profiles", std::move(profile_tables));
-
-    return write_document(document, path());
-}
 
 // Factory function for creating a new S3Client.
 // Credentials (whether SSO token has expired) are checked later
@@ -337,11 +211,7 @@ std::shared_ptr<Aws::S3::S3Client> get_client(const RemotePath& path,
                                                 to_wide(message).c_str());
                 throw SsoLoginFailed(message);
             }
-            const auto prefer_device_code = [] {
-                std::scoped_lock lock(config_mtx);
-                return RuntimeConfig::get().prefer_sso_device_code;
-            }();
-            perform_sso_login(*plugin_host, profile, prefer_device_code);
+            perform_sso_login(*plugin_host, profile, prefer_sso_device_code());
             sso_generation.fetch_add(1, std::memory_order_relaxed);
 
             auto refreshed = make_client(configuration, path);
@@ -714,84 +584,9 @@ private:
 
 void reset_config()
 {
-    std::scoped_lock lock(config_mtx);
-    runtime_config.reset();
+    reset_runtime_config();
     std::scoped_lock metadata_lock(object_metadata_mutex);
     object_metadata.clear();
-}
-
-bool is_dry_run()
-{
-    std::scoped_lock lock(config_mtx);
-    return RuntimeConfig::get().dry_run;
-}
-
-BucketMap ProfileConfig::registered_buckets() const
-{
-    std::scoped_lock lock(config_mtx);
-    const auto& config = RuntimeConfig::get();
-    const auto profile = config.profiles.find(profile_);
-    return profile == config.profiles.end() ? BucketMap{}
-                                            : profile->second.registered_buckets;
-}
-
-bool ProfileConfig::has_discovered_buckets() const
-{
-    std::scoped_lock lock(config_mtx);
-    const auto& config = RuntimeConfig::get();
-    const auto profile = config.profiles.find(profile_);
-    return profile != config.profiles.end() && !profile->second.discovered_buckets.empty();
-}
-
-void ProfileConfig::set_discovered_buckets(BucketMap buckets) const
-{
-    std::scoped_lock lock(config_mtx);
-    auto& config = RuntimeConfig::get();
-    config.profiles[profile_].discovered_buckets = std::move(buckets);
-}
-
-std::string ProfileConfig::bucket_region(std::string_view bucket) const
-{
-    std::scoped_lock lock(config_mtx);
-    const auto& config = RuntimeConfig::get();
-    const auto profile = config.profiles.find(profile_);
-    if (profile == config.profiles.end())
-        return {};
-
-    if (const auto registered = profile->second.registered_buckets.find(bucket);
-        registered != profile->second.registered_buckets.end())
-    {
-        return registered->second.region;
-    }
-    if (const auto discovered = profile->second.discovered_buckets.find(bucket);
-        discovered != profile->second.discovered_buckets.end())
-    {
-        return discovered->second.region;
-    }
-
-    return {};
-}
-
-bool ProfileConfig::register_bucket(std::string_view bucket, std::string_view region) const
-{
-    std::scoped_lock lock(config_mtx);
-    auto& config = RuntimeConfig::get();
-    config.profiles[profile_].registered_buckets[std::string{bucket}] =
-        BucketInfo{std::string{region}};
-    return config.flush_to_disk();
-}
-
-bool ProfileConfig::unregister_bucket(std::string_view bucket) const
-{
-    std::scoped_lock lock(config_mtx);
-    auto& config = RuntimeConfig::get();
-    auto& registered = config.profiles[profile_].registered_buckets;
-    if (auto it = registered.find(bucket); it != registered.end())
-    {
-        registered.erase(it);
-        return config.flush_to_disk();
-    }
-    return false;
 }
 
 std::string discover_bucket_region(std::string_view profile, std::string_view bucket)
@@ -849,12 +644,8 @@ int initialize(int number, tProgressProcW progress, tLogProcW log, tRequestProcW
             }
         };
 
-        {
-            std::scoped_lock config_lock(config_mtx);
-            aws_options.loggingOptions.logLevel =
-                AwsLogSystem::parse_log_level(RuntimeConfig::get().aws_log_level);
-            imds_enabled = RuntimeConfig::get().enable_imds;
-        }
+        aws_options.loggingOptions.logLevel = AwsLogSystem::parse_log_level(aws_log_level());
+        imds_enabled = is_imds_enabled();
         aws_options.loggingOptions.logger_create_fn = [] {
             return Aws::MakeShared<AwsLogSystem>("s3cmd", aws_options.loggingOptions.logLevel);
         };

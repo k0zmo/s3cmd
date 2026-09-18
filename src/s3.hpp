@@ -2,42 +2,13 @@
 
 #include "fsplugin.h"
 
-#include <functional>
-#include <map>
 #include <string>
 #include <string_view>
-#include <utility>
 
 namespace s3cmd {
 
-struct BucketInfo
-{
-    std::string region;
-    FILETIME created{};
-};
-using BucketMap = std::map<std::string, BucketInfo, std::less<>>;
-
 // Function called only in tests
 void reset_config();
-
-class ProfileConfig
-{
-public:
-    explicit ProfileConfig(std::string profile)
-      : profile_{std::move(profile)}
-    {
-    }
-
-    BucketMap registered_buckets() const;
-    bool has_discovered_buckets() const;
-    void set_discovered_buckets(BucketMap buckets) const;
-    std::string bucket_region(std::string_view bucket) const;
-    bool register_bucket(std::string_view bucket, std::string_view region) const;
-    bool unregister_bucket(std::string_view bucket) const;
-
-private:
-    std::string profile_;
-};
 
 std::string discover_bucket_region(std::string_view profile, std::string_view bucket);
 

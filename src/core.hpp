@@ -6,15 +6,7 @@
 #include <string>
 #include <string_view>
 
-namespace std::filesystem {
-
-class path;
-} // namespace std::filesystem
-
 namespace s3cmd {
-
-// Returns a path to config directory of the plugin
-const std::filesystem::path& config_directory_path();
 
 class PluginHost
 {

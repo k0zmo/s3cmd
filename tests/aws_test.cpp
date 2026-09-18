@@ -1,4 +1,5 @@
 #include "s3.hpp"
+#include "config.hpp"
 #include "core.hpp"
 #include "utils.hpp"
 

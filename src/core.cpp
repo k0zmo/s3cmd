@@ -4,42 +4,13 @@
 
 #include <algorithm>
 #include <array>
-#include <cstdlib>
-#include <filesystem>
 #include <format>
 #include <iterator>
-#include <memory>
-#include <stdexcept>
 #include <string>
 #include <string_view>
 #include <utility>
 
 namespace s3cmd {
-
-const std::filesystem::path& config_directory_path()
-{
-    static std::filesystem::path value = [] {
-#ifdef _WIN32
-        wchar_t* app_data{};
-        std::size_t size{};
-        // _wdupenv_s allocates a correctly sized UTF-16 copy.
-        if (_wdupenv_s(&app_data, &size, L"APPDATA") != 0 || !app_data || !*app_data)
-        {
-            std::free(app_data);
-            throw std::runtime_error("APPDATA is not set");
-        }
-        std::unique_ptr<wchar_t, decltype(&std::free)> releaser(app_data, &std::free);
-        return std::filesystem::path(releaser.get()) / L"s3cmd";
-#else
-        if (const auto* config_home = std::getenv("XDG_CONFIG_HOME"); config_home && *config_home)
-            return std::filesystem::path(config_home) / "s3cmd";
-        if (const auto* home = std::getenv("HOME"); home && *home)
-            return std::filesystem::path(home) / ".config" / "s3cmd";
-        throw std::runtime_error("XDG_CONFIG_HOME and HOME are not set");
-#endif
-    }();
-    return value;
-}
 
 PluginHost::PluginHost(int plugin_number, tProgressProcW progress_proc, tLogProcW log_proc,
                        tRequestProcW request_proc)

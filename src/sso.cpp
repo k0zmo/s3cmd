@@ -1,6 +1,7 @@
 #include "sso.hpp"
 #include "prereq.h"
 #include "core.hpp"
+#include "config.hpp"
 #include "log.hpp"
 #include "utils.hpp"
 
