@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.24)
-project(s3cmd VERSION 1.1.0 LANGUAGES C CXX)
+project(s3cmd VERSION 1.2.0 LANGUAGES C CXX)
 
 # The next release version. Clear the suffix on release branches.
 set(S3CMD_VERSION_SUFFIX "-dev")
