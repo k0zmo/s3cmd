@@ -1,7 +1,6 @@
 [plugininstall]
-description=S3 plugin @S3CMD_VERSION@ (64bit)
+description=S3 plugin @S3CMD_VERSION@ (@S3CMD_BITS@bit)
 type=wfx
-file=s3cmd.wfx64
-file=pluginst.inf
+file=s3cmd@S3CMD_PLUGIN_SUFFIX@
 defaultdir=s3cmd
 version=@S3CMD_VERSION@

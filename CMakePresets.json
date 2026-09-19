@@ -30,10 +30,7 @@
             "name": ":windows",
             "hidden": true,
             "inherits": [":base"],
-            "condition": { "type": "equals", "lhs": "${hostSystemName}", "rhs": "Windows" },
-            "cacheVariables": {
-                "VCPKG_TARGET_TRIPLET": "x64-windows-static-md"
-            }
+            "condition": { "type": "equals", "lhs": "${hostSystemName}", "rhs": "Windows" }
         },
         {
             "name": ":linux",
@@ -135,13 +132,37 @@
             "name": ":x64-arch-external",
             "hidden": true,
             "architecture": { "strategy": "external", "value": "x64" },
-            "toolset":      { "strategy": "external", "value": "host=x64" }
+            "toolset":      { "strategy": "external", "value": "host=x64" },
+            "cacheVariables": {
+                "VCPKG_TARGET_TRIPLET": "x64-windows-static-md"
+            }
         },
         {
             "name": ":x64-arch-set",
             "hidden": true,
             "architecture": { "strategy": "set", "value": "x64" },
-            "toolset":      { "strategy": "set", "value": "host=x64" }
+            "toolset":      { "strategy": "set", "value": "host=x64" },
+            "cacheVariables": {
+                "VCPKG_TARGET_TRIPLET": "x64-windows-static-md"
+            }
+        },
+        {
+            "name": ":x86-arch-external",
+            "hidden": true,
+            "architecture": { "strategy": "external", "value": "x86" },
+            "toolset":      { "strategy": "external", "value": "host=x64" },
+            "cacheVariables": {
+                "VCPKG_TARGET_TRIPLET": "x86-windows-static-md"
+            }
+        },
+        {
+            "name": ":x86-arch-set",
+            "hidden": true,
+            "architecture": { "strategy": "set", "value": "Win32" },
+            "toolset":      { "strategy": "set", "value": "host=x64" },
+            "cacheVariables": {
+                "VCPKG_TARGET_TRIPLET": "x86-windows-static-md"
+            }
         },
         {
             "name": "gcc-debug",
@@ -196,6 +217,14 @@
             "inherits": [":windows", ":msvc", ":x64-arch-external", ":asan"]
         },
         {
+            "name": "msvc-x86-debug",
+            "inherits": [":windows", ":msvc", ":x86-arch-external", ":debug"]
+        },
+        {
+            "name": "msvc-x86-release",
+            "inherits": [":windows", ":msvc", ":x86-arch-external", ":release"]
+        },
+        {
             "name": "clang-windows-debug",
             "inherits": [":windows", ":clang", ":x64-arch-external", ":debug"],
             "cacheVariables": {
@@ -221,13 +250,13 @@
             }
         },
         {
-            "name": "vs2022",
-            "inherits": [":windows", ":msvc", ":x64-arch-set"],
-            "generator": "Visual Studio 17 2022"
-        },
-        {
             "name": "vs2026",
             "inherits": [":windows", ":msvc", ":x64-arch-set"],
+            "generator": "Visual Studio 18 2026"
+        },
+        {
+            "name": "vs2026-x86",
+            "inherits": [":windows", ":msvc", ":x86-arch-set"],
             "generator": "Visual Studio 18 2026"
         }
     ]

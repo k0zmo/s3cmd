@@ -7,7 +7,8 @@ The plugin has a simple path: AWS profile, S3 bucket, then object(s).
 
 ## Install
 
-The release package contains `s3cmd.wfx64`, `pluginst.inf`, and this README.
+Choose the release ZIP for your Total Commander version: `win32` for 32-bit or `win64` for 64-bit.
+The package contains `s3cmd.wfx` (32-bit) or `s3cmd.wfx64` (64-bit), `pluginst.inf`, this README, and icon licenses.
 
 1. Open the release ZIP in Total Commander.
 2. Accept the plugin installation prompt from `pluginst.inf`.
@@ -18,7 +19,7 @@ You can also install the plugin manually:
 2. Open Configuration > Options > Plugins in Total Commander.
 3. Select File system plugins (.WFX).
 4. Select Configure.
-5. Add `s3cmd.wfx64`.
+5. Add `s3cmd.wfx` for 32-bit Total Commander or `s3cmd.wfx64` for 64-bit Total Commander.
 
 ## Configure AWS access
 

@@ -3,6 +3,25 @@
 
 #define WFX_EXPORT extern "C"
 
+// 32-bit Total Commander requires these ANSI exports even for Unicode plugins.
+// Actual operations use the W entry points on the supported Windows versions.
+WFX_EXPORT int __stdcall FsInit(int, tProgressProc, tLogProc, tRequestProc)
+{
+    return 0;
+}
+
+WFX_EXPORT HANDLE __stdcall FsFindFirst(char*, WIN32_FIND_DATA*)
+{
+    SetLastError(ERROR_NOT_SUPPORTED);
+    return INVALID_HANDLE_VALUE;
+}
+
+WFX_EXPORT BOOL __stdcall FsFindNext(HANDLE, WIN32_FIND_DATA*)
+{
+    SetLastError(ERROR_NOT_SUPPORTED);
+    return FALSE;
+}
+
 WFX_EXPORT int __stdcall FsInitW(int number, tProgressProcW progress, tLogProcW log,
                                  tRequestProcW request)
 {

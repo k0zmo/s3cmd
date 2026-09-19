@@ -13,6 +13,16 @@ permissions:
 jobs:
   windows:
     runs-on: windows-2022
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x64
+            preset: msvc-release
+            platform: win64
+          - arch: amd64_x86
+            preset: msvc-x86-release
+            platform: win32
 
     steps:
       - uses: actions/checkout@v7
@@ -23,24 +33,24 @@ jobs:
         uses: actions/cache@v6
         with:
           path: ~\AppData\Local\vcpkg\archives
-          key: vcpkg-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('vcpkg.json', 'CMakePresets.json') }}
+          key: vcpkg-${{ runner.os }}-${{ matrix.platform }}-${{ hashFiles('vcpkg.json', 'CMakePresets.json') }}
           restore-keys: |
-            vcpkg-${{ runner.os }}-${{ runner.arch }}-
+            vcpkg-${{ runner.os }}-${{ matrix.platform }}-
 
       - uses: TheMrMilchmann/setup-msvc-dev@v4
         with:
-          arch: x64
+          arch: ${{ matrix.arch }}
 
       - name: Configure
         run: >-
-          cmake --preset msvc-release
+          cmake --preset ${{ matrix.preset }}
           --toolchain "$env:VCPKG_INSTALLATION_ROOT/scripts/buildsystems/vcpkg.cmake"
 
       - name: Build
-        run: cmake --build build/msvc-release
+        run: cmake --build build/${{ matrix.preset }}
 
       - name: Unit tests
-        run: ctest --test-dir build/msvc-release -L unit --output-on-failure
+        run: ctest --test-dir build/${{ matrix.preset }} -L unit --output-on-failure
 
       - name: AWS integration tests
         if: github.event_name != 'pull_request'
@@ -54,35 +64,46 @@ jobs:
           S3CMD_TEST_REGION: ${{ secrets.S3CMD_TEST_REGION }}
           S3CMD_TEST_LIST_BUCKETS: ${{ secrets.S3CMD_TEST_LIST_BUCKETS }}
           S3CMD_TEST_OBJECT: ${{ secrets.S3CMD_TEST_OBJECT }}
-        run: ctest --test-dir build/msvc-release -L integration --output-on-failure
+        run: ctest --test-dir build/${{ matrix.preset }} -L integration --output-on-failure
 
       - name: Package
-        run: cmake --build build/msvc-release --target package
+        run: cmake --build build/${{ matrix.preset }} --target package
 
       - name: Validate release version
         if: startsWith(github.ref, 'refs/tags/v')
         run: |
           $version = $env:GITHUB_REF_NAME.Substring(1)
           if ($version -cnotmatch '^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$' -or
-              (Get-Content "build/msvc-release/pluginst.inf") -cnotcontains "version=$version") {
+              (Get-Content "build/${{ matrix.preset }}/pluginst.inf") -cnotcontains "version=$version") {
             throw "Release tag must match the CMake version with an empty S3CMD_VERSION_SUFFIX"
           }
-          if (-not (Test-Path "build/msvc-release/s3cmd-$version-win64.zip")) {
+          if (-not (Test-Path "build/${{ matrix.preset }}/s3cmd-$version-${{ matrix.platform }}.zip")) {
             throw "Tag $env:GITHUB_REF_NAME does not match the CMake project version"
           }
 
       - name: Upload package
         uses: actions/upload-artifact@v7
         with:
-          path: build/msvc-release/s3cmd-*-win64.zip
+          path: build/${{ matrix.preset }}/s3cmd-*-${{ matrix.platform }}.zip
           archive: false
           if-no-files-found: error
 
+  release:
+    needs: windows
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: windows-2022
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          path: packages
+          merge-multiple: true
+          skip-decompress: true
+
       - name: Create GitHub release
-        if: startsWith(github.ref, 'refs/tags/v')
         env:
           GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
         run: >-
           gh release create $env:GITHUB_REF_NAME
-          "build/msvc-release/s3cmd-*-win64.zip"
+          "packages/s3cmd-*-win*.zip"
           --verify-tag

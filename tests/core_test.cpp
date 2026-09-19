@@ -139,6 +139,7 @@ TemporaryConfig& temporary_config()
 
 TEST_CASE("AWS SDK lifecycle is idempotent on its owner thread", "[unit]")
 {
+    temporary_config();
     s3cmd::initialize(0, nullptr, nullptr, nullptr);
     s3cmd::initialize(0, nullptr, nullptr, nullptr);
     s3cmd::shutdown();

@@ -80,9 +80,15 @@ endif()
 target_compile_features(s3cmd PRIVATE cxx_std_20)
 target_compile_definitions(s3cmd PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
 target_link_libraries(s3cmd PRIVATE s3cmd-core)
+math(EXPR S3CMD_BITS "${CMAKE_SIZEOF_VOID_P} * 8")
+if(CMAKE_SIZEOF_VOID_P EQUAL 8)
+    set(S3CMD_PLUGIN_SUFFIX ".wfx64")
+else()
+    set(S3CMD_PLUGIN_SUFFIX ".wfx")
+endif()
 set_target_properties(s3cmd PROPERTIES
     PREFIX ""
-    SUFFIX ".wfx64"
+    SUFFIX "${S3CMD_PLUGIN_SUFFIX}"
 )
 if(WIN32)
     include(VersionInfo)
@@ -141,5 +147,6 @@ install(FILES
 set(CPACK_GENERATOR ZIP)
 set(CPACK_INCLUDE_TOPLEVEL_DIRECTORY OFF)
 set(CPACK_PACKAGE_VERSION "${S3CMD_VERSION}")
+set(CPACK_SYSTEM_NAME "win${S3CMD_BITS}")
 set(CPACK_PROJECT_CONFIG_FILE "${s3cmd_SOURCE_DIR}/cmake/PackageVersion.cmake")
 include(CPack)

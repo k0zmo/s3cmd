@@ -1,4 +1,7 @@
 EXPORTS
+    FsInit
+    FsFindFirst
+    FsFindNext
     FsInitW
     FsFindFirstW
     FsFindNextW
