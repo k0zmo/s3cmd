@@ -6,7 +6,16 @@
 #include <toml++/toml.hpp>
 
 #include <filesystem>
-#include <mutex>
+#include <system_error>
+
+#ifdef _WIN32
+#  include <Windows.h>
+#else
+#  include <cerrno>
+#  include <fcntl.h>
+#  include <sys/file.h>
+#  include <unistd.h>
+#endif
 
 namespace s3cmd {
 
@@ -14,13 +23,121 @@ namespace {
 
 constexpr std::string_view download_suffix = ".s3cmddownload";
 
-// Process-local lock. Might be a problem if we use multiple instances of totalcmd/doublecmd
-std::mutex resume_mtx;
-
 const std::filesystem::path& resume_path()
 {
     static const auto value = config_directory_path() / "resume.toml";
     return value;
+}
+
+const std::filesystem::path& resume_lock_path()
+{
+    static const auto value = [] {
+        auto path = resume_path();
+        path += ".lock";
+        return path;
+    }();
+    return value;
+}
+
+bool commit_file(const std::filesystem::path& source, const std::filesystem::path& target,
+                 bool replace)
+{
+#ifdef _WIN32
+    auto flags = MOVEFILE_WRITE_THROUGH;
+    if (replace)
+        flags |= MOVEFILE_REPLACE_EXISTING;
+    return MoveFileExW(source.c_str(), target.c_str(), flags);
+#else
+    std::error_code ec;
+    if (replace)
+    {
+        std::filesystem::rename(source, target, ec);
+        return !ec;
+    }
+    std::filesystem::create_hard_link(source, target, ec);
+    if (ec)
+        return false;
+    std::filesystem::remove(source, ec);
+    return !ec;
+#endif
+}
+
+class ResumeLock
+{
+public:
+    ResumeLock()
+    {
+        std::error_code ec;
+        std::filesystem::create_directories(resume_path().parent_path(), ec);
+        if (ec)
+            throw std::system_error(ec);
+#ifdef _WIN32
+        handle_ = CreateFileW(resume_lock_path().c_str(), GENERIC_READ | GENERIC_WRITE,
+                              FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_ALWAYS,
+                              FILE_ATTRIBUTE_NORMAL, nullptr);
+        if (handle_ == INVALID_HANDLE_VALUE)
+            throw std::system_error(static_cast<int>(GetLastError()), std::system_category());
+        OVERLAPPED overlapped{};
+        if (!LockFileEx(handle_, LOCKFILE_EXCLUSIVE_LOCK, 0, MAXDWORD, MAXDWORD, &overlapped))
+        {
+            const auto error = GetLastError();
+            CloseHandle(handle_);
+            handle_ = INVALID_HANDLE_VALUE;
+            throw std::system_error(static_cast<int>(error), std::system_category());
+        }
+#else
+        handle_ = ::open(resume_lock_path().c_str(), O_CREAT | O_RDWR, 0600);
+        if (handle_ == -1 || ::flock(handle_, LOCK_EX) == -1)
+        {
+            const auto error = errno;
+            if (handle_ != -1)
+                ::close(handle_);
+            handle_ = -1;
+            throw std::system_error(error, std::generic_category());
+        }
+#endif
+    }
+
+    ~ResumeLock()
+    {
+#ifdef _WIN32
+        if (handle_ != INVALID_HANDLE_VALUE)
+        {
+            OVERLAPPED overlapped{};
+            UnlockFileEx(handle_, 0, MAXDWORD, MAXDWORD, &overlapped);
+            CloseHandle(handle_);
+        }
+#else
+        if (handle_ != -1)
+        {
+            ::flock(handle_, LOCK_UN);
+            ::close(handle_);
+        }
+#endif
+    }
+
+    ResumeLock(const ResumeLock&) = delete;
+    ResumeLock& operator=(const ResumeLock&) = delete;
+
+private:
+#ifdef _WIN32
+    HANDLE handle_{INVALID_HANDLE_VALUE};
+#else
+    int handle_{-1};
+#endif
+};
+
+bool write_resume_document(const toml::table& document)
+{
+    auto temporary = resume_path();
+    temporary += ".tmp";
+    if (!write_document(document, temporary))
+        return false;
+    if (commit_file(temporary, resume_path(), true))
+        return true;
+    std::error_code ignored;
+    std::filesystem::remove(temporary, ignored);
+    return false;
 }
 
 std::string resume_key(const std::filesystem::path& path)
@@ -63,7 +180,7 @@ std::optional<ResumeFile::ResumeState>
 std::optional<ResumeRecord> ResumeFile::read_resume_record() const
 try
 {
-    std::scoped_lock lock(resume_mtx);
+    ResumeLock process_lock;
     const auto document = read_document(resume_path());
     if (!document)
         return std::nullopt;
@@ -95,7 +212,7 @@ catch (...)
 bool ResumeFile::write_resume_record(ResumeRecord record)
 try
 {
-    std::scoped_lock lock(resume_mtx);
+    ResumeLock process_lock;
     auto document = read_document(resume_path()).value_or(toml::table{});
     auto* downloads = document.get_as<toml::table>("downloads");
     if (!downloads)
@@ -107,7 +224,7 @@ try
                                 toml::table{{"remote", remote_},
                                             {"etag", record.etag},
                                             {"size", static_cast<std::int64_t>(record.size)}});
-    return write_document(document, resume_path());
+    return write_resume_document(document);
 }
 catch (...)
 {
@@ -117,7 +234,7 @@ catch (...)
 bool ResumeFile::erase_resume_record()
 try
 {
-    std::scoped_lock lock(resume_mtx);
+    ResumeLock process_lock;
     auto document = read_document(resume_path());
     auto* downloads = document ? document->get_as<toml::table>("downloads") : nullptr;
     if (!downloads || downloads->erase(resume_key(local_)) == 0)
@@ -128,21 +245,20 @@ try
         std::filesystem::remove(resume_path(), ec);
         return !ec;
     }
-    return write_document(*document, resume_path());
+    return write_resume_document(*document);
 }
 catch (...)
 {
     return false;
 }
 
-bool ResumeFile::finish_download(std::uint64_t expected_size)
+bool ResumeFile::finish_download(std::uint64_t expected_size, bool replace)
 {
     const auto download = download_path();
     std::error_code ec;
     if (std::filesystem::file_size(download, ec) != expected_size || ec)
         return false;
-    std::filesystem::rename(download, local_, ec);
-    if (ec)
+    if (!commit_file(download, local_, replace))
         return false;
     erase_resume_record();
     return true;

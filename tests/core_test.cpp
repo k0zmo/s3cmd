@@ -5,6 +5,7 @@
 #include "core.hpp"
 #include "fsplugin.h"
 #include "object_metadata.hpp"
+#include "resume.hpp"
 
 #include <aws/core/auth/GeneralHTTPCredentialsProvider.h>
 #include <aws/core/auth/SSOCredentialsProvider.h>
@@ -203,10 +204,27 @@ TEST_CASE("Content-Range parsing", "[unit]")
     CHECK_FALSE(s3cmd::parse_content_range("bytes 42-99/100 extra"));
 }
 
+TEST_CASE("Download commit preserves an unexpected destination", "[unit]")
+{
+    auto& config = temporary_config();
+    const auto local = config.root / L"download";
+    s3cmd::ResumeFile resume{local, "remote"};
+    std::ofstream(local, std::ios::binary) << "existing";
+    std::ofstream(resume.download_path(), std::ios::binary) << "replacement";
+
+    CHECK_FALSE(resume.finish_download(11, false));
+    CHECK(read_file(local) == "existing");
+    CHECK(read_file(resume.download_path()) == "replacement");
+
+    REQUIRE(resume.finish_download(11, true));
+    CHECK(read_file(local) == "replacement");
+    CHECK_FALSE(std::filesystem::exists(resume.download_path()));
+}
+
 TEST_CASE("Get discards HTTP error bodies before retry", "[unit]")
 {
     auto& config = temporary_config();
-    const std::string object = "prefix and the rest of the object";
+    std::string object = "prefix and the rest of the object";
     std::atomic<bool> reject{true};
     std::atomic<bool> stall{};
     std::atomic<bool> delay{};
@@ -284,6 +302,15 @@ TEST_CASE("Get discards HTTP error bodies before retry", "[unit]")
     std::string prefix;
     int flags{};
     SECTION("new download") {}
+    SECTION("new download spans multiple response reads")
+    {
+        reject = false;
+        object.assign(128 * 1024, 'x');
+        REQUIRE(s3cmd::get_file(L"\\resume-test\\bucket\\object", local.c_str(), 0, nullptr) ==
+                FS_FILE_OK);
+        CHECK(read_file(local) == object);
+        return;
+    }
     SECTION("equal size cannot be resumed without listing metadata")
     {
         reject = false;
@@ -354,6 +381,15 @@ TEST_CASE("Get discards HTTP error bodies before retry", "[unit]")
         CHECK(transfer_canceled);
         CHECK_FALSE(transfer_wrong_thread);
         CHECK(read_file(local) == "existing target");
+        return;
+    }
+    SECTION("resume metadata write failure aborts download")
+    {
+        reject = false;
+        std::filesystem::create_directories(config.path.parent_path() / L"resume.toml");
+        CHECK(s3cmd::get_file(L"\\resume-test\\bucket\\object", local.c_str(),
+                             FS_COPYFLAGS_OVERWRITE, nullptr) == FS_FILE_WRITEERROR);
+        CHECK_FALSE(std::filesystem::exists(download));
         return;
     }
     SECTION("resumed download")

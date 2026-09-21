@@ -34,7 +34,7 @@ public:
     std::filesystem::path download_path() const;
     bool write_resume_record(ResumeRecord record);
     bool erase_resume_record();
-    bool finish_download(std::uint64_t expected_size);
+    bool finish_download(std::uint64_t expected_size, bool replace);
 
 private:
     std::optional<ResumeRecord> read_resume_record() const;

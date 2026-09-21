@@ -286,13 +286,13 @@ public:
     TransferProgress(const wchar_t* source, const wchar_t* target,
                      Aws::S3::Model::GetObjectRequest& request, std::uint64_t transferred = 0,
                      std::uint64_t total = 0, bool resume = false,
-                     std::function<void(std::string_view, std::uint64_t)> headers_ready = {})
+                     std::function<bool(std::string_view, std::uint64_t)> headers_ready = {})
         : TransferProgress{source, target, total, request, transferred}
     {
         request.SetHeadersReceivedEventHandler(
             [this, transferred, total, resume,
              headers_ready = std::move(headers_ready)](const Aws::Http::HttpRequest*,
-                                                        Aws::Http::HttpResponse* response) {
+                                                        Aws::Http::HttpResponse* response) mutable {
                 response_error_ = static_cast<int>(response->GetResponseCode()) >= 300;
                 invalid_range_ = false;
                 const std::string_view length = response->HasHeader(Aws::Http::CONTENT_LENGTH_HEADER)
@@ -322,8 +322,12 @@ public:
                     remaining && response->HasHeader("etag"))
                 {
                     const auto& etag = response->GetHeader("etag");
-                    if (headers_ready && !etag.empty())
-                        headers_ready(etag, total_);
+                    if (headers_ready && !etag.empty() &&
+                        // We want to call this just once
+                        !std::exchange(headers_ready, nullptr)(etag, total_))
+                    {
+                        resume_error_ = true;
+                    }
                 }
             });
         request.SetDataReceivedEventHandler([this](const Aws::Http::HttpRequest*,
@@ -344,6 +348,7 @@ public:
     bool is_canceled() const { return canceled_.load(); }
     bool has_response_error() const { return response_error_; }
     bool has_invalid_range() const { return invalid_range_; }
+    bool has_resume_error() const { return resume_error_; }
     std::uint64_t total() const { return total_; }
 
     template <typename Outcome>
@@ -386,7 +391,7 @@ private:
         request.SetContinueRequestHandler(
             [this](const Aws::Http::HttpRequest*) {
                 std::scoped_lock lock(pause_mutex_);
-                return !canceled_.load() && !invalid_range_;
+                return !canceled_.load() && !invalid_range_ && !resume_error_;
             });
     }
 
@@ -412,6 +417,7 @@ private:
     std::atomic<bool> canceled_{};
     bool response_error_{};
     bool invalid_range_{};
+    std::atomic<bool> resume_error_{};
 };
 
 // Checks whether an object at `path` exists
@@ -967,11 +973,19 @@ try
                 remote_name, local_name, request, offset,
                 resume ? resume_state->record.size : listed_size, resume,
                 [&resume_file, download](std::string_view etag, std::uint64_t size) {
+                    if (size == 0)
+                        return true;
                     std::error_code ec;
-                    if (std::filesystem::file_size(download, ec) == 0 && !ec)
-                        resume_file.write_resume_record({std::string{etag}, size});
+                    return std::filesystem::file_size(download, ec) == 0 && !ec &&
+                           resume_file.write_resume_record({std::string{etag}, size});
                 }};
             const auto outcome = progress.wait(client->GetObjectCallable(request));
+            if (progress.has_resume_error())
+            {
+                std::error_code ignored;
+                std::filesystem::remove(download, ignored);
+                return FS_FILE_WRITEERROR;
+            }
             if (progress.has_invalid_range())
                 return FS_FILE_READERROR;
             if (!outcome.IsSuccess())
@@ -1011,7 +1025,8 @@ try
     }
     
     // Finalize the download operation
-    if (!resume_file.finish_download(remote_size))
+    if (!resume_file.finish_download(remote_size,
+                                     resume || (copy_flags & FS_COPYFLAGS_OVERWRITE) != 0))
         return FS_FILE_WRITEERROR;
 
     // Remove the source (remote) file if it's move operation rather than copy
