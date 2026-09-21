@@ -10,7 +10,7 @@ namespace s3cmd {
 // Function called only in tests
 void reset_config();
 
-std::string discover_bucket_region(std::string_view profile, std::string_view bucket);
+std::string discover_bucket_region(const std::string& profile, const std::string& bucket);
 
 // Plugin API implementation
 int initialize(int number, tProgressProcW progress, tLogProcW log, tRequestProcW request);

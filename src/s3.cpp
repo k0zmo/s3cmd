@@ -589,25 +589,27 @@ void reset_config()
     object_metadata.clear();
 }
 
-std::string discover_bucket_region(std::string_view profile, std::string_view bucket)
+std::string discover_bucket_region(const std::string& profile, const std::string& bucket)
 {
     AwsLease lease;
-    auto client = get_client({std::string(profile), {}, {}});
+    auto client = get_client({profile, {}, {}});
     Aws::S3::Model::GetBucketLocationRequest request;
-    request.SetBucket(std::string(bucket));
+    request.SetBucket(bucket);
     log("[s3cmd] operation=GetBucketLocation profile={} bucket={}", profile, bucket);
     const auto outcome = client->GetBucketLocation(request);
     if (!outcome.IsSuccess())
         return {};
 
     const auto location = outcome.GetResult().GetLocationConstraint();
+    std::string region;
     if (location == Aws::S3::Model::BucketLocationConstraint::NOT_SET)
-        return "us-east-1";
-    if (location == Aws::S3::Model::BucketLocationConstraint::EU)
-        return "eu-west-1";
-    const auto region =
-        Aws::S3::Model::BucketLocationConstraintMapper::GetNameForBucketLocationConstraint(
-            location);
+        region = "us-east-1";
+    else if (location == Aws::S3::Model::BucketLocationConstraint::EU)
+        region = "eu-west-1";
+    else
+        region = Aws::S3::Model::BucketLocationConstraintMapper::
+            GetNameForBucketLocationConstraint(location);
+    ProfileConfig(profile).cache_bucket_region(bucket, region);
     return region;
 }
 

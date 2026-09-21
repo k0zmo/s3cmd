@@ -136,6 +136,7 @@ TEST_CASE("a bucket region can be discovered from its name", "[integration]")
 
     PluginSession session;
     CHECK(s3cmd::discover_bucket_region(*profile, *bucket) == *region);
+    CHECK(s3cmd::ProfileConfig(*profile).bucket_region(*bucket) == *region);
 }
 
 TEST_CASE("a bucket can be entered using its own region", "[integration]")

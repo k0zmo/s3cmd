@@ -379,6 +379,17 @@ TEST_CASE("discovered bucket regions remain in memory", "[unit]")
     CHECK_FALSE(std::filesystem::exists(ini.path));
 }
 
+TEST_CASE("directly discovered bucket regions remain in memory", "[unit]")
+{
+    temporary_config();
+    const s3cmd::ProfileConfig profile("work");
+
+    profile.cache_bucket_region("direct-bucket", "eu-west-2");
+
+    CHECK(profile.bucket_region("direct-bucket") == "eu-west-2");
+    CHECK_FALSE(profile.has_discovered_buckets());
+}
+
 TEST_CASE("bucket registration is disabled when buckets were discovered", "[unit]")
 {
     temporary_config();

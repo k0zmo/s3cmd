@@ -29,6 +29,7 @@ struct RuntimeConfig
     {
         BucketMap registered_buckets;
         BucketMap discovered_buckets;
+        bool has_discovered_buckets{};
     };
 
     bool dry_run{false};
@@ -211,13 +212,22 @@ bool ProfileConfig::has_discovered_buckets() const
     std::scoped_lock lock(config_mtx);
     const auto& config = RuntimeConfig::get();
     const auto profile = config.profiles.find(profile_);
-    return profile != config.profiles.end() && !profile->second.discovered_buckets.empty();
+    return profile != config.profiles.end() && profile->second.has_discovered_buckets;
 }
 
 void ProfileConfig::set_discovered_buckets(BucketMap buckets) const
 {
     std::scoped_lock lock(config_mtx);
-    RuntimeConfig::get().profiles[profile_].discovered_buckets = std::move(buckets);
+    auto& profile = RuntimeConfig::get().profiles[profile_];
+    profile.has_discovered_buckets = !buckets.empty();
+    profile.discovered_buckets = std::move(buckets);
+}
+
+void ProfileConfig::cache_bucket_region(const std::string& bucket, std::string region) const
+{
+    std::scoped_lock lock(config_mtx);
+    auto& profile = RuntimeConfig::get().profiles[profile_];
+    profile.discovered_buckets[bucket] = BucketInfo{std::move(region)};
 }
 
 std::string ProfileConfig::bucket_region(std::string_view bucket) const
@@ -242,12 +252,11 @@ std::string ProfileConfig::bucket_region(std::string_view bucket) const
     return {};
 }
 
-bool ProfileConfig::register_bucket(std::string_view bucket, std::string_view region) const
+bool ProfileConfig::register_bucket(const std::string& bucket, std::string region) const
 {
     std::scoped_lock lock(config_mtx);
     auto& config = RuntimeConfig::get();
-    config.profiles[profile_].registered_buckets[std::string{bucket}] =
-        BucketInfo{std::string{region}};
+    config.profiles[profile_].registered_buckets[bucket] = BucketInfo{std::move(region)};
     return config.flush_to_disk();
 }
 
