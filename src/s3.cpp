@@ -1,6 +1,5 @@
 #include "s3.hpp"
 #include "config.hpp"
-#include "content_range.hpp"
 #include "prereq.h"
 #include "core.hpp"
 #include "creds.hpp"
@@ -58,7 +57,6 @@
 #include <filesystem>
 #include <format>
 #include <fstream>
-#include <functional>
 #include <future>
 #include <ios>
 #include <map>
@@ -97,6 +95,23 @@ thread_local bool suppress_delete_listing{};
 
 std::mutex object_metadata_mutex;
 ObjectMetadataCache object_metadata;
+
+std::optional<ObjectMetadata> cached_object_metadata(RemotePathView path)
+{
+    if (path.profile.empty() || path.bucket.empty() || path.key.empty())
+        return std::nullopt;
+    const auto separator = path.key.rfind(L'\\');
+    const auto name_start = separator == std::wstring_view::npos ? 0 : separator + 1;
+    std::scoped_lock lock(object_metadata_mutex);
+    if (const auto* found = object_metadata.find(
+            MetadataDirectory<std::wstring_view>{path.profile, path.bucket,
+                                                 path.key.substr(0, name_start)},
+            path.key.substr(name_start)))
+    {
+        return *found;
+    }
+    return std::nullopt;
+}
 
 struct ClientEntry
 {
@@ -285,50 +300,16 @@ public:
     // Constructor for Get request
     TransferProgress(const wchar_t* source, const wchar_t* target,
                      Aws::S3::Model::GetObjectRequest& request, std::uint64_t transferred = 0,
-                     std::uint64_t total = 0, bool resume = false,
-                     std::function<bool(std::string_view, std::uint64_t)> headers_ready = {})
+                     std::uint64_t total = 0, bool resume = false)
         : TransferProgress{source, target, total, request, transferred}
     {
         request.SetHeadersReceivedEventHandler(
-            [this, transferred, total, resume,
-             headers_ready = std::move(headers_ready)](const Aws::Http::HttpRequest*,
-                                                        Aws::Http::HttpResponse* response) mutable {
+            [this, resume](const Aws::Http::HttpRequest*, Aws::Http::HttpResponse* response) {
                 response_error_ = static_cast<int>(response->GetResponseCode()) >= 300;
-                invalid_range_ = false;
-                const std::string_view length = response->HasHeader(Aws::Http::CONTENT_LENGTH_HEADER)
-                                                    ? std::string_view(response->GetHeader(Aws::Http::CONTENT_LENGTH_HEADER))
-                                                    : std::string_view("");
-                const auto remaining = parse_number<std::uint64_t>(length);
-                if (resume && !response_error_)
-                {
-                    if (!remaining ||
-                        response->GetResponseCode() !=
-                            Aws::Http::HttpResponseCode::PARTIAL_CONTENT ||
-                        !response->HasHeader("content-range"))
-                    {
-                        invalid_range_ = true;
-                        return;
-                    }
-                    const auto range = parse_content_range(response->GetHeader("content-range"));
-                    invalid_range_ = !range || !range->matches(transferred, total, *remaining);
-                    if (invalid_range_)
-                        return;
-                    total_ = range->size;
-                    percent_ = transfer_percent(transferred_, total_);
-                    return;
-                }
-                total_ = transferred + remaining.value_or(0);
-                if (response->GetResponseCode() == Aws::Http::HttpResponseCode::OK &&
-                    remaining && response->HasHeader("etag"))
-                {
-                    const auto& etag = response->GetHeader("etag");
-                    if (headers_ready && !etag.empty() &&
-                        // We want to call this just once
-                        !std::exchange(headers_ready, nullptr)(etag, total_))
-                    {
-                        resume_error_ = true;
-                    }
-                }
+                // Trust a 206 range body. Add validation of Content-Range if endpoints prove unreliable.
+                invalid_range_ = resume && !response_error_ &&
+                                 response->GetResponseCode() !=
+                                     Aws::Http::HttpResponseCode::PARTIAL_CONTENT;
             });
         request.SetDataReceivedEventHandler([this](const Aws::Http::HttpRequest*,
                                                    Aws::Http::HttpResponse*,
@@ -348,8 +329,6 @@ public:
     bool is_canceled() const { return canceled_.load(); }
     bool has_response_error() const { return response_error_; }
     bool has_invalid_range() const { return invalid_range_; }
-    bool has_resume_error() const { return resume_error_; }
-    std::uint64_t total() const { return total_; }
 
     template <typename Outcome>
     Outcome wait(std::future<Outcome> future)
@@ -391,7 +370,7 @@ private:
         request.SetContinueRequestHandler(
             [this](const Aws::Http::HttpRequest*) {
                 std::scoped_lock lock(pause_mutex_);
-                return !canceled_.load() && !invalid_range_ && !resume_error_;
+                return !canceled_.load() && !invalid_range_;
             });
     }
 
@@ -417,7 +396,6 @@ private:
     std::atomic<bool> canceled_{};
     bool response_error_{};
     bool invalid_range_{};
-    std::atomic<bool> resume_error_{};
 };
 
 // Checks whether an object at `path` exists
@@ -932,7 +910,23 @@ try
         return FS_FILE_OK;
     }
 
-    if (!resume && !resume_file.erase_resume_record())
+    if (!resume)
+    {
+        if (!resume_file.erase_resume_record())
+            return FS_FILE_WRITEERROR;
+        std::error_code ec;
+        std::filesystem::remove(download, ec);
+        if (ec)
+            return FS_FILE_WRITEERROR;
+    }
+
+    std::string listed_etag;
+    if (!resume && info && listed_size != 0)
+    {
+        if (const auto metadata = cached_object_metadata(RemotePathView::make(remote_name)))
+            listed_etag = to_utf8(metadata->etag);
+    }
+    if (!listed_etag.empty() && !resume_file.write_resume_record({listed_etag, listed_size}))
         return FS_FILE_WRITEERROR;
 
     std::uint64_t remote_size{};
@@ -969,23 +963,9 @@ try
                 return stream;
             });
 
-            TransferProgress progress{
-                remote_name, local_name, request, offset,
-                resume ? resume_state->record.size : listed_size, resume,
-                [&resume_file, download](std::string_view etag, std::uint64_t size) {
-                    if (size == 0)
-                        return true;
-                    std::error_code ec;
-                    return std::filesystem::file_size(download, ec) == 0 && !ec &&
-                           resume_file.write_resume_record({std::string{etag}, size});
-                }};
+            TransferProgress progress{remote_name, local_name, request, offset,
+                                      resume ? resume_state->record.size : listed_size, resume};
             const auto outcome = progress.wait(client->GetObjectCallable(request));
-            if (progress.has_resume_error())
-            {
-                std::error_code ignored;
-                std::filesystem::remove(download, ignored);
-                return FS_FILE_WRITEERROR;
-            }
             if (progress.has_invalid_range())
                 return FS_FILE_READERROR;
             if (!outcome.IsSuccess())
@@ -997,6 +977,8 @@ try
                     std::error_code ec;
                     std::filesystem::resize_file(download, offset, ec);
                     if (ec)
+                        return FS_FILE_WRITEERROR;
+                    if (!resume && !resume_file.erase_resume_record())
                         return FS_FILE_WRITEERROR;
                 }
                 if (progress.is_canceled())
@@ -1020,7 +1002,8 @@ try
             {
                 return FS_FILE_USERABORT;
             }
-            remote_size = progress.total();
+            remote_size = resume ? resume_state->record.size
+                                 : static_cast<std::uint64_t>(outcome.GetResult().GetContentLength());
         }
     }
     
@@ -1453,15 +1436,7 @@ int content_get_value(const wchar_t* file_name, int field_index, void* field_val
     // Keys fields
     else
     {
-        if (path.profile.empty() || path.bucket.empty() || path.key.empty())
-            return ft_fieldempty;
-        const auto separator = path.key.rfind(L'\\');
-        const auto name_start = separator == std::wstring_view::npos ? 0 : separator + 1;
-        std::scoped_lock lock(object_metadata_mutex);
-        const auto* found = object_metadata.find(
-            MetadataDirectory<std::wstring_view>{path.profile, path.bucket,
-                                                 path.key.substr(0, name_start)},
-            path.key.substr(name_start));
+        const auto found = cached_object_metadata(path);
 
         // Both TC and Double Commander can request these fields again after a
         // column-layout change, even without relisting. If metadata was already

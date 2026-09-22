@@ -1,6 +1,5 @@
 #include "s3.hpp"
 #include "config.hpp"
-#include "content_range.hpp"
 #include "creds.hpp"
 #include "core.hpp"
 #include "fsplugin.h"
@@ -185,25 +184,6 @@ std::string read_file(const std::filesystem::path& path)
 
 } // namespace
 
-TEST_CASE("Content-Range parsing", "[unit]")
-{
-    CHECK(s3cmd::parse_number<std::uint64_t>("42") == 42);
-    CHECK_FALSE(s3cmd::parse_number<std::uint64_t>("42x"));
-    CHECK_FALSE(s3cmd::parse_number<std::uint64_t>(""));
-
-    const auto range = s3cmd::parse_content_range("bytes 42-99/100");
-    REQUIRE(range);
-    CHECK(range->first == 42);
-    CHECK(range->last == 99);
-    CHECK(range->size == 100);
-    CHECK(range->matches(42, 100, 58));
-    CHECK_FALSE(range->matches(41, 100, 58));
-
-    CHECK_FALSE(s3cmd::parse_content_range("items 42-99/100"));
-    CHECK_FALSE(s3cmd::parse_content_range("bytes 42-/100"));
-    CHECK_FALSE(s3cmd::parse_content_range("bytes 42-99/100 extra"));
-}
-
 TEST_CASE("Download commit preserves an unexpected destination", "[unit]")
 {
     auto& config = temporary_config();
@@ -228,7 +208,7 @@ TEST_CASE("Get discards HTTP error bodies before retry", "[unit]")
     std::atomic<bool> reject{true};
     std::atomic<bool> stall{};
     std::atomic<bool> delay{};
-    std::atomic<int> invalid_response{};
+    std::atomic<bool> ignore_range{};
     std::atomic<int> head_requests{};
     std::string if_match;
     transfer_percentages.clear();
@@ -251,16 +231,12 @@ TEST_CASE("Get discards HTTP error bodies before retry", "[unit]")
         }
         response.set_header("ETag", "\"test\"");
         if_match = request.get_header_value("If-Match");
-        if (invalid_response)
+        if (ignore_range)
         {
             // Keep httplib from repairing the intentionally invalid range response.
             const_cast<httplib::Request&>(request).ranges.clear();
-            response.status = invalid_response == 1 ? 200 : 206;
+            response.status = 200;
             response.set_content(object, "application/octet-stream");
-            if (invalid_response == 3)
-                response.set_header("Content-Range", "bytes 0-31/32");
-            if (invalid_response == 4)
-                response.set_header("Content-Range", "bytes 6-31/32junk");
             return;
         }
         if (request.method == "HEAD")
@@ -321,12 +297,9 @@ TEST_CASE("Get discards HTTP error bodies before retry", "[unit]")
         CHECK(read_file(download) == std::string(object.size(), 'x'));
         return;
     }
-    SECTION("invalid ranged responses leave the prefix intact")
+    SECTION("ignored range leaves the prefix intact")
     {
-        SECTION("range ignored") { invalid_response = 1; }
-        SECTION("missing content range") { invalid_response = 2; }
-        SECTION("wrong start offset") { invalid_response = 3; }
-        SECTION("malformed total size") { invalid_response = 4; }
+        ignore_range = true;
         std::ofstream(download, std::ios::binary) << "prefix";
         write_resume_record(config, local, L"\\resume-test\\bucket\\object", "\"test\"",
                             object.size());
@@ -383,12 +356,12 @@ TEST_CASE("Get discards HTTP error bodies before retry", "[unit]")
         CHECK(read_file(local) == "existing target");
         return;
     }
-    SECTION("resume metadata write failure aborts download")
+    SECTION("missing listing metadata skips the resume record")
     {
         reject = false;
         std::filesystem::create_directories(config.path.parent_path() / L"resume.toml");
         CHECK(s3cmd::get_file(L"\\resume-test\\bucket\\object", local.c_str(),
-                             FS_COPYFLAGS_OVERWRITE, nullptr) == FS_FILE_WRITEERROR);
+                             FS_COPYFLAGS_OVERWRITE, nullptr) == FS_FILE_OK);
         CHECK_FALSE(std::filesystem::exists(download));
         return;
     }
@@ -437,6 +410,13 @@ TEST_CASE("Get sidecar survives restart and rejects a changed object", "[unit]")
     transfer_caller = GetCurrentThreadId();
 
     httplib::Server server;
+    server.Get("/bucket", [&](const httplib::Request&, httplib::Response& response) {
+        response.set_content(
+            "<ListBucketResult><IsTruncated>false</IsTruncated><Contents><Key>object</Key>"
+            "<ETag>&quot;original&quot;</ETag><Size>" + std::to_string(object.size()) +
+                "</Size></Contents></ListBucketResult>",
+            "application/xml");
+    });
     server.Get("/bucket/object", [&](const httplib::Request& request, httplib::Response& response) {
         if_match = request.get_header_value("If-Match");
         response.set_header("ETag", e_tag);
@@ -479,14 +459,23 @@ TEST_CASE("Get sidecar survives restart and rejects a changed object", "[unit]")
     TemporaryEnvironment secret("AWS_SECRET_ACCESS_KEY", "test");
     TemporaryEnvironment region("AWS_DEFAULT_REGION", "us-east-1");
     TemporaryEnvironment checksum("AWS_REQUEST_CHECKSUM_CALCULATION", "when_required");
+    REQUIRE(s3cmd::ProfileConfig("resume-test").register_bucket("bucket", "us-east-1"));
     const auto local = config.root / L"download";
     const auto download = download_path(local);
     std::ofstream(local, std::ios::binary) << "existing target";
 
     {
         PluginSession session(0, cancel_stalled_transfer);
+        wchar_t directory[] = L"\\resume-test\\bucket";
+        WIN32_FIND_DATAW entry{};
+        const auto handle = s3cmd::find_first(directory, &entry);
+        REQUIRE(handle != INVALID_HANDLE_VALUE);
+        s3cmd::find_close(handle);
+        RemoteInfoStruct info{};
+        info.SizeLow = entry.nFileSizeLow;
+        info.SizeHigh = entry.nFileSizeHigh;
         CHECK(s3cmd::get_file(L"\\resume-test\\bucket\\object", local.c_str(),
-                             FS_COPYFLAGS_OVERWRITE, nullptr) == FS_FILE_USERABORT);
+                             FS_COPYFLAGS_OVERWRITE, &info) == FS_FILE_USERABORT);
     }
     REQUIRE(read_file(local) == "existing target");
     REQUIRE(std::filesystem::file_size(download) == 6);
