@@ -6,15 +6,11 @@
 #include <toml++/toml.hpp>
 
 #include <filesystem>
+#include <mutex>
 #include <system_error>
 
 #ifdef _WIN32
 #  include <Windows.h>
-#else
-#  include <cerrno>
-#  include <fcntl.h>
-#  include <sys/file.h>
-#  include <unistd.h>
 #endif
 
 namespace s3cmd {
@@ -23,19 +19,12 @@ namespace {
 
 constexpr std::string_view download_suffix = ".s3cmddownload";
 
+// ponytail: Serializes this process's journal updates. Same-target transfers need sidecar ownership.
+std::mutex resume_mtx;
+
 const std::filesystem::path& resume_path()
 {
     static const auto value = config_directory_path() / "resume.toml";
-    return value;
-}
-
-const std::filesystem::path& resume_lock_path()
-{
-    static const auto value = [] {
-        auto path = resume_path();
-        path += ".lock";
-        return path;
-    }();
     return value;
 }
 
@@ -61,71 +50,6 @@ bool commit_file(const std::filesystem::path& source, const std::filesystem::pat
     return !ec;
 #endif
 }
-
-class ResumeLock
-{
-public:
-    ResumeLock()
-    {
-        std::error_code ec;
-        std::filesystem::create_directories(resume_path().parent_path(), ec);
-        if (ec)
-            throw std::system_error(ec);
-#ifdef _WIN32
-        handle_ = CreateFileW(resume_lock_path().c_str(), GENERIC_READ | GENERIC_WRITE,
-                              FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_ALWAYS,
-                              FILE_ATTRIBUTE_NORMAL, nullptr);
-        if (handle_ == INVALID_HANDLE_VALUE)
-            throw std::system_error(static_cast<int>(GetLastError()), std::system_category());
-        OVERLAPPED overlapped{};
-        if (!LockFileEx(handle_, LOCKFILE_EXCLUSIVE_LOCK, 0, MAXDWORD, MAXDWORD, &overlapped))
-        {
-            const auto error = GetLastError();
-            CloseHandle(handle_);
-            handle_ = INVALID_HANDLE_VALUE;
-            throw std::system_error(static_cast<int>(error), std::system_category());
-        }
-#else
-        handle_ = ::open(resume_lock_path().c_str(), O_CREAT | O_RDWR, 0600);
-        if (handle_ == -1 || ::flock(handle_, LOCK_EX) == -1)
-        {
-            const auto error = errno;
-            if (handle_ != -1)
-                ::close(handle_);
-            handle_ = -1;
-            throw std::system_error(error, std::generic_category());
-        }
-#endif
-    }
-
-    ~ResumeLock()
-    {
-#ifdef _WIN32
-        if (handle_ != INVALID_HANDLE_VALUE)
-        {
-            OVERLAPPED overlapped{};
-            UnlockFileEx(handle_, 0, MAXDWORD, MAXDWORD, &overlapped);
-            CloseHandle(handle_);
-        }
-#else
-        if (handle_ != -1)
-        {
-            ::flock(handle_, LOCK_UN);
-            ::close(handle_);
-        }
-#endif
-    }
-
-    ResumeLock(const ResumeLock&) = delete;
-    ResumeLock& operator=(const ResumeLock&) = delete;
-
-private:
-#ifdef _WIN32
-    HANDLE handle_{INVALID_HANDLE_VALUE};
-#else
-    int handle_{-1};
-#endif
-};
 
 bool write_resume_document(const toml::table& document)
 {
@@ -180,7 +104,7 @@ std::optional<ResumeFile::ResumeState>
 std::optional<ResumeRecord> ResumeFile::read_resume_record() const
 try
 {
-    ResumeLock process_lock;
+    std::scoped_lock lock(resume_mtx);
     const auto document = read_document(resume_path());
     if (!document)
         return std::nullopt;
@@ -212,7 +136,7 @@ catch (...)
 bool ResumeFile::write_resume_record(ResumeRecord record)
 try
 {
-    ResumeLock process_lock;
+    std::scoped_lock lock(resume_mtx);
     auto document = read_document(resume_path()).value_or(toml::table{});
     auto* downloads = document.get_as<toml::table>("downloads");
     if (!downloads)
@@ -234,7 +158,7 @@ catch (...)
 bool ResumeFile::erase_resume_record()
 try
 {
-    ResumeLock process_lock;
+    std::scoped_lock lock(resume_mtx);
     auto document = read_document(resume_path());
     auto* downloads = document ? document->get_as<toml::table>("downloads") : nullptr;
     if (!downloads || downloads->erase(resume_key(local_)) == 0)
