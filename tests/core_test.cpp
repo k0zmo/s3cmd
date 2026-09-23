@@ -204,11 +204,16 @@ TEST_CASE("Download commit preserves an unexpected destination", "[unit]")
 TEST_CASE("Get discards HTTP error bodies before retry", "[unit]")
 {
     auto& config = temporary_config();
+    const auto local = config.root / L"download";
+    auto differently_cased_local = local;
+    differently_cased_local.replace_filename(L"DOWNLOAD");
     std::string object = "prefix and the rest of the object";
     std::atomic<bool> reject{true};
     std::atomic<bool> stall{};
     std::atomic<bool> delay{};
     std::atomic<bool> ignore_range{};
+    std::atomic<bool> probe_duplicate{};
+    std::atomic<int> duplicate_result{-1};
     std::atomic<int> head_requests{};
     std::string if_match;
     transfer_percentages.clear();
@@ -220,6 +225,10 @@ TEST_CASE("Get discards HTTP error bodies before retry", "[unit]")
     const auto respond = [&](const httplib::Request& request, httplib::Response& response) {
         if (request.method == "HEAD")
             ++head_requests;
+        if (probe_duplicate.exchange(false))
+            duplicate_result =
+                s3cmd::get_file(L"\\resume-test\\bucket\\object", differently_cased_local.c_str(),
+                                FS_COPYFLAGS_OVERWRITE, nullptr);
         if (delay)
             std::this_thread::sleep_for(std::chrono::milliseconds(250));
         if (stall)
@@ -273,11 +282,20 @@ TEST_CASE("Get discards HTTP error bodies before retry", "[unit]")
     TemporaryEnvironment checksum("AWS_REQUEST_CHECKSUM_CALCULATION", "when_required");
     PluginSession session(0, cancel_stalled_transfer);
 
-    const auto local = config.root / L"download";
     const auto download = download_path(local);
     std::string prefix;
     int flags{};
     SECTION("new download") {}
+    SECTION("concurrent download to the same destination is rejected")
+    {
+        reject = false;
+        probe_duplicate = true;
+        CHECK(s3cmd::get_file(L"\\resume-test\\bucket\\object", local.c_str(),
+                              FS_COPYFLAGS_OVERWRITE, nullptr) == FS_FILE_OK);
+        CHECK(duplicate_result == FS_FILE_WRITEERROR);
+        CHECK(read_file(local) == object);
+        return;
+    }
     SECTION("new download spans multiple response reads")
     {
         reject = false;

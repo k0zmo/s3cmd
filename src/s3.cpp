@@ -113,6 +113,54 @@ std::optional<ObjectMetadata> cached_object_metadata(RemotePathView path)
     return std::nullopt;
 }
 
+class ActiveDownload
+{
+public:
+    explicit ActiveDownload(const std::filesystem::path& local)
+        : path_(std::filesystem::absolute(local).lexically_normal())
+    {
+        std::scoped_lock lock(active_downloads_mutex_);
+        acquired_ = active_downloads_.insert(path_).second;
+    }
+
+    ~ActiveDownload()
+    {
+        if (acquired_)
+        {
+            std::scoped_lock lock(active_downloads_mutex_);
+            active_downloads_.erase(path_);
+        }
+    }
+
+    ActiveDownload(const ActiveDownload&) = delete;
+    ActiveDownload& operator=(const ActiveDownload&) = delete;
+
+    explicit operator bool() const noexcept { return acquired_; }
+
+    struct DownloadPathLess
+    {
+        bool operator()(const std::filesystem::path& lhs,
+                        const std::filesystem::path& rhs) const
+        {
+#ifdef _WIN32
+            return caseicmp(lhs.c_str(), rhs.c_str()) < 0;
+#else
+            return lhs < rhs;
+#endif
+        }
+    };
+
+private:
+    static std::mutex active_downloads_mutex_;
+    static std::set<std::filesystem::path, DownloadPathLess> active_downloads_;
+
+    std::filesystem::path path_;
+    bool acquired_{};
+};
+std::mutex ActiveDownload::active_downloads_mutex_;
+std::set<std::filesystem::path, ActiveDownload::DownloadPathLess>
+    ActiveDownload::active_downloads_;
+
 struct ClientEntry
 {
     std::shared_ptr<Aws::Auth::AWSCredentialsProvider> credentials;
@@ -846,6 +894,13 @@ int get_file(const wchar_t* remote_name, const wchar_t* local_name, int copy_fla
 try
 {
     const auto local = std::filesystem::path(local_name);
+    const ActiveDownload active_download{local};
+    if (!active_download)
+    {
+        log_error("GetObject", "A download to this destination is already active");
+        return FS_FILE_WRITEERROR;
+    }
+
     const auto remote = to_utf8(remote_name);
     ResumeFile resume_file{local, remote};
 
