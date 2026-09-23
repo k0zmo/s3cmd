@@ -19,7 +19,6 @@ namespace {
 
 constexpr std::string_view download_suffix = ".s3cmddownload";
 
-// ponytail: Serializes this process's journal updates. Same-target transfers need sidecar ownership.
 std::mutex resume_mtx;
 
 const std::filesystem::path& resume_path()
@@ -88,7 +87,10 @@ std::optional<ResumeFile::ResumeState>
 {
     const auto download = download_path();
     ec.clear();
-    if (!std::filesystem::is_regular_file(download, ec) || ec)
+    const auto status = std::filesystem::status(download, ec);
+    if (status.type() == std::filesystem::file_type::not_found)
+        ec.clear();
+    if (ec || !std::filesystem::is_regular_file(status))
         return std::nullopt;
 
     const auto offset = std::filesystem::file_size(download, ec);

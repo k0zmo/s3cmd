@@ -201,6 +201,18 @@ TEST_CASE("Download commit preserves an unexpected destination", "[unit]")
     CHECK_FALSE(std::filesystem::exists(resume.download_path()));
 }
 
+TEST_CASE("Get rejects an untracked local file without a resume state", "[unit]")
+{
+    auto& config = temporary_config();
+    const auto local = config.root / L"download";
+    std::ofstream(local, std::ios::binary) << "partial";
+    PluginSession session;
+
+    CHECK(s3cmd::get_file(L"\\resume-test\\bucket\\object", local.c_str(),
+                          FS_COPYFLAGS_RESUME, nullptr) == FS_FILE_NOTSUPPORTED);
+    CHECK(read_file(local) == "partial");
+}
+
 TEST_CASE("Get discards HTTP error bodies before retry", "[unit]")
 {
     auto& config = temporary_config();
@@ -415,7 +427,7 @@ TEST_CASE("Get discards HTTP error bodies before retry", "[unit]")
     CHECK_FALSE(std::filesystem::exists(download));
 }
 
-TEST_CASE("Get sidecar survives restart and rejects a changed object", "[unit]")
+TEST_CASE("Get resume state survives restart and rejects a changed object", "[unit]")
 {
     auto& config = temporary_config();
     std::string object = "prefix and the rest of the object";
