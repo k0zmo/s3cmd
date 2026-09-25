@@ -201,6 +201,35 @@ TEST_CASE("Download commit preserves an unexpected destination", "[unit]")
     CHECK_FALSE(std::filesystem::exists(resume.download_path()));
 }
 
+TEST_CASE("Plugin initialization prunes invalid resume entries", "[unit]")
+{
+    auto& config = temporary_config();
+    const auto valid = config.root / L"valid";
+    const auto missing = config.root / L"missing";
+    const auto complete = config.root / L"complete";
+    s3cmd::ResumeFile valid_resume{valid, "remote"};
+    s3cmd::ResumeFile missing_resume{missing, "remote"};
+    s3cmd::ResumeFile complete_resume{complete, "remote"};
+    std::ofstream(valid_resume.download_path(), std::ios::binary) << "part";
+    std::ofstream(complete_resume.download_path(), std::ios::binary) << "complete";
+    REQUIRE(valid_resume.write_resume_record({"etag", 8}));
+    REQUIRE(missing_resume.write_resume_record({"etag", 8}));
+    REQUIRE(complete_resume.write_resume_record({"etag", 8}));
+
+    {
+        PluginSession session;
+        const auto document = read_file(config.path.parent_path() / L"resume.toml");
+        const auto key = [](const std::filesystem::path& path) {
+            return s3cmd::to_utf8(std::filesystem::absolute(path).lexically_normal().native());
+        };
+        CHECK(document.find(key(valid)) != std::string::npos);
+        CHECK(document.find(key(missing)) == std::string::npos);
+        CHECK(document.find(key(complete)) == std::string::npos);
+        CHECK(std::filesystem::exists(valid_resume.download_path()));
+        CHECK(std::filesystem::exists(complete_resume.download_path()));
+    }
+}
+
 TEST_CASE("Get rejects an untracked local file without a resume state", "[unit]")
 {
     auto& config = temporary_config();

@@ -766,6 +766,7 @@ int initialize(int number, tProgressProcW progress, tLogProcW log, tRequestProcW
         }
         aws_init_thread_id = std::this_thread::get_id();
         aws_initialized = true;
+        prune_resume_records();
     }
     else
     {

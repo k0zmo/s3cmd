@@ -14,6 +14,8 @@ struct ResumeRecord
     std::uint64_t size{};
 };
 
+void prune_resume_records();
+
 class ResumeFile
 {
 public:

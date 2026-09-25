@@ -8,6 +8,7 @@
 #include <filesystem>
 #include <mutex>
 #include <system_error>
+#include <vector>
 
 #ifdef _WIN32
 #  include <Windows.h>
@@ -74,6 +75,85 @@ std::string resume_key(const std::filesystem::path& path)
 }
 
 } // namespace
+
+void prune_resume_records()
+try
+{
+    std::scoped_lock lock(resume_mtx);
+    auto document = read_document(resume_path());
+    auto* downloads = document ? document->get_as<toml::table>("downloads") : nullptr;
+    if (!downloads)
+        return;
+
+    std::vector<std::string> invalid;
+    for (const auto& [key, node] : *downloads)
+    {
+        const auto* entry = node.as_table();
+        const auto remote = entry ? (*entry)["remote"].value<std::string>() : std::nullopt;
+        const auto etag = entry ? (*entry)["etag"].value<std::string>() : std::nullopt;
+        const auto size = entry ? (*entry)["size"].value<std::int64_t>() : std::nullopt;
+
+        // Check if the entry contains all the necessary information
+        bool remove = !remote || remote->empty() || !etag || etag->empty() ||
+                      !size || *size <= 0;
+
+        if (!remove)
+        {
+            // It does, let's check if the corresponding local file exists anymore
+            try
+            {
+#ifdef _WIN32
+                std::filesystem::path download{to_wide(key.str())};
+#else
+                std::filesystem::path download{key.str()};
+#endif
+                download += download_suffix;
+                std::error_code ec;
+                const auto status = std::filesystem::status(download, ec);
+                if (status.type() == std::filesystem::file_type::not_found)
+                    ec.clear();
+                if (!ec)
+                {
+                    remove = !std::filesystem::is_regular_file(status);
+                    if (!remove)
+                    {
+                        const auto offset = std::filesystem::file_size(download, ec);
+                        if (!ec)
+                            remove = offset >= static_cast<std::uint64_t>(*size);
+                    }
+                }
+            }
+            catch (const std::exception&)
+            {
+                remove = true;
+            }
+        }
+        if (remove)
+            invalid.emplace_back(key.str());
+    }
+
+    if (invalid.empty())
+        return;
+
+    // List is ready, remove the entries and update the journal file
+    for (const auto& key : invalid)
+        downloads->erase(key);
+
+    if (downloads->empty())
+    {
+        // Empty list, we can delete the journal file
+        std::error_code ec;
+        std::filesystem::remove(resume_path(), ec);
+    }
+    else
+    {
+        // Just update it
+        write_resume_document(*document);
+    }
+}
+catch (...)
+{
+}
 
 std::filesystem::path ResumeFile::download_path() const
 {
