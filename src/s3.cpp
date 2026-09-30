@@ -6,6 +6,7 @@
 #include "fsplugin.h"
 #include "log.hpp"
 #include "object_metadata.hpp"
+#include "resume.hpp"
 #include "sso.hpp"
 #include "utils.hpp"
 
@@ -38,14 +39,16 @@
 #include <aws/s3/model/ObjectStorageClass.h>
 #include <aws/s3/model/PutObjectRequest.h>
 
+#include <toml++/toml.hpp>
+
 // FIXME: This should be removed
-#include <Windows.h> // GetCurrentThreadId, SetLastError, GetTempFileNameW, MoveFileExW
+#include <Windows.h> // GetCurrentThreadId, SetLastError
 
 #include <algorithm>
 #include <array>
 #include <atomic>
 #include <cassert>
-#include <charconv>
+#include <chrono>
 #include <cstdint>
 #include <cstring>
 #include <cstdlib>
@@ -54,7 +57,7 @@
 #include <filesystem>
 #include <format>
 #include <fstream>
-#include <functional>
+#include <future>
 #include <ios>
 #include <map>
 #include <memory>
@@ -69,6 +72,8 @@
 #include <thread>
 #include <utility>
 #include <vector>
+
+using namespace std::chrono_literals;
 
 namespace s3cmd {
 
@@ -90,6 +95,71 @@ thread_local bool suppress_delete_listing{};
 
 std::mutex object_metadata_mutex;
 ObjectMetadataCache object_metadata;
+
+std::optional<ObjectMetadata> cached_object_metadata(RemotePathView path)
+{
+    if (path.profile.empty() || path.bucket.empty() || path.key.empty())
+        return std::nullopt;
+    const auto separator = path.key.rfind(L'\\');
+    const auto name_start = separator == std::wstring_view::npos ? 0 : separator + 1;
+    std::scoped_lock lock(object_metadata_mutex);
+    if (const auto* found = object_metadata.find(
+            MetadataDirectory<std::wstring_view>{path.profile, path.bucket,
+                                                 path.key.substr(0, name_start)},
+            path.key.substr(name_start)))
+    {
+        return *found;
+    }
+    return std::nullopt;
+}
+
+class ActiveDownload
+{
+public:
+    explicit ActiveDownload(const std::filesystem::path& local)
+        : path_(std::filesystem::absolute(local).lexically_normal())
+    {
+        std::scoped_lock lock(active_downloads_mutex_);
+        acquired_ = active_downloads_.insert(path_).second;
+    }
+
+    ~ActiveDownload()
+    {
+        if (acquired_)
+        {
+            std::scoped_lock lock(active_downloads_mutex_);
+            active_downloads_.erase(path_);
+        }
+    }
+
+    ActiveDownload(const ActiveDownload&) = delete;
+    ActiveDownload& operator=(const ActiveDownload&) = delete;
+
+    explicit operator bool() const noexcept { return acquired_; }
+
+    struct DownloadPathLess
+    {
+        bool operator()(const std::filesystem::path& lhs,
+                        const std::filesystem::path& rhs) const
+        {
+#ifdef _WIN32
+            return caseicmp(lhs.c_str(), rhs.c_str()) < 0;
+#else
+            return lhs < rhs;
+#endif
+        }
+    };
+
+private:
+    static std::mutex active_downloads_mutex_;
+    static std::set<std::filesystem::path, DownloadPathLess> active_downloads_;
+
+    std::filesystem::path path_;
+    bool acquired_{};
+};
+std::mutex ActiveDownload::active_downloads_mutex_;
+std::set<std::filesystem::path, ActiveDownload::DownloadPathLess>
+    ActiveDownload::active_downloads_;
 
 struct ClientEntry
 {
@@ -264,22 +334,30 @@ bool report_progress(const wchar_t* source, const wchar_t* target, int percent)
     return plugin_host->notify_progress(source, target, percent);
 }
 
-// Notifies totalcmd about the transfer progress. Used in both get and put operations
-// Only calls the calback when value of the progress changes (i.e. from 34% to 35%).
-// Naturally supports pause transfers when totalcmd blocks the `report_progress` function
-// on their end
+// Reserve 100 for a completed transfer, including when a resumed file is already full size.
+int transfer_percent(std::uint64_t transferred, std::uint64_t total)
+{
+    return total == 0 ? 0
+                     : std::min(99, static_cast<int>(std::min(transferred, total) * 100 / total));
+}
+
+// Keep tracks of SDK callbacks that run on AWS SDK worker thread(s)
 class TransferProgress
 {
 public:
     // Constructor for Get request
     TransferProgress(const wchar_t* source, const wchar_t* target,
-                     Aws::S3::Model::GetObjectRequest& request)
-        : TransferProgress{source, target, 0, request}
+                     Aws::S3::Model::GetObjectRequest& request, std::uint64_t transferred = 0,
+                     std::uint64_t total = 0, bool resume = false)
+        : TransferProgress{source, target, total, request, transferred}
     {
         request.SetHeadersReceivedEventHandler(
-            [this](const Aws::Http::HttpRequest*, Aws::Http::HttpResponse* response) {
-                const auto& length = response->GetHeader(Aws::Http::CONTENT_LENGTH_HEADER);
-                std::from_chars(length.data(), length.data() + length.size(), total_);
+            [this, resume](const Aws::Http::HttpRequest*, Aws::Http::HttpResponse* response) {
+                response_error_ = static_cast<int>(response->GetResponseCode()) >= 300;
+                // Trust a 206 range body. Add validation of Content-Range if endpoints prove unreliable.
+                invalid_range_ = resume && !response_error_ &&
+                                 response->GetResponseCode() !=
+                                     Aws::Http::HttpResponseCode::PARTIAL_CONTENT;
             });
         request.SetDataReceivedEventHandler([this](const Aws::Http::HttpRequest*,
                                                    Aws::Http::HttpResponse*,
@@ -289,8 +367,7 @@ public:
     // Constructor for Put request
     TransferProgress(const wchar_t* source, const wchar_t* target,
                      Aws::S3::Model::PutObjectRequest& request)
-        : TransferProgress{source, target,
-                           static_cast<std::uint64_t>(request.GetContentLength()),
+        : TransferProgress{source, target, static_cast<std::uint64_t>(request.GetContentLength()),
                            request}
     {
         request.SetDataSentEventHandler(
@@ -298,49 +375,75 @@ public:
     }
 
     bool is_canceled() const { return canceled_.load(); }
+    bool has_response_error() const { return response_error_; }
+    bool has_invalid_range() const { return invalid_range_; }
+
+    template <typename Outcome>
+    Outcome wait(std::future<Outcome> future)
+    {
+        try
+        {
+            while (future.wait_for(100ms) != std::future_status::ready)
+            {
+                // Pause is implemented by plugin host blocking progress callback.
+                std::scoped_lock lock(pause_mutex_);
+                if (!canceled_ && report_progress(source_, target_, percent_.load()))
+                    canceled_ = true;
+            }
+        }
+        catch (...)
+        {
+            canceled_ = true;
+            // Drain the worker before unwinding - callbacks we set up captured `this`
+            future.wait();
+            throw;
+        }
+        return future.get();
+    }
 
 private:
     // Common constructor for both Get and Put requests
     template <typename Request>
-    TransferProgress(const wchar_t* source, const wchar_t* target,
-                     std::uint64_t total, Request& request)
-        : source_{source}, target_{target}, total_{total}
+    TransferProgress(const wchar_t* source, const wchar_t* target, std::uint64_t total,
+                     Request& request, std::uint64_t transferred = 0)
+        : source_{source},
+          target_{target},
+          total_{total},
+          initial_transferred_{transferred},
+          transferred_{transferred},
+          percent_{transfer_percent(transferred, total)}
     {
         request.SetRequestRetryHandler(
-            [this](const Aws::AmazonWebServiceRequest&) { transferred_ = 0; });
+            [this](const Aws::AmazonWebServiceRequest&) { transferred_ = initial_transferred_; });
         request.SetContinueRequestHandler(
-            [this](const Aws::Http::HttpRequest*) { return !canceled_.load(); });
+            [this](const Aws::Http::HttpRequest*) {
+                std::scoped_lock lock(pause_mutex_);
+                return !canceled_.load() && !invalid_range_;
+            });
     }
 
-    // Calculate percentage of the transfer. Never returns 100 as that's reserved for a completed transfer
-    int transfer_percent(std::uint64_t transferred, std::uint64_t total)
-    {
-        return total == 0
-                   ? 0
-                   : std::min(99, static_cast<int>(std::min(transferred, total) * 100 / total));
-    }
-
-    // Called whenever `bytes` data is transferred. Recalculates a percentage and if it changed
-    // since last time, notifies totalcmd about that.
+    // TC is notified about new value of progress in `wait` function
+    // This is to guarantee we don't call plugin host on different thread that he called us
     void add(long long bytes)
     {
+        std::scoped_lock lock(pause_mutex_);
         if (bytes > 0)
             transferred_ += static_cast<std::uint64_t>(bytes);
         const auto next = transfer_percent(transferred_, total_);
         if (next > percent_)
-        {
             percent_ = next;
-            if (report_progress(source_, target_, percent_))
-                canceled_ = true;
-        }
     }
 
     const wchar_t* source_;
     const wchar_t* target_;
     std::uint64_t total_{};
+    const std::uint64_t initial_transferred_{};
     std::uint64_t transferred_{};
-    int percent_{};
+    std::atomic<int> percent_{};
+    std::mutex pause_mutex_;
     std::atomic<bool> canceled_{};
+    bool response_error_{};
+    bool invalid_range_{};
 };
 
 // Checks whether an object at `path` exists
@@ -663,6 +766,7 @@ int initialize(int number, tProgressProcW progress, tLogProcW log, tRequestProcW
         }
         aws_init_thread_id = std::this_thread::get_id();
         aws_initialized = true;
+        prune_resume_records();
     }
     else
     {
@@ -787,14 +891,65 @@ int execute_file(const wchar_t* remote_name, const wchar_t* verb)
 }
 
 int get_file(const wchar_t* remote_name, const wchar_t* local_name, int copy_flags,
-             [[maybe_unused]] const RemoteInfoStruct* info)
+             const RemoteInfoStruct* info)
 try
 {
-    if ((copy_flags & FS_COPYFLAGS_RESUME) != 0)
-        return FS_FILE_NOTSUPPORTED;
-    if ((copy_flags & FS_COPYFLAGS_OVERWRITE) == 0 && std::filesystem::exists(local_name))
-        return FS_FILE_EXISTS;
-    if (report_progress(remote_name, local_name, 0))
+    const auto local = std::filesystem::path(local_name);
+    const ActiveDownload active_download{local};
+    if (!active_download)
+    {
+        log_error("GetObject", "A download to this destination is already active");
+        return FS_FILE_WRITEERROR;
+    }
+
+    const auto remote = to_utf8(remote_name);
+    ResumeFile resume_file{local, remote};
+
+    const auto download = resume_file.download_path();
+    const auto resume = (copy_flags & FS_COPYFLAGS_RESUME) != 0;
+    const auto listed_size = info ? static_cast<std::uint64_t>(info->SizeLow) |
+                                        (static_cast<std::uint64_t>(info->SizeHigh) << 32)
+                                  : 0;
+    const auto expected_size = info ? std::optional{listed_size} : std::nullopt;
+
+    try
+    {
+        // FIXME: We have the TOCTOU behavior here
+        const auto local_exists = std::filesystem::exists(local);
+        const auto download_exists = std::filesystem::exists(download);
+        if (!resume && ((copy_flags & FS_COPYFLAGS_OVERWRITE) == 0) &&
+            (local_exists || download_exists))
+        {
+            if (download_exists)
+            {
+                std::error_code ec;
+                if (resume_file.resume_state(expected_size, ec))
+                    return FS_FILE_EXISTSRESUMEALLOWED;
+                if (ec)
+                    return FS_FILE_WRITEERROR;
+            }
+            return FS_FILE_EXISTS;
+        }
+    }
+    catch (const std::filesystem::filesystem_error&)
+    {
+        return FS_FILE_WRITEERROR;
+    }
+
+    std::uint64_t offset{};
+    std::optional<ResumeFile::ResumeState> resume_state;
+    if (resume)
+    {
+        std::error_code ec;
+        resume_state = resume_file.resume_state(expected_size, ec);
+        if (ec)
+            return FS_FILE_WRITEERROR;
+        if (!resume_state)
+            return FS_FILE_NOTSUPPORTED;
+        offset = resume_state->offset;
+    }
+    const auto progress_size = resume ? resume_state->record.size : listed_size;
+    if (report_progress(remote_name, local_name, transfer_percent(offset, progress_size)))
         return FS_FILE_USERABORT;
 
     const auto path = RemotePath::make(remote_name);
@@ -811,46 +966,109 @@ try
         return FS_FILE_OK;
     }
 
-    const auto local = std::filesystem::path(local_name);
-    wchar_t temporary[MAX_PATH];
-    if (GetTempFileNameW(local.parent_path().c_str(), L"s3c", 0, temporary) == 0)
-        return FS_FILE_WRITEERROR;
-    const auto partial = std::filesystem::path(temporary);
-    std::error_code ignored;
+    if (!resume)
+    {
+        if (!resume_file.erase_resume_record())
+            return FS_FILE_WRITEERROR;
+        std::error_code ec;
+        std::filesystem::remove(download, ec);
+        if (ec)
+            return FS_FILE_WRITEERROR;
+    }
 
+    std::string listed_etag;
+    if (!resume && info && listed_size != 0)
+    {
+        if (const auto metadata = cached_object_metadata(RemotePathView::make(remote_name)))
+            listed_etag = to_utf8(metadata->etag);
+    }
+    if (!listed_etag.empty() && !resume_file.write_resume_record({listed_etag, listed_size}))
+        return FS_FILE_WRITEERROR;
+
+    std::uint64_t remote_size{};
     {
         AwsLease lease;
         auto client = get_client(path);
-        Aws::S3::Model::GetObjectRequest request;
-        request.SetBucket(path.bucket);
-        request.SetKey(path.key);
-        request.SetResponseStreamFactory([partial] {
-            return Aws::New<std::fstream>("s3cmd", partial,
-                                          std::ios::out | std::ios::binary | std::ios::trunc);
-        });
 
-        TransferProgress progress{remote_name, local_name, request};
-        const auto outcome = client->GetObject(request);
-        if (!outcome.IsSuccess())
         {
-            std::filesystem::remove(partial, ignored);
+            Aws::S3::Model::GetObjectRequest request;
+            request.SetBucket(path.bucket);
+            request.SetKey(path.key);
+            if (resume)
+            {
+                const auto range = std::format("bytes={}-", offset);
+                request.SetRange(range);
+                request.SetIfMatch(resume_state->record.etag);
+            }
+            request.SetResponseStreamFactory([download, offset] {
+                auto stream = Aws::New<std::fstream>("s3cmd");
+                if (offset == 0)
+                {
+                    stream->open(download, std::ios::out | std::ios::binary | std::ios::trunc);
+                }
+                else
+                {
+                    std::error_code ec;
+                    std::filesystem::resize_file(download, offset, ec);
+                    if (!ec)
+                    {
+                        stream->open(download, std::ios::in | std::ios::out | std::ios::binary);
+                        stream->seekp(static_cast<std::streamoff>(offset));
+                    }
+                }
+                return stream;
+            });
+
+            TransferProgress progress{remote_name, local_name, request, offset,
+                                      resume ? resume_state->record.size : listed_size, resume};
+            const auto outcome = progress.wait(client->GetObjectCallable(request));
+            if (progress.has_invalid_range())
+                return FS_FILE_READERROR;
+            if (!outcome.IsSuccess())
+            {
+                // Error bodies use the same stream; only retain bytes from object responses.
+                // Use the received status even if cancellation masks it in the SDK error.
+                if (progress.has_response_error())
+                {
+                    std::error_code ec;
+                    std::filesystem::resize_file(download, offset, ec);
+                    if (ec)
+                        return FS_FILE_WRITEERROR;
+                    if (!resume && !resume_file.erase_resume_record())
+                        return FS_FILE_WRITEERROR;
+                }
+                if (progress.is_canceled())
+                    return FS_FILE_USERABORT;
+                log_aws_error("GetObject", outcome.GetError());
+                if (resume && outcome.GetError().GetResponseCode() ==
+                                  Aws::Http::HttpResponseCode::PRECONDITION_FAILED)
+                {
+                    resume_file.erase_resume_record();
+                    return FS_FILE_NOTSUPPORTED;
+                }
+                if (resume && outcome.GetError().GetResponseCode() ==
+                                  Aws::Http::HttpResponseCode::REQUESTED_RANGE_NOT_SATISFIABLE)
+                    return FS_FILE_NOTSUPPORTED;
+                return outcome.GetError().GetResponseCode() ==
+                               Aws::Http::HttpResponseCode::NOT_FOUND
+                           ? FS_FILE_NOTFOUND
+                           : FS_FILE_READERROR;
+            }
             if (progress.is_canceled())
+            {
                 return FS_FILE_USERABORT;
-            log_aws_error("GetObject", outcome.GetError());
-            return outcome.GetError().GetResponseCode() == Aws::Http::HttpResponseCode::NOT_FOUND
-                       ? FS_FILE_NOTFOUND
-                       : FS_FILE_READERROR;
+            }
+            remote_size = resume ? resume_state->record.size
+                                 : static_cast<std::uint64_t>(outcome.GetResult().GetContentLength());
         }
     }
-
-    auto move_flags = MOVEFILE_WRITE_THROUGH;
-    if ((copy_flags & FS_COPYFLAGS_OVERWRITE) != 0)
-        move_flags |= MOVEFILE_REPLACE_EXISTING;
-    if (!MoveFileExW(partial.c_str(), local_name, move_flags))
-    {
-        std::filesystem::remove(partial, ignored);
+    
+    // Finalize the download operation
+    if (!resume_file.finish_download(remote_size,
+                                     resume || (copy_flags & FS_COPYFLAGS_OVERWRITE) != 0))
         return FS_FILE_WRITEERROR;
-    }
+
+    // Remove the source (remote) file if it's move operation rather than copy
     if ((copy_flags & FS_COPYFLAGS_MOVE) != 0 && !delete_file(remote_name))
         return FS_FILE_WRITEERROR;
 
@@ -873,9 +1091,9 @@ try
     if ((copy_flags & FS_COPYFLAGS_RESUME) != 0)
         return FS_FILE_NOTSUPPORTED;
 
-    std::error_code error;
-    const auto size = std::filesystem::file_size(local_name, error);
-    if (error)
+    std::error_code ec;
+    const auto size = std::filesystem::file_size(local_name, ec);
+    if (ec)
         return FS_FILE_READERROR;
     // FIXME: single-part upload stops at S3's 5 GiB limit
     if (size > max_single_part_size)
@@ -915,7 +1133,7 @@ try
             request.SetIfNoneMatch("*");
 
         TransferProgress progress{local_name, remote_name, request};
-        const auto outcome = client->PutObject(request);
+        const auto outcome = progress.wait(client->PutObjectCallable(request));
         if (!outcome.IsSuccess())
         {
             if (progress.is_canceled())
@@ -926,15 +1144,17 @@ try
                        ? FS_FILE_EXISTS
                        : FS_FILE_WRITEERROR;
         }
+        if (progress.is_canceled())
+            return FS_FILE_USERABORT;
     }
 
     if ((copy_flags & FS_COPYFLAGS_MOVE) != 0)
     {
         log_local_operation("DeleteLocalFile", local_name, false);
-        std::filesystem::remove(local_name, error);
-        if (error)
+        std::filesystem::remove(local_name, ec);
+        if (ec)
         {
-            log_error("Delete local source", std::format("error {}", error.value()));
+            log_error("Delete local source", std::format("error {}", ec.value()));
             return FS_FILE_READERROR;
         }
     }
@@ -1272,15 +1492,7 @@ int content_get_value(const wchar_t* file_name, int field_index, void* field_val
     // Keys fields
     else
     {
-        if (path.profile.empty() || path.bucket.empty() || path.key.empty())
-            return ft_fieldempty;
-        const auto separator = path.key.rfind(L'\\');
-        const auto name_start = separator == std::wstring_view::npos ? 0 : separator + 1;
-        std::scoped_lock lock(object_metadata_mutex);
-        const auto* found = object_metadata.find(
-            MetadataDirectory<std::wstring_view>{path.profile, path.bucket,
-                                                 path.key.substr(0, name_start)},
-            path.key.substr(name_start));
+        const auto found = cached_object_metadata(path);
 
         // Both TC and Double Commander can request these fields again after a
         // column-layout change, even without relisting. If metadata was already

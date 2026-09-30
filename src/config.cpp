@@ -1,10 +1,10 @@
 #include "config.hpp"
+#include "toml.hpp"
 
 #include <toml++/toml.hpp>
 
 #include <cstdlib>
 #include <filesystem>
-#include <fstream>
 #include <mutex>
 #include <optional>
 #include <stdexcept>
@@ -47,31 +47,6 @@ struct RuntimeConfig
 
 std::mutex config_mtx;
 std::optional<RuntimeConfig> runtime_config;
-
-std::optional<toml::table> read_document(const std::filesystem::path& file_path)
-{
-    try
-    {
-        std::ifstream input{file_path};
-        if (input)
-            return toml::parse(input);
-    }
-    catch (const toml::parse_error&)
-    {
-    }
-    return std::nullopt;
-}
-
-bool write_document(const toml::table& document, const std::filesystem::path& file_path)
-{
-    std::error_code ec;
-    std::filesystem::create_directories(file_path.parent_path(), ec);
-    if (ec)
-        return false;
-
-    std::ofstream output(file_path, std::ios::trunc);
-    return output && (output << document) && output.flush();
-}
 
 RuntimeConfig& RuntimeConfig::get()
 {
