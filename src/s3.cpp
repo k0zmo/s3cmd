@@ -605,7 +605,22 @@ private:
         pc.set_discovered_buckets(discovered ? buckets : BucketMap{});
 
         if (!discovered)
+        {
             append_entry("_F7=register bucket.txt", /*directory=*/false);
+
+            if (buckets.empty() && plugin_host->is_notify_message_box_available() &&
+                pc.take_bucket_registration_hint())
+            {
+                plugin_host->notify_message_box(
+                    PluginHost::message_box_type::msg_ok, L"Register S3 bucket",
+                    L"Cannot list buckets for AWS profile '{}'.\n\n"
+                    L"Press F7 in this profile and enter an existing bucket name. "
+                    L"The plugin finds its region or asks you to enter it.\n\n"
+                    L"This registers the bucket locally. It does not create a bucket in AWS.",
+                    to_wide(path.profile));
+            }
+        }
+
         for (const auto& [name, bucket] : buckets)
             append_entry(name, /*directory=*/true, 0, bucket.created);
     }

@@ -30,6 +30,7 @@ struct RuntimeConfig
         BucketMap registered_buckets;
         BucketMap discovered_buckets;
         bool has_discovered_buckets{};
+        bool bucket_registration_hint_shown{};
     };
 
     bool dry_run{false};
@@ -69,12 +70,15 @@ RuntimeConfig& RuntimeConfig::get()
             for (const auto& [name, profile] : *profiles)
             {
                 const auto* profile_table = profile.as_table();
-                const auto* buckets =
-                    profile_table ? profile_table->get_as<toml::table>("buckets") : nullptr;
+                if (!profile_table)
+                    continue;
+                auto& settings = runtime_config->profiles[std::string(name.str())];
+                settings.bucket_registration_hint_shown =
+                    (*profile_table)["BucketRegistrationHintShown"].value_or(false);
+                const auto* buckets = profile_table->get_as<toml::table>("buckets");
                 if (!buckets)
                     continue;
-                auto& registered =
-                    runtime_config->profiles[std::string(name.str())].registered_buckets;
+                auto& registered = settings.registered_buckets;
                 for (const auto& [bucket, region] : *buckets)
                 {
                     if (const auto value = region.value<std::string>())
@@ -99,7 +103,7 @@ bool RuntimeConfig::flush_to_disk()
     toml::table profile_tables;
     for (const auto& [profile_name, profile] : profiles)
     {
-        if (profile.registered_buckets.empty())
+        if (profile.registered_buckets.empty() && !profile.bucket_registration_hint_shown)
             continue;
 
         toml::table bucket_map;
@@ -107,6 +111,8 @@ bool RuntimeConfig::flush_to_disk()
             bucket_map.emplace(bucket_name, bucket_info.region);
 
         toml::table profile_table;
+        if (profile.bucket_registration_hint_shown)
+            profile_table.emplace("BucketRegistrationHintShown", true);
         profile_table.emplace("buckets", std::move(bucket_map));
         profile_tables.emplace(profile_name, std::move(profile_table));
     }
@@ -180,6 +186,18 @@ BucketMap ProfileConfig::registered_buckets() const
     const auto profile = config.profiles.find(profile_);
     return profile == config.profiles.end() ? BucketMap{}
                                             : profile->second.registered_buckets;
+}
+
+bool ProfileConfig::take_bucket_registration_hint() const
+{
+    std::scoped_lock lock(config_mtx);
+    auto& config = RuntimeConfig::get();
+    auto& profile = config.profiles[profile_];
+    if (profile.bucket_registration_hint_shown || !profile.registered_buckets.empty())
+        return false;
+    profile.bucket_registration_hint_shown = true;
+    config.flush_to_disk();
+    return true;
 }
 
 bool ProfileConfig::has_discovered_buckets() const

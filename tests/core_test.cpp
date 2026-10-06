@@ -964,6 +964,89 @@ TEST_CASE("Object metadata retention is bounded by entry count", "[unit]")
     }
 }
 
+TEST_CASE("Bucket listing shows a registration hint once per empty profile", "[unit]")
+{
+    temporary_config();
+    bool listing_allowed{};
+    bool registered{};
+    bool callback_available{true};
+    SECTION("empty fallback shows a persistent hint") {}
+    SECTION("successful empty listing needs no hint") { listing_allowed = true; }
+    SECTION("registered fallback needs no hint") { registered = true; }
+    SECTION("missing callback does not consume the hint") { callback_available = false; }
+
+    httplib::Server server;
+    server.Get("/", [&](const httplib::Request&, httplib::Response& response) {
+        if (listing_allowed)
+            response.set_content("<ListAllMyBucketsResult><Buckets/></ListAllMyBucketsResult>",
+                                 "application/xml");
+        else
+        {
+            response.status = 403;
+            response.set_content("<Error><Code>AccessDenied</Code><Message>test</Message></Error>",
+                                 "application/xml");
+        }
+    });
+    const auto port = server.bind_to_any_port("127.0.0.1");
+    REQUIRE(port > 0);
+    std::jthread worker([&](std::stop_token stop) {
+        std::stop_callback shutdown(stop, [&] { server.stop(); });
+        server.listen_after_bind();
+    });
+    server.wait_until_ready();
+    const auto endpoint = "http://127.0.0.1:" + std::to_string(port);
+    TemporaryEnvironment url("AWS_ENDPOINT_URL_S3", endpoint.c_str());
+    TemporaryEnvironment endpoints("AWS_IGNORE_CONFIGURED_ENDPOINT_URLS", "false");
+    TemporaryEnvironment access("AWS_ACCESS_KEY_ID", "test");
+    TemporaryEnvironment secret("AWS_SECRET_ACCESS_KEY", "test");
+    TemporaryEnvironment region("AWS_DEFAULT_REGION", "us-east-1");
+    if (registered)
+        REQUIRE(s3cmd::ProfileConfig("work").register_bucket("private-bucket", "us-east-1"));
+
+    request_count = 0;
+    request_accept = true;
+    {
+        PluginSession session(0, nullptr, nullptr, callback_available ? capture_request : nullptr);
+        for (int refresh = 0; refresh < 2; ++refresh)
+        {
+            WIN32_FIND_DATAW entry{};
+            const auto handle = s3cmd::find_first(L"\\work", &entry);
+            if (registered)
+            {
+                REQUIRE(handle != INVALID_HANDLE_VALUE);
+                CHECK(std::wstring_view(entry.cFileName) == L"private-bucket");
+                CHECK_FALSE(s3cmd::find_next(handle, &entry));
+                s3cmd::find_close(handle);
+            }
+            else
+            {
+                CHECK(handle == INVALID_HANDLE_VALUE);
+                CHECK(GetLastError() == ERROR_NO_MORE_FILES);
+            }
+        }
+        const bool expect_hint = !listing_allowed && !registered && callback_available;
+        CHECK(request_count == (expect_hint ? 1 : 0));
+        if (expect_hint)
+        {
+            CHECK(request_type == RT_MsgOK);
+            CHECK(request_text.find(L"work") != request_text.npos);
+            CHECK(request_text.find(L"F7") != request_text.npos);
+            CHECK(request_text.find(L"existing bucket") != request_text.npos);
+        }
+    }
+    PluginSession restarted(0, nullptr, nullptr, capture_request);
+    WIN32_FIND_DATAW entry{};
+    const auto handle = s3cmd::find_first(L"\\work", &entry);
+    if (handle != INVALID_HANDLE_VALUE)
+        s3cmd::find_close(handle);
+    CHECK(request_count == (listing_allowed || registered ? 0 : 1));
+    if (!listing_allowed && !registered)
+    {
+        CHECK(s3cmd::find_first(L"\\other", &entry) == INVALID_HANDLE_VALUE);
+        CHECK(request_count == 2);
+    }
+}
+
 TEST_CASE("ListObjectsV2 metadata is exposed as content fields", "[unit]")
 {
     temporary_config();

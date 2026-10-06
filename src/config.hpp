@@ -32,6 +32,7 @@ public:
     }
 
     BucketMap registered_buckets() const;
+    bool take_bucket_registration_hint() const;
     bool has_discovered_buckets() const;
     void set_discovered_buckets(BucketMap buckets) const;
     void cache_bucket_region(const std::string& bucket, std::string region) const;

@@ -59,7 +59,7 @@ Plugin paths have this form:
 \\profile\\bucket\\object
 ```
 
-If AWS denies `ListBuckets`, the profile view shows `_F7=register bucket.txt`.
+If bucket listing fails and the profile has no registered buckets, the plugin shows a registration hint once per profile.
 Press F7 and then enter an existing bucket name. The plugin finds its region or asks you to enter it.
 
 Bucket registration is stored locally. F7 does not create an S3 bucket and removing a registered bucket doesn't delete it from AWS.
