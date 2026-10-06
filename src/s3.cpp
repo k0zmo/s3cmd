@@ -80,6 +80,7 @@ namespace s3cmd {
 namespace {
 
 constexpr std::uint64_t max_single_part_size = 5ULL * 1024 * 1024 * 1024;
+constexpr std::wstring_view add_existing_bucket_entry = L"_Add existing bucket_";
 
 std::shared_mutex aws_lifecycle_mtx;
 Aws::SDKOptions aws_options;
@@ -606,7 +607,7 @@ private:
 
         if (!discovered)
         {
-            append_entry("_F7=register bucket.txt", /*directory=*/false);
+            append_entry(to_utf8(add_existing_bucket_entry), /*directory=*/false);
 
             if (buckets.empty() && plugin_host->is_notify_message_box_available() &&
                 pc.take_bucket_registration_hint())
@@ -614,10 +615,10 @@ private:
                 plugin_host->notify_message_box(
                     PluginHost::message_box_type::msg_ok, L"Register S3 bucket",
                     L"Cannot list buckets for AWS profile '{}'.\n\n"
-                    L"Press F7 in this profile and enter an existing bucket name. "
+                    L"Open '{}' in this profile and enter the bucket name. "
                     L"The plugin finds its region or asks you to enter it.\n\n"
                     L"This registers the bucket locally. It does not create a bucket in AWS.",
-                    to_wide(path.profile));
+                    to_wide(path.profile), add_existing_bucket_entry);
             }
         }
 
@@ -881,7 +882,8 @@ void status_info(const wchar_t* remote_directory, int start_end, int operation)
     suppress_delete_listing = path.bucket.empty();
 }
 
-int execute_file(const wchar_t* remote_name, const wchar_t* verb)
+int execute_file(wchar_t* remote_name, const wchar_t* verb)
+try
 {
     if (!remote_name || !verb)
         return FS_EXEC_ERROR;
@@ -889,6 +891,34 @@ int execute_file(const wchar_t* remote_name, const wchar_t* verb)
     if (caseicmp(verb, L"open") == 0)
     {
         const auto path = RemotePathView::make(remote_name);
+        if (!path.profile.empty() && path.bucket == add_existing_bucket_entry && path.key.empty())
+        {
+            if (!plugin_host || !plugin_host->is_notify_message_box_available())
+                return FS_EXEC_ERROR;
+
+            std::wstring name(64, L'\0');
+            if (!plugin_host->notify_message_box_result(PluginHost::message_box_type::other,
+                                                        L"Add existing bucket",
+                                                        L"Existing S3 bucket name:", name))
+            {
+                return FS_EXEC_ERROR;
+            }
+
+            const std::wstring_view bucket(name.c_str());
+            if (bucket.empty() || bucket == L"." || bucket == L".." ||
+                bucket.find_first_of(L"\\/") != bucket.npos)
+            {
+                return FS_EXEC_ERROR;
+            }
+
+            const auto bucket_path = std::format(L"\\{}\\{}", path.profile, bucket);
+            if (!make_directory(bucket_path.c_str()))
+                return FS_EXEC_ERROR;
+
+            // FS_EXEC_OK does not refresh after "open". Redirect to the profile listing.
+            remote_name[path.profile.data() + path.profile.size() - remote_name] = L'\0';
+            return FS_EXEC_SYMLINK;
+        }
         if (path.profile.empty() || path.bucket.empty() || path.key.empty())
             return FS_EXEC_OK;
         return FS_EXEC_YOURSELF;
@@ -902,6 +932,11 @@ int execute_file(const wchar_t* remote_name, const wchar_t* verb)
     {
         log("Unknown verb to execute file: {} for file: {}", to_utf8(verb), to_utf8(remote_name));
     }
+    return FS_EXEC_ERROR;
+}
+catch (const std::exception& error)
+{
+    log_unexpected("FsExecuteFileW", error);
     return FS_EXEC_ERROR;
 }
 

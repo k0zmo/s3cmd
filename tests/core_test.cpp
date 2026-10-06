@@ -39,6 +39,7 @@ int request_count{};
 int request_type{};
 bool request_accept{true};
 std::wstring request_text;
+std::vector<std::wstring> request_inputs;
 std::wstring log_text;
 std::atomic<bool> transfer_waiting{};
 std::atomic<bool> transfer_canceled{};
@@ -62,6 +63,18 @@ BOOL __stdcall capture_request(int, int type, wchar_t*, wchar_t* text, wchar_t*,
     request_type = type;
     request_text = text ? text : L"";
     return request_accept;
+}
+
+BOOL __stdcall answer_request(int number, int type, wchar_t* title, wchar_t* text,
+                              wchar_t* out, int max_length)
+{
+    if (!capture_request(number, type, title, text, out, max_length) ||
+        static_cast<std::size_t>(request_count) > request_inputs.size())
+    {
+        return FALSE;
+    }
+    wcsncpy_s(out, max_length, request_inputs[request_count - 1].c_str(), _TRUNCATE);
+    return TRUE;
 }
 
 void __stdcall capture_log(int, int type, wchar_t* text)
@@ -760,11 +773,111 @@ TEST_CASE("directory prefixes use S3 separators", "[unit]")
 
 TEST_CASE("remote files are delegated to the host for opening", "[unit]")
 {
-    CHECK(s3cmd::execute_file(L"\\work\\bucket\\file.txt", L"open") == FS_EXEC_YOURSELF);
-    CHECK(s3cmd::execute_file(L"\\work\\bucket\\file.txt", L"OPEN") == FS_EXEC_YOURSELF);
-    CHECK(s3cmd::execute_file(L"\\work\\bucket", L"open") == FS_EXEC_OK);
-    CHECK(s3cmd::execute_file(L"\\work\\bucket\\file.txt", L"properties") == FS_EXEC_YOURSELF);
-    CHECK(s3cmd::execute_file(L"\\work\\bucket\\file.txt", L"MODE I") == FS_EXEC_YOURSELF);
+    wchar_t object[] = L"\\work\\bucket\\file.txt";
+    wchar_t bucket[] = L"\\work\\bucket";
+    wchar_t named_object[] = L"\\work\\bucket\\_Add existing bucket_";
+    CHECK(s3cmd::execute_file(object, L"open") == FS_EXEC_YOURSELF);
+    CHECK(s3cmd::execute_file(object, L"OPEN") == FS_EXEC_YOURSELF);
+    CHECK(s3cmd::execute_file(bucket, L"open") == FS_EXEC_OK);
+    CHECK(s3cmd::execute_file(object, L"properties") == FS_EXEC_YOURSELF);
+    CHECK(s3cmd::execute_file(object, L"MODE I") == FS_EXEC_YOURSELF);
+    CHECK(s3cmd::execute_file(named_object, L"open") == FS_EXEC_YOURSELF);
+}
+
+TEST_CASE("Add existing bucket opens a local registration prompt", "[unit]")
+{
+    auto& config = temporary_config();
+    request_count = 0;
+    request_accept = true;
+    request_inputs = {L"existing-bucket"};
+    bool location_allowed{true};
+    bool callback_available{true};
+    bool dry_run{};
+    bool expect_registration{true};
+    SECTION("discovers the region and persists registration") {}
+    SECTION("asks for the region when discovery fails")
+    {
+        location_allowed = false;
+        request_inputs.push_back(L"eu-west-1");
+    }
+    SECTION("cancel leaves the registry unchanged")
+    {
+        request_accept = false;
+        expect_registration = false;
+    }
+    SECTION("empty input leaves the registry unchanged")
+    {
+        request_inputs = {L""};
+        expect_registration = false;
+    }
+    SECTION("a path cannot register a directory marker")
+    {
+        request_inputs = {L"existing-bucket/folder"};
+        expect_registration = false;
+    }
+    SECTION("a missing callback fails without discovery")
+    {
+        callback_available = false;
+        expect_registration = false;
+    }
+    SECTION("dry run discovers the region without persisting registration")
+    {
+        dry_run = true;
+        std::filesystem::create_directories(config.path.parent_path());
+        std::ofstream file(config.path);
+        file << "[settings]\nDryRun = true\n";
+    }
+
+    std::atomic<int> location_requests{};
+    std::atomic<bool> saw_location_query{};
+    httplib::Server server;
+    server.Get("/existing-bucket", [&](const httplib::Request& request, httplib::Response& response) {
+        ++location_requests;
+        saw_location_query = request.has_param("location");
+        if (location_allowed)
+            response.set_content("<LocationConstraint>eu-west-1</LocationConstraint>",
+                                 "application/xml");
+        else
+        {
+            response.status = 403;
+            response.set_content("<Error><Code>AccessDenied</Code><Message>test</Message></Error>",
+                                 "application/xml");
+        }
+    });
+    const auto port = server.bind_to_any_port("127.0.0.1");
+    REQUIRE(port > 0);
+    std::jthread worker([&](std::stop_token stop) {
+        std::stop_callback shutdown(stop, [&] { server.stop(); });
+        server.listen_after_bind();
+    });
+    server.wait_until_ready();
+    const auto endpoint = "http://127.0.0.1:" + std::to_string(port);
+    TemporaryEnvironment url("AWS_ENDPOINT_URL_S3", endpoint.c_str());
+    TemporaryEnvironment endpoints("AWS_IGNORE_CONFIGURED_ENDPOINT_URLS", "false");
+    TemporaryEnvironment access("AWS_ACCESS_KEY_ID", "test");
+    TemporaryEnvironment secret("AWS_SECRET_ACCESS_KEY", "test");
+    TemporaryEnvironment region("AWS_DEFAULT_REGION", "us-east-1");
+    PluginSession session(0, nullptr, nullptr, callback_available ? answer_request : nullptr);
+
+    wchar_t remote_name[] = L"\\work\\_Add existing bucket_";
+    CHECK(s3cmd::execute_file(remote_name, L"OPEN") ==
+          (expect_registration ? FS_EXEC_SYMLINK : FS_EXEC_ERROR));
+    CHECK(std::wstring_view(remote_name) ==
+          (expect_registration ? L"\\work" : L"\\work\\_Add existing bucket_"));
+    CHECK(request_count == (callback_available ? (location_allowed ? 1 : 2) : 0));
+    CHECK(location_requests == (expect_registration ? 1 : 0));
+    CHECK(saw_location_query == expect_registration);
+    const s3cmd::ProfileConfig profile("work");
+    const auto registered = profile.registered_buckets();
+    if (expect_registration && !dry_run)
+    {
+        REQUIRE(registered.contains("existing-bucket"));
+        CHECK(registered.at("existing-bucket").region == "eu-west-1");
+        s3cmd::reset_config();
+        CHECK(profile.registered_buckets().contains("existing-bucket"));
+    }
+    else
+        CHECK(registered.empty());
 }
 
 TEST_CASE("bucket registry only unregisters registered buckets", "[unit]")
@@ -1011,10 +1124,16 @@ TEST_CASE("Bucket listing shows a registration hint once per empty profile", "[u
         {
             WIN32_FIND_DATAW entry{};
             const auto handle = s3cmd::find_first(L"\\work", &entry);
-            if (registered)
+            if (!listing_allowed)
             {
                 REQUIRE(handle != INVALID_HANDLE_VALUE);
-                CHECK(std::wstring_view(entry.cFileName) == L"private-bucket");
+                CHECK(std::wstring_view(entry.cFileName) == L"_Add existing bucket_");
+                CHECK_FALSE(entry.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY);
+                if (registered)
+                {
+                    REQUIRE(s3cmd::find_next(handle, &entry));
+                    CHECK(std::wstring_view(entry.cFileName) == L"private-bucket");
+                }
                 CHECK_FALSE(s3cmd::find_next(handle, &entry));
                 s3cmd::find_close(handle);
             }
@@ -1030,7 +1149,7 @@ TEST_CASE("Bucket listing shows a registration hint once per empty profile", "[u
         {
             CHECK(request_type == RT_MsgOK);
             CHECK(request_text.find(L"work") != request_text.npos);
-            CHECK(request_text.find(L"F7") != request_text.npos);
+            CHECK(request_text.find(L"_Add existing bucket_") != request_text.npos);
             CHECK(request_text.find(L"existing bucket") != request_text.npos);
         }
     }
@@ -1042,7 +1161,9 @@ TEST_CASE("Bucket listing shows a registration hint once per empty profile", "[u
     CHECK(request_count == (listing_allowed || registered ? 0 : 1));
     if (!listing_allowed && !registered)
     {
-        CHECK(s3cmd::find_first(L"\\other", &entry) == INVALID_HANDLE_VALUE);
+        const auto other = s3cmd::find_first(L"\\other", &entry);
+        REQUIRE(other != INVALID_HANDLE_VALUE);
+        s3cmd::find_close(other);
         CHECK(request_count == 2);
     }
 }
