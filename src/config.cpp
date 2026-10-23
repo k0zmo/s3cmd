@@ -266,4 +266,14 @@ bool ProfileConfig::unregister_bucket(std::string_view bucket) const
     return false;
 }
 
+bool ProfileConfig::forget_bucket(std::string_view bucket) const
+{
+    std::scoped_lock lock(config_mtx);
+    auto& config = RuntimeConfig::get();
+    auto& profile = config.profiles[profile_];
+    const std::string name(bucket);
+    profile.discovered_buckets.erase(name);
+    return !profile.registered_buckets.erase(name) || config.flush_to_disk();
+}
+
 } // namespace s3cmd

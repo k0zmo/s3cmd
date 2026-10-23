@@ -21,6 +21,7 @@ if(S3CMD_USING_CONAN)
         COMPONENTS
             aws-sdk-cpp-s3
             aws-sdk-cpp-sso-oidc
+            aws-sdk-cpp-sts
     )
 else()
     find_package(AWSSDK CONFIG REQUIRED
@@ -28,6 +29,7 @@ else()
             core
             s3
             sso-oidc
+            sts
     )
 endif()
 
@@ -37,15 +39,16 @@ find_package(httplib CONFIG REQUIRED)
 add_library(s3cmd-core STATIC
     src/fsplugin.h
     src/prereq.h
-    src/config.hpp        src/config.cpp
-    src/core.hpp          src/core.cpp
-    src/creds.hpp         src/creds.cpp
-    src/log.cpp           src/log.hpp
-    src/resume.cpp        src/resume.hpp
-    src/s3.cpp            src/s3.hpp
-    src/sso.cpp           src/sso.hpp
-    src/toml.cpp          src/toml.hpp
-    src/utils.hpp         src/utils.cpp
+    src/config.hpp                 src/config.cpp
+    src/core.hpp                   src/core.cpp
+    src/bucket_creation_dialog.hpp src/bucket_creation_dialog.cpp
+    src/creds.hpp                  src/creds.cpp
+    src/log.cpp                    src/log.hpp
+    src/resume.cpp                 src/resume.hpp
+    src/s3.cpp                     src/s3.hpp
+    src/sso.cpp                    src/sso.hpp
+    src/toml.cpp                   src/toml.hpp
+    src/utils.hpp                  src/utils.cpp
 )
 target_compile_features(s3cmd-core PUBLIC cxx_std_20)
 target_compile_definitions(s3cmd-core PUBLIC NOMINMAX WIN32_LEAN_AND_MEAN)
@@ -59,12 +62,14 @@ if(TARGET AWS::aws-sdk-cpp-s3)
     target_link_libraries(s3cmd-core PUBLIC
         AWS::aws-sdk-cpp-s3
         AWS::aws-sdk-cpp-sso-oidc
+        AWS::aws-sdk-cpp-sts
     )
 else()
     target_link_libraries(s3cmd-core PUBLIC
         aws-cpp-sdk-core
         aws-cpp-sdk-s3
         aws-cpp-sdk-sso-oidc
+        aws-cpp-sdk-sts
     )
 endif()
 if(WIN32)
@@ -77,7 +82,7 @@ add_library(s3cmd MODULE
     src/s3cmd.def
 )
 if(WIN32)
-    target_sources(s3cmd PRIVATE src/s3cmd.rc)
+    target_sources(s3cmd PRIVATE src/s3cmd.rc src/bucket_creation_dialog.rc)
 endif()
 target_compile_features(s3cmd PRIVATE cxx_std_20)
 target_compile_definitions(s3cmd PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
@@ -113,6 +118,9 @@ if(BUILD_TESTING)
         tests/aws_test.cpp
         tests/core_test.cpp
     )
+    if(WIN32)
+        target_sources(s3cmd-test PRIVATE src/bucket_creation_dialog.rc)
+    endif()
     target_link_libraries(s3cmd-test PRIVATE
         s3cmd-core
         Catch2::Catch2WithMain

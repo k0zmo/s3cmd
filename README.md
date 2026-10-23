@@ -61,9 +61,16 @@ Plugin paths have this form:
 
 If bucket listing fails and the profile has no registered buckets, the plugin shows a registration hint once per profile.
 When bucket listing fails, open `_Add existing bucket_` in the profile and enter the bucket name.
-The plugin finds its region or asks you to enter it. You can also register a bucket with F7.
+The plugin finds its region or asks you to enter it. Registration only stores the bucket locally.
 
-Bucket registration is stored locally. F7 does not create an S3 bucket and removing a registered bucket doesn't delete it from AWS.
+At profile level, F7 creates an S3 bucket and registers it locally.
+The Create bucket dialog starts with the Global namespace and the AWS profile's region.
+Choose a region from the editable dropdown, or type a region code.
+Select Account regional to reserve the name for your AWS account and selected region.
+The plugin obtains your account ID and previews the full name, such as `test-111122223333-eu-west-1-an`.
+Change the region to update the preview before you select Create.
+F8 or Delete deletes a bucket from AWS only if it is empty, including all object versions and delete markers.
+The plugin never deletes bucket contents as part of a bucket deletion.
 
 The plugin exposes `Region` for bucket entries and `Storage class` plus `ETag` for object entries as Total Commander content fields. Add them to a custom-column view when needed.
 
@@ -87,7 +94,8 @@ The plugin exposes `Region` for bucket entries and `Storage class` plus `ETag` f
 - Deletes objects and directory markers.
 - Creates S3 directory markers for directories created with F7.
 - Removes a directory marker only after the directory contents are removed.
-- Registers and unregisters existing buckets when automatic bucket discovery is unavailable.
+- Registers existing buckets when automatic bucket discovery is unavailable.
+- Creates S3 buckets in a selected region and deletes empty buckets.
 - Exposes `Region`, `Storage class`, and `ETag` as content fields.
 - Reuses S3 clients and supports concurrent background transfers during one plugin session.
 - Resumes interrupted downloads only while the source object still has the recorded ETag.
@@ -133,7 +141,7 @@ This setting does not override `AWS_EC2_METADATA_DISABLED=true`.
 - S3 copy, rename, and move operations cannot exceed 5 GiB.
 - S3 copy, rename, and move progress changes directly from 0% to 100%.
 - Directory rename and directory move are not supported.
-- The plugin does not create or delete S3 buckets. It only registers existing buckets when discovery is unavailable.
+- Bucket creation and deletion support general-purpose S3 buckets only.
 
 ## Build
 

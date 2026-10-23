@@ -39,6 +39,7 @@ public:
     std::string bucket_region(std::string_view bucket) const;
     bool register_bucket(const std::string& bucket, std::string region) const;
     bool unregister_bucket(std::string_view bucket) const;
+    bool forget_bucket(std::string_view bucket) const;
 
 private:
     std::string profile_;

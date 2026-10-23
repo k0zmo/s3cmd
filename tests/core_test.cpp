@@ -1,4 +1,6 @@
 #include "s3.hpp"
+#include "bucket_creation_dialog.hpp"
+#include "resource.h"
 #include "config.hpp"
 #include "creds.hpp"
 #include "core.hpp"
@@ -21,6 +23,7 @@
 #include <Windows.h> // GetCurrentProcessId, GetTickCount64, SetLastError, GetLastError
 
 #include <atomic>
+#include <array>
 #include <chrono>
 #include <cstdlib>
 #include <filesystem>
@@ -694,6 +697,58 @@ TEST_CASE("credential chain preserves provider order and gates IMDS", "[unit]")
     }
 }
 
+TEST_CASE("bucket creation lets an invalid initial name be corrected", "[unit]")
+{
+    bool account_regional = false;
+    std::string initial = "Invalid_Name";
+    SECTION("global bucket") {}
+    SECTION("account regional bucket") { account_regional = true; }
+    SECTION("overlong initial name") { initial.assign(80, 'a'); }
+
+    bool exercised = false;
+    static std::function<void(HWND)> exercise;
+    exercise = [&](HWND dialog) {
+        exercised = true;
+        std::array<wchar_t, 128> text{};
+        GetDlgItemTextW(dialog, IDC_BUCKET_PREFIX, text.data(), static_cast<int>(text.size()));
+        CHECK(s3cmd::to_utf8(text.data()) == initial);
+        CHECK_FALSE(IsWindowEnabled(GetDlgItem(dialog, IDOK)));
+        CHECK(GetWindowTextLengthW(GetDlgItem(dialog, IDC_BUCKET_ERROR)) > 0);
+
+        SetDlgItemTextW(dialog, IDC_BUCKET_PREFIX, L"corrected-bucket");
+        CHECK(IsWindowEnabled(GetDlgItem(dialog, IDOK)));
+        CHECK(GetWindowTextLengthW(GetDlgItem(dialog, IDC_BUCKET_ERROR)) == 0);
+        if (account_regional)
+        {
+            SendDlgItemMessageW(dialog, IDC_BUCKET_NAMESPACE, CB_SETCURSEL, 1, 0);
+            SendMessageW(dialog, WM_COMMAND,
+                         MAKEWPARAM(IDC_BUCKET_NAMESPACE, CBN_SELCHANGE), 0);
+        }
+        GetDlgItemTextW(dialog, IDC_BUCKET_PREVIEW, text.data(), static_cast<int>(text.size()));
+        CHECK(std::wstring_view(text.data()) ==
+              (account_regional ? L"corrected-bucket-123456789012-eu-central-1-an"
+                                : L"corrected-bucket"));
+        SendMessageW(dialog, WM_COMMAND, IDOK, 0);
+    };
+    const auto hook = SetWindowsHookExW(WH_CBT, [](int code, WPARAM wparam, LPARAM lparam) -> LRESULT {
+        const auto dialog = reinterpret_cast<HWND>(wparam);
+        if (code == HCBT_ACTIVATE && GetDlgItem(dialog, IDC_BUCKET_PREFIX))
+            exercise(dialog);
+        return CallNextHookEx(nullptr, code, wparam, lparam);
+    }, nullptr, GetCurrentThreadId());
+    REQUIRE(hook != nullptr);
+    s3cmd::BucketCreationDialog dialog(initial, "eu-central-1", [] (std::string_view) { return "123456789012"; });
+    const auto options = dialog.show();
+    UnhookWindowsHookEx(hook);
+    exercise = {};
+    REQUIRE(exercised);
+    REQUIRE(options.has_value());
+    CHECK(options->validation_error.empty());
+    CHECK(options->bucket_name ==
+          (account_regional ? "corrected-bucket-123456789012-eu-central-1-an"
+                            : "corrected-bucket"));
+}
+
 TEST_CASE("remote paths identify profile, bucket, and object", "[unit]")
 {
     CHECK(s3cmd::RemotePath::make(L"\\") == s3cmd::RemotePath{});
@@ -730,9 +785,79 @@ TEST_CASE("remote path views borrow the original wide path", "[unit]")
 
 TEST_CASE("virtual deletes skip recursive directory listings", "[unit]")
 {
-    temporary_config();
+    auto& ini = temporary_config();
     const s3cmd::ProfileConfig config("work");
     REQUIRE(config.register_bucket("bucket", "eu-central-1"));
+
+    int delete_status{204};
+    std::string error;
+    bool discovered_only{};
+    bool dry_run{};
+    SECTION("deletes an empty registered bucket") {}
+    SECTION("deletes an empty discovered bucket") { discovered_only = true; }
+    SECTION("refuses a bucket containing objects")
+    {
+        delete_status = 409;
+        error = "BucketNotEmpty";
+    }
+    SECTION("keeps registration when AWS denies deletion")
+    {
+        delete_status = 403;
+        error = "AccessDenied";
+    }
+    SECTION("dry run never sends a deletion request") { dry_run = true; }
+    if (discovered_only)
+    {
+        REQUIRE(config.unregister_bucket("bucket"));
+        config.set_discovered_buckets({{"bucket", {"eu-central-1"}}});
+    }
+    if (dry_run)
+    {
+        std::ofstream file(ini.path);
+        REQUIRE(file);
+        file << "[settings]\nDryRun = true\n";
+        file.close();
+        s3cmd::reset_config();
+        REQUIRE(config.register_bucket("bucket", "eu-central-1"));
+    }
+
+    std::atomic<int> bucket_deletes{}, object_deletes{}, unexpected_requests{};
+    httplib::Server server;
+    server.set_pre_routing_handler([&](const httplib::Request& request, httplib::Response& response) {
+        if (request.method == "DELETE" && request.path == "/bucket")
+        {
+            ++bucket_deletes;
+            response.status = delete_status;
+            if (!error.empty())
+                response.set_content("<Error><Code>" + error + "</Code><Message>" + error +
+                                     "</Message></Error>", "application/xml");
+        }
+        else if (request.method == "DELETE" && request.path == "/bucket/file.txt")
+        {
+            ++object_deletes;
+            response.status = 204;
+        }
+        else
+        {
+            ++unexpected_requests;
+            response.status = 403;
+        }
+        return httplib::Server::HandlerResponse::Handled;
+    });
+    const auto port = server.bind_to_any_port("127.0.0.1");
+    REQUIRE(port > 0);
+    std::jthread worker([&](std::stop_token stop) {
+        std::stop_callback shutdown(stop, [&] { server.stop(); });
+        server.listen_after_bind();
+    });
+    server.wait_until_ready();
+    const auto endpoint = "http://127.0.0.1:" + std::to_string(port);
+    TemporaryEnvironment url("AWS_ENDPOINT_URL_S3", endpoint.c_str());
+    TemporaryEnvironment endpoints("AWS_IGNORE_CONFIGURED_ENDPOINT_URLS", "false");
+    TemporaryEnvironment access("AWS_ACCESS_KEY_ID", "test");
+    TemporaryEnvironment secret("AWS_SECRET_ACCESS_KEY", "test");
+    TemporaryEnvironment region("AWS_DEFAULT_REGION", "us-east-1");
+    PluginSession session;
 
     wchar_t root[] = L"\\";
     wchar_t profile[] = L"\\work";
@@ -750,18 +875,19 @@ TEST_CASE("virtual deletes skip recursive directory listings", "[unit]")
     SetLastError(ERROR_SUCCESS);
     CHECK(s3cmd::find_first(bucket, &entry) == INVALID_HANDLE_VALUE);
     CHECK(GetLastError() == ERROR_NO_MORE_FILES);
-    CHECK(s3cmd::remove_directory(bucket));
-    CHECK_FALSE(config.registered_buckets().contains("bucket"));
+    CHECK_FALSE(s3cmd::delete_file(L"\\work\\bucket\\file.txt"));
+    CHECK_FALSE(s3cmd::remove_directory(L"\\work\\bucket\\folder"));
+    CHECK(s3cmd::remove_directory(bucket) == (dry_run || delete_status == 204));
+    CHECK(bucket_deletes == (dry_run ? 0 : 1));
+    CHECK(object_deletes == 0);
+    CHECK(unexpected_requests == 0);
+    CHECK(config.registered_buckets().contains("bucket") ==
+          (!discovered_only && (dry_run || delete_status != 204)));
+    if (!dry_run && delete_status == 204)
+        CHECK(config.bucket_region("bucket").empty());
     s3cmd::status_info(profile, FS_STATUS_END, FS_STATUS_OP_DELETE);
-
-    REQUIRE(config.register_bucket("discovered-bucket", "eu-central-1"));
-    config.set_discovered_buckets({{"discovered-bucket", {"us-west-2"}}});
-    wchar_t discovered_bucket[] = L"\\work\\discovered-bucket";
-
-    s3cmd::status_info(profile, FS_STATUS_START, FS_STATUS_OP_DELETE);
-    CHECK_FALSE(s3cmd::remove_directory(discovered_bucket));
-    CHECK(config.registered_buckets().contains("discovered-bucket"));
-    s3cmd::status_info(profile, FS_STATUS_END, FS_STATUS_OP_DELETE);
+    CHECK(s3cmd::delete_file(L"\\work\\bucket\\file.txt"));
+    CHECK(object_deletes == (dry_run ? 0 : 1));
 }
 
 TEST_CASE("directory prefixes use S3 separators", "[unit]")
@@ -936,10 +1062,13 @@ TEST_CASE("bucket registration is disabled when buckets were discovered", "[unit
     temporary_config();
     const s3cmd::ProfileConfig profile("work");
     profile.set_discovered_buckets({{"discovered-bucket", {"eu-west-1"}}});
-    PluginSession session;
 
-    wchar_t bucket[] = L"\\work\\new-bucket";
-    CHECK_FALSE(s3cmd::make_directory(bucket));
+    request_count = 0;
+    request_accept = true;
+    request_inputs = {L"new-bucket"};
+    PluginSession prompted(0, nullptr, nullptr, answer_request);
+    wchar_t action[] = L"\\work\\_Add existing bucket_";
+    CHECK(s3cmd::execute_file(action, L"open") == FS_EXEC_ERROR);
     CHECK_FALSE(profile.registered_buckets().contains("new-bucket"));
 }
 
@@ -948,10 +1077,13 @@ TEST_CASE("bucket registration rejects an already registered bucket", "[unit]")
     temporary_config();
     const s3cmd::ProfileConfig profile("work");
     REQUIRE(profile.register_bucket("registered-bucket", "eu-central-1"));
-    PluginSession session;
 
-    wchar_t bucket[] = L"\\work\\registered-bucket";
-    CHECK_FALSE(s3cmd::make_directory(bucket));
+    request_count = 0;
+    request_accept = true;
+    request_inputs = {L"registered-bucket"};
+    PluginSession prompted(0, nullptr, nullptr, answer_request);
+    wchar_t action[] = L"\\work\\_Add existing bucket_";
+    CHECK(s3cmd::execute_file(action, L"open") == FS_EXEC_ERROR);
 }
 
 TEST_CASE("registered regions override discovered regions", "[unit]")
@@ -1380,7 +1512,9 @@ TEST_CASE("runtime dry run completes S3 operations without side effects", "[unit
     CHECK(s3cmd::make_directory(directory));
     CHECK(s3cmd::rename_or_move(object, copy, TRUE, TRUE, nullptr) == FS_FILE_OK);
     CHECK(s3cmd::remove_directory(registered_bucket));
-    CHECK_FALSE(s3cmd::remove_directory(discovered_bucket));
+    CHECK(s3cmd::remove_directory(discovered_bucket));
+    CHECK(s3cmd::make_directory(L"\\work\\new-bucket"));
+    CHECK_FALSE(profile.registered_buckets().contains("new-bucket"));
     CHECK(profile.registered_buckets().contains("registered-bucket"));
 }
 

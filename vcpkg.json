@@ -9,7 +9,8 @@
       "default-features": false,
       "features": [
         "s3",
-        "sso-oidc"
+        "sso-oidc",
+        "sts"
       ]
     },
     "catch2",

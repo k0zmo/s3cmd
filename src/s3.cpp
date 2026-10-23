@@ -1,4 +1,5 @@
 #include "s3.hpp"
+#include "bucket_creation_dialog.hpp"
 #include "config.hpp"
 #include "prereq.h"
 #include "core.hpp"
@@ -30,14 +31,20 @@
 #include <aws/s3/S3ClientConfiguration.h>
 #include <aws/s3/model/BucketLocationConstraint.h>
 #include <aws/s3/model/CopyObjectRequest.h>
+#include <aws/s3/model/CreateBucketConfiguration.h>
+#include <aws/s3/model/CreateBucketRequest.h>
+#include <aws/s3/model/DeleteBucketRequest.h>
 #include <aws/s3/model/DeleteObjectRequest.h>
 #include <aws/s3/model/GetBucketLocationRequest.h>
 #include <aws/s3/model/GetObjectRequest.h>
+#include <aws/s3/model/HeadBucketRequest.h>
 #include <aws/s3/model/HeadObjectRequest.h>
 #include <aws/s3/model/ListBucketsRequest.h>
 #include <aws/s3/model/ListObjectsV2Request.h>
 #include <aws/s3/model/ObjectStorageClass.h>
 #include <aws/s3/model/PutObjectRequest.h>
+#include <aws/sts/STSClient.h>
+#include <aws/sts/model/GetCallerIdentityRequest.h>
 
 #include <toml++/toml.hpp>
 
@@ -90,8 +97,7 @@ bool imds_enabled{};
 std::optional<PluginHost> plugin_host{};
 
 // TC recursively lists directories before calling FsRemoveDir.
-// Profiles and buckets are virtual directories, so their delete operations must
-// see an empty listing.
+// Profile deletion is unsupported; bucket deletion must never recurse into objects.
 thread_local bool suppress_delete_listing{};
 
 std::mutex object_metadata_mutex;
@@ -216,10 +222,14 @@ std::shared_ptr<ClientEntry> make_client(const Aws::S3::S3ClientConfiguration& c
         uses_sso, generation);
 }
 
-std::shared_ptr<Aws::S3::S3Client> get_client(const RemotePath& path,
+std::shared_ptr<ClientEntry> get_client_entry(const RemotePath& path,
                                               std::string_view region_override = {})
 {
     Aws::S3::S3ClientConfiguration configuration(path.profile.c_str(), !imds_enabled);
+    // S3 region redirects can omit Location; keep their status and headers visible to the SDK.
+    configuration.followRedirects = Aws::Client::FollowRedirectsPolicy::NEVER;
+    configuration.enableHttpClientTrace =
+        aws_options.loggingOptions.logLevel == Aws::Utils::Logging::LogLevel::Trace;
     if (!region_override.empty())
     {
         configuration.region = region_override;
@@ -296,7 +306,13 @@ std::shared_ptr<Aws::S3::S3Client> get_client(const RemotePath& path,
         std::scoped_lock lock(client_mutex);
         clients.insert_or_assign(key, entry);
     }
-    return entry->client;
+    return entry;
+}
+
+std::shared_ptr<Aws::S3::S3Client> get_client(const RemotePath& path,
+                                              std::string_view region_override = {})
+{
+    return get_client_entry(path, region_override)->client;
 }
 
 void log_error(std::string_view operation, std::string_view message)
@@ -446,6 +462,41 @@ private:
     bool response_error_{};
     bool invalid_range_{};
 };
+
+bool register_existing_bucket(const RemotePath& path)
+{
+    const ProfileConfig profile(path.profile);
+    if (profile.has_discovered_buckets() || profile.registered_buckets().contains(path.bucket))
+        return false;
+
+    auto region = discover_bucket_region(path.profile, path.bucket);
+    if (region.empty())
+    {
+        {
+            AwsLease lease;
+            const Aws::S3::S3ClientConfiguration configuration{path.profile.c_str(), true};
+            region = configuration.region;
+        }
+        if (plugin_host->is_notify_message_box_available())
+        {
+            auto value = to_wide(region);
+            value.resize(64);
+            if (!plugin_host->notify_message_box_result(
+                    PluginHost::message_box_type::other, L"Register S3 bucket",
+                    std::format(L"Region for AWS profile '{}':", to_wide(path.profile)).c_str(),
+                    value))
+            {
+                return false;
+            }
+            region = to_utf8(value.data());
+        }
+        if (region.empty())
+            return false;
+    }
+    const auto is_dry = is_dry_run();
+    log_operation("RegisterBucket", path, is_dry);
+    return is_dry || profile.register_bucket(path.bucket, region);
+}
 
 // Checks whether an object at `path` exists
 bool remote_exists(Aws::S3::S3Client& client, const RemotePath& path)
@@ -911,8 +962,7 @@ try
                 return FS_EXEC_ERROR;
             }
 
-            const auto bucket_path = std::format(L"\\{}\\{}", path.profile, bucket);
-            if (!make_directory(bucket_path.c_str()))
+            if (!register_existing_bucket({to_utf8(path.profile), to_utf8(bucket), {}}))
                 return FS_EXEC_ERROR;
 
             // FS_EXEC_OK does not refresh after "open". Redirect to the profile listing.
@@ -1226,7 +1276,7 @@ bool delete_file(const wchar_t* remote_name)
 try
 {
     const auto path = RemotePath::make(remote_name);
-    if (path.profile.empty() || path.bucket.empty() || path.key.empty())
+    if (suppress_delete_listing || path.profile.empty() || path.bucket.empty() || path.key.empty())
         return false;
 
     const auto is_dry = is_dry_run();
@@ -1261,76 +1311,131 @@ try
 
     if (path.key.empty())
     {
-        const ProfileConfig profile(path.profile);
-
-        // Don't allow bucket registration is the profile already lists remote buckets.
-        // Also, check for already registered bucket
-        if (profile.has_discovered_buckets() ||
-            profile.registered_buckets().contains(path.bucket))
+        // Create a new bucket
+        if (is_dry_run())
         {
-            return false;
+            if (!ProfileConfig(path.profile).bucket_region(path.bucket).empty())
+                return false;
+            log_operation("CreateBucket", path, true);
+            return true;
         }
 
-        // Try to discover a bucket region
-        auto region = discover_bucket_region(path.profile, path.bucket);
-        if (region.empty())
-        {
-            // Can't do, let's ask the user to provide it manually,
-            // with profile's default region being the default option
-            {
-                AwsLease lease;
-                const Aws::S3::S3ClientConfiguration configuration{path.profile.c_str(), true};
-                region = configuration.region;
-            }
+        const std::string region = [&]() {
+            AwsLease lease;
+            return Aws::S3::S3ClientConfiguration{path.profile.c_str(), !imds_enabled}.region;
+        }();
+        BucketCreationDialog dialog(path.bucket, region, [&](std::string_view region) {
+            // Retrieve AWS account ID
+            AwsLease lease;
+            const auto entry = get_client_entry({path.profile, {}, {}}, region);
+            Aws::STS::STSClientConfiguration configuration(path.profile.c_str(), !imds_enabled);
+            configuration.region = region;
+            configuration.enableHttpClientTrace =
+                aws_options.loggingOptions.logLevel == Aws::Utils::Logging::LogLevel::Trace;
+            Aws::STS::STSClient client(entry->credentials, nullptr, configuration);
+            const auto outcome = client.GetCallerIdentity(Aws::STS::Model::GetCallerIdentityRequest{});
+            if (!outcome.IsSuccess())
+                throw std::runtime_error(std::format("Cannot obtain the AWS account ID: {}", outcome.GetError().GetMessage()));
+            const auto account = outcome.GetResult().GetAccount();
+            if (account.size() != 12 || account.find_first_not_of("0123456789") != account.npos)
+                throw std::runtime_error("AWS returned an invalid account ID.");
+            return account;
+        });
 
-            assert(plugin_host);
-            if (plugin_host->is_notify_message_box_available())
+        const auto options = dialog.show();
+        if (!options)
+            return false;
+
+        try
+        {
+            if (!options->validation_error.empty())
             {
-                auto value = to_wide(region);
-                value.resize(64); // Max length for out value for the user
-                if (!plugin_host->notify_message_box_result(
-                        PluginHost::message_box_type::other, L"Register S3 bucket",
-                        std::format(L"Region for AWS profile '{}:", to_wide(path.profile)).c_str(),
-                        /*out*/ value))
+                log_error("CreateBucket", options->validation_error);
+                return false;
+            }
+            const RemotePath new_path{path.profile, options->bucket_name, {}}; // used only for logging
+            const ProfileConfig profile(path.profile);
+            if (!profile.bucket_region(options->bucket_name).empty())
+                return false;
+            const auto is_dry = is_dry_run();
+            log_operation("CreateBucket", new_path, is_dry);
+            if (is_dry)
+                return true;
+            AwsLease lease;
+            auto client = get_client({path.profile, {}, {}}, options->region);
+            if (!options->account_regional)
+            {
+                // Recreating an owned us-east-1 bucket can succeed and reset its ACLs.
+                Aws::S3::Model::HeadBucketRequest head;
+                head.SetBucket(options->bucket_name);
+                log_operation("HeadBucket", new_path, false);
+                const auto existing = client->HeadBucket(head);
+                if (existing.IsSuccess() ||
+                    existing.GetError().GetResponseCode() == Aws::Http::HttpResponseCode::MOVED_PERMANENTLY)
                 {
+                    log_error("CreateBucket", "Bucket already exists");
                     return false;
                 }
-
-                region = to_utf8(value.data());
+                if (existing.GetError().GetResponseCode() != Aws::Http::HttpResponseCode::NOT_FOUND)
+                {
+                    log_aws_error("HeadBucket before creation", existing.GetError());
+                    return false;
+                }
             }
-
-            // Still no region, early-return with an error
-            if (region.empty())
+            // Account regional creation always rejects an existing bucket, including in us-east-1.
+            Aws::S3::Model::CreateBucketRequest request;
+            request.SetBucket(options->bucket_name);
+            if (options->account_regional)
+                request.SetAdditionalCustomHeaderValue("x-amz-bucket-namespace", "account-regional");
+            if (options->region != "us-east-1")
+            {
+                Aws::S3::Model::CreateBucketConfiguration location;
+                location.SetLocationConstraint(
+                    Aws::S3::Model::BucketLocationConstraintMapper::GetBucketLocationConstraintForName(options->region));
+                request.SetCreateBucketConfiguration(std::move(location));
+            }
+            const auto outcome = client->CreateBucket(request);
+            if (!outcome.IsSuccess())
+            {
+                log_aws_error("CreateBucket", outcome.GetError());
                 return false;
+            }
+            if (!profile.register_bucket(options->bucket_name, options->region))
+            {
+                log_error("CreateBucket", "Bucket was created in AWS, but local registration could not be saved");
+                return false;
+            }
+            return true;
         }
+        catch (const std::exception& error)
+        {
+            log_unexpected("CreateBucket", error);
+            return false;
+        }
+    }
+    else
+    {
+        // Create a S3 "marker" (directory)
+        const RemotePath marker{path.profile, path.bucket, path.directory_prefix()};
         const auto is_dry = is_dry_run();
-        log_operation("RegisterBucket", path, is_dry);
+        log_operation("PutObject", marker, is_dry);
         if (is_dry)
         {
             return true;
         }
-        return profile.register_bucket(path.bucket, region);
-    }
 
-    const RemotePath marker{path.profile, path.bucket, path.directory_prefix()};
-    const auto is_dry = is_dry_run();
-    log_operation("PutObject", marker, is_dry);
-    if (is_dry)
-    {
-        return true;
+        AwsLease lease;
+        auto client = get_client(path);
+        Aws::S3::Model::PutObjectRequest request;
+        request.SetBucket(path.bucket);
+        request.SetKey(path.directory_prefix());
+        request.SetBody(Aws::MakeShared<Aws::StringStream>("s3cmd"));
+        request.SetContentLength(0);
+        const auto outcome = client->PutObject(request);
+        if (!outcome.IsSuccess())
+            log_aws_error("PutObject directory marker", outcome.GetError());
+        return outcome.IsSuccess();
     }
-
-    AwsLease lease;
-    auto client = get_client(path);
-    Aws::S3::Model::PutObjectRequest request;
-    request.SetBucket(path.bucket);
-    request.SetKey(path.directory_prefix());
-    request.SetBody(Aws::MakeShared<Aws::StringStream>("s3cmd"));
-    request.SetContentLength(0);
-    const auto outcome = client->PutObject(request);
-    if (!outcome.IsSuccess())
-        log_aws_error("PutObject directory marker", outcome.GetError());
-    return outcome.IsSuccess();
 }
 catch (const std::exception& error)
 {
@@ -1347,16 +1452,32 @@ try
 
     if (path.key.empty())
     {
-        ProfileConfig pc{path.profile};
-        if (pc.has_discovered_buckets())
-            return false;
-
         const auto is_dry = is_dry_run();
-        log_operation("UnregisterBucket", path, is_dry);
+        log_operation("DeleteBucket", path, is_dry);
         if (is_dry)
-            return pc.registered_buckets().contains(path.bucket);
-        return pc.unregister_bucket(path.bucket);
+            return true;
+
+        // S3 refuses nonempty buckets, including object versions and delete markers.
+        AwsLease lease;
+        auto client = get_client(path);
+        Aws::S3::Model::DeleteBucketRequest request;
+        request.SetBucket(path.bucket);
+        const auto outcome = client->DeleteBucket(request);
+        if (!outcome.IsSuccess())
+        {
+            log_aws_error("DeleteBucket", outcome.GetError());
+            return false;
+        }
+        if (!ProfileConfig(path.profile).forget_bucket(path.bucket))
+        {
+            log_error("DeleteBucket", "Bucket was deleted in AWS, but local registration could not be removed");
+            return false;
+        }
+        return true;
     }
+
+    if (suppress_delete_listing)
+        return false;
 
     const auto prefix = path.directory_prefix();
 
