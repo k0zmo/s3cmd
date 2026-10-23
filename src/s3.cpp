@@ -334,15 +334,15 @@ void log_unexpected(std::string_view operation, const std::exception& error)
     log_error(operation, error.what());
 }
 
-void log_operation(std::string_view operation, const RemotePath& path, bool dry)
+void log_operation(std::string_view operation, const RemotePath& path)
 {
-    log("[s3cmd] operation={} dry={} profile={} bucket={} key={}", operation, dry, path.profile,
+    log("[s3cmd] operation={} profile={} bucket={} key={}", operation, path.profile,
         path.bucket, path.key);
 }
 
-void log_local_operation(std::string_view operation, const wchar_t* path, bool dry)
+void log_local_operation(std::string_view operation, const wchar_t* path)
 {
-    log("[s3cmd] operation={} dry={} path={}", operation, dry, to_utf8(path));
+    log("[s3cmd] operation={} path={}", operation, to_utf8(path));
 }
 
 bool report_progress(const wchar_t* source, const wchar_t* target, int percent)
@@ -493,15 +493,14 @@ bool register_existing_bucket(const RemotePath& path)
         if (region.empty())
             return false;
     }
-    const auto is_dry = is_dry_run();
-    log_operation("RegisterBucket", path, is_dry);
-    return is_dry || profile.register_bucket(path.bucket, region);
+    log_operation("RegisterBucket", path);
+    return profile.register_bucket(path.bucket, region);
 }
 
 // Checks whether an object at `path` exists
 bool remote_exists(Aws::S3::S3Client& client, const RemotePath& path)
 {
-    log_operation("HeadObject", path, false);
+    log_operation("HeadObject", path);
     Aws::S3::Model::HeadObjectRequest request;
     request.SetBucket(path.bucket);
     request.SetKey(path.key);
@@ -627,7 +626,7 @@ private:
         auto client = get_client(path, "us-east-1");
         Aws::S3::Model::ListBucketsRequest request;
         request.SetMaxBuckets(10'000);
-        log_operation("ListBuckets", path, false);
+        log_operation("ListBuckets", path);
         ProfileConfig pc{path.profile};
         for (;;)
         {
@@ -691,7 +690,7 @@ private:
         request.SetBucket(path.bucket);
         request.SetDelimiter("/");
         request.SetPrefix(prefix);
-        log_operation("ListObjectsV2", {path.profile, path.bucket, prefix}, false);
+        log_operation("ListObjectsV2", {path.profile, path.bucket, prefix});
         ObjectMetadataMap metadata;
 
         for (;;)
@@ -1056,15 +1055,7 @@ try
     if (path.profile.empty() || path.bucket.empty() || path.key.empty())
         return FS_FILE_NOTFOUND;
 
-    const auto is_dry = is_dry_run();
-    log_operation("GetObject", path, is_dry);
-    if (is_dry)
-    {
-        if ((copy_flags & FS_COPYFLAGS_MOVE) != 0)
-            log_operation("DeleteObject", path, true);
-        report_progress(remote_name, local_name, 100);
-        return FS_FILE_OK;
-    }
+    log_operation("GetObject", path);
 
     if (!resume)
     {
@@ -1205,15 +1196,7 @@ try
     if (path.profile.empty() || path.bucket.empty() || path.key.empty())
         return FS_FILE_WRITEERROR;
 
-    const auto is_dry = is_dry_run();
-    log_operation("PutObject", path, is_dry);
-    if (is_dry)
-    {
-        if ((copy_flags & FS_COPYFLAGS_MOVE) != 0)
-            log_local_operation("DeleteLocalFile", local_name, true);
-        report_progress(local_name, remote_name, 100);
-        return FS_FILE_OK;
-    }
+    log_operation("PutObject", path);
 
     {
         AwsLease lease;
@@ -1250,7 +1233,7 @@ try
 
     if ((copy_flags & FS_COPYFLAGS_MOVE) != 0)
     {
-        log_local_operation("DeleteLocalFile", local_name, false);
+        log_local_operation("DeleteLocalFile", local_name);
         std::filesystem::remove(local_name, ec);
         if (ec)
         {
@@ -1279,12 +1262,7 @@ try
     if (suppress_delete_listing || path.profile.empty() || path.bucket.empty() || path.key.empty())
         return false;
 
-    const auto is_dry = is_dry_run();
-    log_operation("DeleteObject", path, is_dry);
-    if (is_dry)
-    {
-        return true;
-    }
+    log_operation("DeleteObject", path);
 
     AwsLease lease;
     auto client = get_client(path);
@@ -1312,14 +1290,6 @@ try
     if (path.key.empty())
     {
         // Create a new bucket
-        if (is_dry_run())
-        {
-            if (!ProfileConfig(path.profile).bucket_region(path.bucket).empty())
-                return false;
-            log_operation("CreateBucket", path, true);
-            return true;
-        }
-
         const std::string region = [&]() {
             AwsLease lease;
             return Aws::S3::S3ClientConfiguration{path.profile.c_str(), !imds_enabled}.region;
@@ -1357,10 +1327,7 @@ try
             const ProfileConfig profile(path.profile);
             if (!profile.bucket_region(options->bucket_name).empty())
                 return false;
-            const auto is_dry = is_dry_run();
-            log_operation("CreateBucket", new_path, is_dry);
-            if (is_dry)
-                return true;
+            log_operation("CreateBucket", new_path);
             AwsLease lease;
             auto client = get_client({path.profile, {}, {}}, options->region);
             if (!options->account_regional)
@@ -1368,7 +1335,7 @@ try
                 // Recreating an owned us-east-1 bucket can succeed and reset its ACLs.
                 Aws::S3::Model::HeadBucketRequest head;
                 head.SetBucket(options->bucket_name);
-                log_operation("HeadBucket", new_path, false);
+                log_operation("HeadBucket", new_path);
                 const auto existing = client->HeadBucket(head);
                 if (existing.IsSuccess() ||
                     existing.GetError().GetResponseCode() == Aws::Http::HttpResponseCode::MOVED_PERMANENTLY)
@@ -1417,12 +1384,7 @@ try
     {
         // Create a S3 "marker" (directory)
         const RemotePath marker{path.profile, path.bucket, path.directory_prefix()};
-        const auto is_dry = is_dry_run();
-        log_operation("PutObject", marker, is_dry);
-        if (is_dry)
-        {
-            return true;
-        }
+        log_operation("PutObject", marker);
 
         AwsLease lease;
         auto client = get_client(path);
@@ -1452,10 +1414,7 @@ try
 
     if (path.key.empty())
     {
-        const auto is_dry = is_dry_run();
-        log_operation("DeleteBucket", path, is_dry);
-        if (is_dry)
-            return true;
+        log_operation("DeleteBucket", path);
 
         // S3 refuses nonempty buckets, including object versions and delete markers.
         AwsLease lease;
@@ -1487,7 +1446,7 @@ try
     list.SetBucket(path.bucket);
     list.SetPrefix(prefix);
     list.SetMaxKeys(2);
-    log_operation("ListObjectsV2", {path.profile, path.bucket, prefix}, false);
+    log_operation("ListObjectsV2", {path.profile, path.bucket, prefix});
     const auto listed = client->ListObjectsV2(list);
     if (!listed.IsSuccess())
     {
@@ -1506,12 +1465,7 @@ try
         return true;
 
     const RemotePath marker{path.profile, path.bucket, prefix};
-    const auto is_dry = is_dry_run();
-    log_operation("DeleteObject", marker, is_dry);
-    if (is_dry)
-    {
-        return true;
-    }
+    log_operation("DeleteObject", marker);
 
     Aws::S3::Model::DeleteObjectRequest remove;
     remove.SetBucket(path.bucket);
@@ -1547,17 +1501,9 @@ try
         target.profile.empty() || target.bucket.empty() || target.key.empty())
         return FS_FILE_NOTFOUND;
 
-    const auto is_dry = is_dry_run();
     const auto copy_operation =
         std::format("CopyObject source={}/{}/{}", source.profile, source.bucket, source.key);
-    log_operation(copy_operation, target, is_dry);
-    if (is_dry)
-    {
-        if (move)
-            log_operation("DeleteObject", source, true);
-        report_progress(old_name, new_name, 100);
-        return FS_FILE_OK;
-    }
+    log_operation(copy_operation, target);
 
     AwsLease lease;
     auto target_client = get_client(target);
@@ -1581,7 +1527,7 @@ try
     if (move)
     {
         auto source_client = get_client(source);
-        log_operation("DeleteObject", source, false);
+        log_operation("DeleteObject", source);
         Aws::S3::Model::DeleteObjectRequest remove;
         remove.SetBucket(source.bucket);
         remove.SetKey(source.key);

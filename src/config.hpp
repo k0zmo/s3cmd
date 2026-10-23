@@ -48,7 +48,6 @@ private:
 // Returns a path to config directory of the plugin
 const std::filesystem::path& config_directory_path();
 
-bool is_dry_run();
 bool prefer_sso_device_code();
 bool is_imds_enabled();
 std::string aws_log_level();

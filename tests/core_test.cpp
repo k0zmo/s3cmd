@@ -785,14 +785,13 @@ TEST_CASE("remote path views borrow the original wide path", "[unit]")
 
 TEST_CASE("virtual deletes skip recursive directory listings", "[unit]")
 {
-    auto& ini = temporary_config();
+    temporary_config();
     const s3cmd::ProfileConfig config("work");
     REQUIRE(config.register_bucket("bucket", "eu-central-1"));
 
     int delete_status{204};
     std::string error;
     bool discovered_only{};
-    bool dry_run{};
     SECTION("deletes an empty registered bucket") {}
     SECTION("deletes an empty discovered bucket") { discovered_only = true; }
     SECTION("refuses a bucket containing objects")
@@ -805,20 +804,10 @@ TEST_CASE("virtual deletes skip recursive directory listings", "[unit]")
         delete_status = 403;
         error = "AccessDenied";
     }
-    SECTION("dry run never sends a deletion request") { dry_run = true; }
     if (discovered_only)
     {
         REQUIRE(config.unregister_bucket("bucket"));
         config.set_discovered_buckets({{"bucket", {"eu-central-1"}}});
-    }
-    if (dry_run)
-    {
-        std::ofstream file(ini.path);
-        REQUIRE(file);
-        file << "[settings]\nDryRun = true\n";
-        file.close();
-        s3cmd::reset_config();
-        REQUIRE(config.register_bucket("bucket", "eu-central-1"));
     }
 
     std::atomic<int> bucket_deletes{}, object_deletes{}, unexpected_requests{};
@@ -877,17 +866,17 @@ TEST_CASE("virtual deletes skip recursive directory listings", "[unit]")
     CHECK(GetLastError() == ERROR_NO_MORE_FILES);
     CHECK_FALSE(s3cmd::delete_file(L"\\work\\bucket\\file.txt"));
     CHECK_FALSE(s3cmd::remove_directory(L"\\work\\bucket\\folder"));
-    CHECK(s3cmd::remove_directory(bucket) == (dry_run || delete_status == 204));
-    CHECK(bucket_deletes == (dry_run ? 0 : 1));
+    CHECK(s3cmd::remove_directory(bucket) == (delete_status == 204));
+    CHECK(bucket_deletes == 1);
     CHECK(object_deletes == 0);
     CHECK(unexpected_requests == 0);
     CHECK(config.registered_buckets().contains("bucket") ==
-          (!discovered_only && (dry_run || delete_status != 204)));
-    if (!dry_run && delete_status == 204)
+          (!discovered_only && delete_status != 204));
+    if (delete_status == 204)
         CHECK(config.bucket_region("bucket").empty());
     s3cmd::status_info(profile, FS_STATUS_END, FS_STATUS_OP_DELETE);
     CHECK(s3cmd::delete_file(L"\\work\\bucket\\file.txt"));
-    CHECK(object_deletes == (dry_run ? 0 : 1));
+    CHECK(object_deletes == 1);
 }
 
 TEST_CASE("directory prefixes use S3 separators", "[unit]")
@@ -912,13 +901,12 @@ TEST_CASE("remote files are delegated to the host for opening", "[unit]")
 
 TEST_CASE("Add existing bucket opens a local registration prompt", "[unit]")
 {
-    auto& config = temporary_config();
+    temporary_config();
     request_count = 0;
     request_accept = true;
     request_inputs = {L"existing-bucket"};
     bool location_allowed{true};
     bool callback_available{true};
-    bool dry_run{};
     bool expect_registration{true};
     SECTION("discovers the region and persists registration") {}
     SECTION("asks for the region when discovery fails")
@@ -945,13 +933,6 @@ TEST_CASE("Add existing bucket opens a local registration prompt", "[unit]")
     {
         callback_available = false;
         expect_registration = false;
-    }
-    SECTION("dry run discovers the region without persisting registration")
-    {
-        dry_run = true;
-        std::filesystem::create_directories(config.path.parent_path());
-        std::ofstream file(config.path);
-        file << "[settings]\nDryRun = true\n";
     }
 
     std::atomic<int> location_requests{};
@@ -995,7 +976,7 @@ TEST_CASE("Add existing bucket opens a local registration prompt", "[unit]")
     CHECK(saw_location_query == expect_registration);
     const s3cmd::ProfileConfig profile("work");
     const auto registered = profile.registered_buckets();
-    if (expect_registration && !dry_run)
+    if (expect_registration)
     {
         REQUIRE(registered.contains("existing-bucket"));
         CHECK(registered.at("existing-bucket").region == "eu-west-1");
@@ -1448,74 +1429,6 @@ TEST_CASE("ListObjectsV2 metadata is exposed as content fields", "[unit]")
         CHECK(s3cmd::content_get_value(object_path, 2, value, sizeof(value)) == ft_fieldempty);
         CHECK(list_requests == 1);
     }
-}
-
-TEST_CASE("runtime dry run completes S3 operations without side effects", "[unit]")
-{
-    auto& ini = temporary_config();
-    std::filesystem::create_directories(ini.path.parent_path());
-    {
-        std::ofstream file(ini.path);
-        REQUIRE(file);
-        file << "[settings]\nDryRun = true\n";
-    }
-    const s3cmd::ProfileConfig profile("work");
-    REQUIRE(profile.register_bucket("registered-bucket", "eu-central-1"));
-    PluginSession session;
-
-    wchar_t object[] = L"\\work\\bucket\\file.txt";
-    wchar_t directory[] = L"\\work\\bucket\\folder";
-    wchar_t copy[] = L"\\work\\bucket\\copy.txt";
-    wchar_t registered_bucket[] = L"\\work\\registered-bucket";
-    wchar_t discovered_bucket[] = L"\\work\\discovered-bucket";
-    const auto local = std::filesystem::temp_directory_path() /
-                       (L"s3cmd-dry-run-" + std::to_wstring(GetCurrentProcessId()));
-    auto local_name = local.wstring();
-    const auto upload = ini.root / L"upload.txt";
-    {
-        std::ofstream file(upload);
-        REQUIRE(file);
-        file << "move source";
-    }
-    auto upload_name = upload.wstring();
-
-    CHECK(s3cmd::get_file(object, local_name.data(), FS_COPYFLAGS_MOVE, nullptr) == FS_FILE_OK);
-    CHECK_FALSE(std::filesystem::exists(local));
-    const auto partial = ini.root / L"partial-download";
-    const auto download = download_path(partial);
-    {
-        std::ofstream file(download);
-        REQUIRE(file);
-        file << "partial";
-    }
-    auto partial_name = partial.wstring();
-    CHECK(s3cmd::get_file(object, partial_name.data(), 0, nullptr) == FS_FILE_EXISTS);
-    RemoteInfoStruct info{};
-    for (DWORD size : {6u, 7u, 8u})
-    {
-        info.SizeLow = size;
-        write_resume_record(ini, partial, object, "\"test\"", size);
-        CHECK(s3cmd::get_file(object, partial_name.data(), 0, &info) ==
-              (size > 7 ? FS_FILE_EXISTSRESUMEALLOWED : FS_FILE_EXISTS));
-        CHECK(s3cmd::get_file(object, partial_name.data(), FS_COPYFLAGS_RESUME, &info) ==
-              (size > 7 ? FS_FILE_OK : FS_FILE_NOTSUPPORTED));
-    }
-    info.SizeLow = 0;
-    info.SizeHigh = 1;
-    write_resume_record(ini, partial, object, "\"test\"", std::uint64_t{1} << 32);
-    CHECK(s3cmd::get_file(object, partial_name.data(), 0, &info) == FS_FILE_EXISTSRESUMEALLOWED);
-    CHECK(s3cmd::get_file(object, partial_name.data(), FS_COPYFLAGS_RESUME, nullptr) == FS_FILE_OK);
-    CHECK(std::filesystem::file_size(download) == 7);
-    CHECK(s3cmd::put_file(upload_name.data(), object, FS_COPYFLAGS_MOVE) == FS_FILE_OK);
-    CHECK(std::filesystem::exists(upload));
-    CHECK(s3cmd::delete_file(object));
-    CHECK(s3cmd::make_directory(directory));
-    CHECK(s3cmd::rename_or_move(object, copy, TRUE, TRUE, nullptr) == FS_FILE_OK);
-    CHECK(s3cmd::remove_directory(registered_bucket));
-    CHECK(s3cmd::remove_directory(discovered_bucket));
-    CHECK(s3cmd::make_directory(L"\\work\\new-bucket"));
-    CHECK_FALSE(profile.registered_buckets().contains("new-bucket"));
-    CHECK(profile.registered_buckets().contains("registered-bucket"));
 }
 
 TEST_CASE("expired SSO profiles require supported login configuration", "[unit]")

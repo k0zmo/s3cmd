@@ -33,7 +33,6 @@ struct RuntimeConfig
         bool bucket_registration_hint_shown{};
     };
 
-    bool dry_run{false};
     bool prefer_sso_device_code{false};
     bool enable_imds{false};
     std::string aws_log_level{"Info"};
@@ -58,7 +57,6 @@ RuntimeConfig& RuntimeConfig::get()
     if (auto document = read_document(path()))
     {
         // Deserialize TOML document into RuntimeConfig.
-        runtime_config->dry_run = (*document)["settings"]["DryRun"].value_or(false);
         runtime_config->prefer_sso_device_code =
             (*document)["settings"]["PreferSsoDeviceCode"].value_or(false);
         runtime_config->enable_imds = (*document)["settings"]["EnableIMDS"].value_or(false);
@@ -95,8 +93,7 @@ bool RuntimeConfig::flush_to_disk()
 {
     // Serialize our config to TOML document and write it to disk.
     toml::table document;
-    document.emplace("settings", toml::table{{"DryRun", dry_run},
-                                             {"AwsLogLevel", aws_log_level},
+    document.emplace("settings", toml::table{{"AwsLogLevel", aws_log_level},
                                              {"PreferSsoDeviceCode", prefer_sso_device_code},
                                              {"EnableIMDS", enable_imds}});
 
@@ -147,12 +144,6 @@ const std::filesystem::path& config_directory_path()
 #endif
     }();
     return value;
-}
-
-bool is_dry_run()
-{
-    std::scoped_lock lock(config_mtx);
-    return RuntimeConfig::get().dry_run;
 }
 
 bool prefer_sso_device_code()
