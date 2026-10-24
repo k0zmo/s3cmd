@@ -1318,11 +1318,6 @@ try
 
         try
         {
-            if (!options->validation_error.empty())
-            {
-                log_error("CreateBucket", options->validation_error);
-                return false;
-            }
             const RemotePath new_path{path.profile, options->bucket_name, {}}; // used only for logging
             const ProfileConfig profile(path.profile);
             if (!profile.bucket_region(options->bucket_name).empty())
@@ -1330,9 +1325,11 @@ try
             log_operation("CreateBucket", new_path);
             AwsLease lease;
             auto client = get_client({path.profile, {}, {}}, options->region);
-            if (!options->account_regional)
+            if (!options->account_regional && options->region == "us-east-1")
             {
-                // Recreating an owned us-east-1 bucket can succeed and reset its ACLs.
+                // S3 has a legacy exception: in us-east-1, calling CreateBucket for a bucket you
+                // already own can return success and reset its ACLs, instead of reporting that it
+                // exists.
                 Aws::S3::Model::HeadBucketRequest head;
                 head.SetBucket(options->bucket_name);
                 log_operation("HeadBucket", new_path);

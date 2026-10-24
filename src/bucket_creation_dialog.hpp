@@ -12,7 +12,6 @@ namespace s3cmd {
 struct BucketCreationOptions
 {
     std::string bucket_name;
-    std::string validation_error;
     std::string region;
     bool account_regional{};
     std::string account_id;

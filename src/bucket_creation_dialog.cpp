@@ -98,7 +98,7 @@ BucketCreationDialog::BucketCreationDialog(
     std::string_view region,
     AccountIdLookupFn lookup_account)
     : prefix_(prefix),
-      options_{{}, {}, std::string(region), false, {}},
+      options_{{}, std::string(region), false, {}},
       lookup_account_(std::move(lookup_account))
 {
 }
@@ -116,13 +116,12 @@ void BucketCreationDialog::update(HWND dialog)
     auto name = options_.account_regional && options_.account_id.empty() ?
         std::string("Account ID unavailable") : build_bucket_name(prefix_, options_);
     SetDlgItemTextW(dialog, IDC_BUCKET_PREVIEW, to_wide(name).c_str());
-    auto error = options_.account_regional && !lookup_error_.empty()
-                     ? lookup_error_
-                     : validate_bucket_name(prefix_, options_);
+    const auto error = options_.account_regional && !lookup_error_.empty()
+                           ? lookup_error_
+                           : validate_bucket_name(prefix_, options_);
     SetDlgItemTextW(dialog, IDC_BUCKET_ERROR, to_wide(error).c_str());
     EnableWindow(GetDlgItem(dialog, IDOK), error.empty());
 
-    options_.validation_error = std::move(error);
     options_.bucket_name = std::move(name);
 }
 
