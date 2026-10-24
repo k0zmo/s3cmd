@@ -13,11 +13,12 @@
 
 namespace s3cmd {
 
-// S3 object metadata that we get for free from ListObjectV2
+// S3 entry metadata that we get for free from ListObjectsV2.
 struct ObjectMetadata
 {
     Aws::S3::Model::ObjectStorageClass storage_class{};
     std::wstring etag;
+    bool directory{};
 };
 
 template <typename String = std::wstring>

@@ -7,6 +7,7 @@
 #include "fsplugin.h"
 #include "log.hpp"
 #include "object_metadata.hpp"
+#include "properties_dialog.hpp"
 #include "resume.hpp"
 #include "sso.hpp"
 #include "utils.hpp"
@@ -36,7 +37,9 @@
 #include <aws/s3/model/DeleteBucketRequest.h>
 #include <aws/s3/model/DeleteObjectRequest.h>
 #include <aws/s3/model/GetBucketLocationRequest.h>
+#include <aws/s3/model/GetBucketTaggingRequest.h>
 #include <aws/s3/model/GetObjectRequest.h>
+#include <aws/s3/model/GetObjectTaggingRequest.h>
 #include <aws/s3/model/HeadBucketRequest.h>
 #include <aws/s3/model/HeadObjectRequest.h>
 #include <aws/s3/model/ListBucketsRequest.h>
@@ -99,6 +102,7 @@ std::optional<PluginHost> plugin_host{};
 // TC recursively lists directories before calling FsRemoveDir.
 // Profile deletion is unsupported; bucket deletion must never recurse into objects.
 thread_local bool suppress_delete_listing{};
+thread_local bool suppress_presign_logging{};
 
 std::mutex object_metadata_mutex;
 ObjectMetadataCache object_metadata;
@@ -513,6 +517,163 @@ bool remote_exists(Aws::S3::S3Client& client, const RemotePath& path)
     throw std::runtime_error(outcome.GetError().GetMessage());
 }
 
+S3Properties initial_properties(const RemotePath& path, const std::optional<ObjectMetadata>& cached)
+{
+    S3Properties properties;
+    properties.kind = path.key.empty() ? PropertiesKind::bucket :
+                      cached ? (cached->directory ? PropertiesKind::prefix : PropertiesKind::object) :
+                      PropertiesKind::unknown;
+    const auto key = properties.kind == PropertiesKind::prefix ? path.directory_prefix() : path.key;
+    properties.address = std::format("s3://{}/{}", path.bucket, key);
+    properties.region = ProfileConfig(path.profile).bucket_region(path.bucket);
+    if (properties.kind == PropertiesKind::prefix)
+    {
+        properties.details = "Folder (S3 prefix)";
+        properties.tag_status.clear();
+    }
+    return properties;
+}
+
+S3Properties load_properties(Aws::S3::S3Client& client, const RemotePath& path,
+                              S3Properties properties, const std::atomic<bool>& cancelled)
+{
+    const auto continue_request = [&cancelled](const Aws::Http::HttpRequest*) {
+        return !cancelled.load();
+    };
+    if (properties.kind == PropertiesKind::prefix || cancelled)
+        return properties;
+    if (properties.kind == PropertiesKind::object || properties.kind == PropertiesKind::unknown)
+    {
+        Aws::S3::Model::HeadObjectRequest request;
+        request.SetBucket(path.bucket);
+        request.SetKey(path.key);
+        request.SetContinueRequestHandler(continue_request);
+        const auto outcome = client.HeadObject(request);
+        if (cancelled)
+            return properties;
+        if (outcome.IsSuccess())
+        {
+            properties.kind = PropertiesKind::object;
+            const auto& object = outcome.GetResult();
+            auto storage = Aws::S3::Model::StorageClassMapper::GetNameForStorageClass(object.GetStorageClass());
+            if (storage.empty())
+                storage = "STANDARD";
+            properties.details = std::format(
+                "Size: {} bytes\r\nModified: {}\r\nStorage class: {}\r\nETag: {}",
+                object.GetContentLength(), object.GetLastModified().ToGmtString(
+                    Aws::Utils::DateFormat::ISO_8601), storage, object.GetETag());
+        }
+        else if (properties.kind == PropertiesKind::unknown &&
+                 outcome.GetError().GetResponseCode() == Aws::Http::HttpResponseCode::NOT_FOUND)
+        {
+            Aws::S3::Model::ListObjectsV2Request listing;
+            listing.SetBucket(path.bucket);
+            listing.SetPrefix(path.directory_prefix());
+            listing.SetMaxKeys(1);
+            listing.SetContinueRequestHandler(continue_request);
+            const auto found = client.ListObjectsV2(listing);
+            if (found.IsSuccess() && !found.GetResult().GetContents().empty())
+            {
+                properties.kind = PropertiesKind::prefix;
+                properties.address = std::format("s3://{}/{}", path.bucket, path.directory_prefix());
+                properties.details = "Folder (S3 prefix)";
+                properties.tag_status.clear();
+                return properties;
+            }
+            properties.details = found.IsSuccess() ? "Object or folder no longer exists." :
+                std::format("Cannot identify this path: {}", found.GetError().GetMessage());
+        }
+        else
+        {
+            properties.details = std::format("Metadata unavailable: {}", outcome.GetError().GetMessage());
+        }
+    }
+    else
+    {
+        properties.details = "S3 bucket";
+    }
+
+    if (cancelled)
+        return properties;
+    const auto read_tags = [&properties](const auto& outcome) {
+        if (outcome.IsSuccess())
+        {
+            for (const auto& tag : outcome.GetResult().GetTagSet())
+                properties.tags.emplace_back(tag.GetKey(), tag.GetValue());
+            properties.tag_status = properties.tags.empty() ? "No tags." : "";
+        }
+        else if (outcome.GetError().GetExceptionName() == "NoSuchTagSet")
+        {
+            properties.tag_status = "No tags.";
+        }
+        else
+        {
+            properties.tag_status = std::format("Tags unavailable: {}", outcome.GetError().GetMessage());
+        }
+    };
+    if (properties.kind == PropertiesKind::bucket)
+    {
+        Aws::S3::Model::GetBucketTaggingRequest request;
+        request.SetBucket(path.bucket);
+        request.SetContinueRequestHandler(continue_request);
+        read_tags(client.GetBucketTagging(request));
+    }
+    else if (properties.kind == PropertiesKind::object)
+    {
+        Aws::S3::Model::GetObjectTaggingRequest request;
+        request.SetBucket(path.bucket);
+        request.SetKey(path.key);
+        request.SetContinueRequestHandler(continue_request);
+        read_tags(client.GetObjectTagging(request));
+    }
+    else
+    {
+        properties.tag_status = "Tags unavailable: path type is unknown.";
+    }
+    return properties;
+}
+
+void show_properties(HWND owner, const wchar_t* remote_name)
+{
+    std::optional<AwsLease> lease;
+    const auto path = RemotePath::make(remote_name);
+    auto properties = initial_properties(path, cached_object_metadata(RemotePathView::make(remote_name)));
+    std::shared_ptr<ClientEntry> entry;
+    PropertiesDialog dialog(properties,
+        // Prepare
+        [&] {
+            if (properties.kind == PropertiesKind::prefix)
+                return;
+            if (properties.region.empty())
+                properties.region = discover_bucket_region(path.profile, path.bucket);
+            lease.emplace();
+            entry = get_client_entry(path, properties.region);
+        },
+        // Load
+        [&](const std::atomic<bool>& cancelled) {
+            if (properties.kind == PropertiesKind::prefix)
+                return properties;
+            return load_properties(*entry->client, path, properties, cancelled);
+        },
+        // Presign
+        [&](unsigned seconds) {
+            // The SDK logs signing material at Debug/Trace; suppress it only on this thread.
+            struct QuietSigning
+            {
+                QuietSigning() { suppress_presign_logging = true; }
+                ~QuietSigning() { suppress_presign_logging = false; }
+            } quiet;
+            if (entry->credentials->GetAWSCredentials().IsEmpty())
+                throw std::runtime_error("AWS credentials unavailable. Sign in and reopen Properties.");
+            const auto url = entry->client->GeneratePresignedUrl(
+                path.bucket, path.key, Aws::Http::HttpMethod::HTTP_GET, seconds);
+            if (url.empty())
+                throw std::runtime_error("Cannot generate a download link.");
+            return url;
+        });
+    dialog.show(owner);
+}
+
 class FindState
 {
 public:
@@ -710,7 +871,8 @@ private:
                     continue;
                 auto prefix_name = std::string_view{value}.substr(prefix.size());
                 prefix_name.remove_suffix(1); // Remove the trailing '/'
-                append_entry(prefix_name, /*directory=*/true);
+                if (append_entry(prefix_name, /*directory=*/true))
+                    metadata[entries_.back().name] = {{}, {}, true};
             }
 
             for (const auto& object : result.GetContents())
@@ -810,6 +972,8 @@ int initialize(int number, tProgressProcW progress, tLogProcW log, tRequestProcW
         private:
             void ProcessFormattedStatement(Aws::String&& statement) override
             {
+                if (suppress_presign_logging)
+                    return;
                 statement.pop_back(); // FormattedLogSystem always appends a newline
                 s3cmd::log("{}", statement);
             }
@@ -932,7 +1096,7 @@ void status_info(const wchar_t* remote_directory, int start_end, int operation)
     suppress_delete_listing = path.bucket.empty();
 }
 
-int execute_file(wchar_t* remote_name, const wchar_t* verb)
+int execute_file(wchar_t* remote_name, const wchar_t* verb, HWND owner)
 try
 {
     if (!remote_name || !verb)
@@ -972,7 +1136,17 @@ try
             return FS_EXEC_OK;
         return FS_EXEC_YOURSELF;
     }
-    else if (caseicmp(verb, L"properties") == 0 || ncaseicmp(verb, L"quote ", 6) == 0 ||
+    else if (caseicmp(verb, L"properties") == 0)
+    {
+        const auto path = RemotePathView::make(remote_name);
+        if (!path.profile.empty() && !path.bucket.empty() &&
+            !(path.bucket == add_existing_bucket_entry && path.key.empty()))
+        {
+            show_properties(owner, remote_name);
+        }
+        return FS_EXEC_OK;
+    }
+    else if (ncaseicmp(verb, L"quote ", 6) == 0 ||
              ncaseicmp(verb, L"chmod ", 6) == 0 || ncaseicmp(verb, L"mode ", 5) == 0)
     {
         return FS_EXEC_YOURSELF;
@@ -1612,7 +1786,7 @@ int content_get_value(const wchar_t* file_name, int field_index, void* field_val
         // column-layout change, even without relisting. If metadata was already
         // evicted, return empty until the next listing. We deliberately avoid
         // refetching for this uncommon case as this complicates matter.
-        if (!found)
+        if (!found || found->directory)
             return ft_fieldempty;
 
         switch (field_index)

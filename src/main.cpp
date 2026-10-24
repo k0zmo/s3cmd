@@ -48,9 +48,9 @@ WFX_EXPORT void __stdcall FsStatusInfoW(wchar_t* remote_directory, int start_end
     s3cmd::status_info(remote_directory, start_end, operation);
 }
 
-WFX_EXPORT int __stdcall FsExecuteFileW(HWND, wchar_t* remote_name, wchar_t* verb)
+WFX_EXPORT int __stdcall FsExecuteFileW(HWND main_win, wchar_t* remote_name, wchar_t* verb)
 {
-    return s3cmd::execute_file(remote_name, verb);
+    return s3cmd::execute_file(remote_name, verb, main_win);
 }
 
 WFX_EXPORT int __stdcall FsGetFileW(wchar_t* remote_name, wchar_t* local_name, int copy_flags,

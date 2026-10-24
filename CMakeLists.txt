@@ -42,6 +42,7 @@ add_library(s3cmd-core STATIC
     src/config.hpp                 src/config.cpp
     src/core.hpp                   src/core.cpp
     src/bucket_creation_dialog.hpp src/bucket_creation_dialog.cpp
+    src/properties_dialog.hpp      src/properties_dialog.cpp
     src/creds.hpp                  src/creds.cpp
     src/log.cpp                    src/log.hpp
     src/resume.cpp                 src/resume.hpp
@@ -73,7 +74,7 @@ else()
     )
 endif()
 if(WIN32)
-    target_link_libraries(s3cmd-core PUBLIC shell32)
+    target_link_libraries(s3cmd-core PUBLIC shell32 comctl32)
 endif()
 
 add_library(s3cmd MODULE
@@ -82,7 +83,7 @@ add_library(s3cmd MODULE
     src/s3cmd.def
 )
 if(WIN32)
-    target_sources(s3cmd PRIVATE src/s3cmd.rc src/bucket_creation_dialog.rc)
+    target_sources(s3cmd PRIVATE src/s3cmd.rc src/bucket_creation_dialog.rc src/properties_dialog.rc)
 endif()
 target_compile_features(s3cmd PRIVATE cxx_std_20)
 target_compile_definitions(s3cmd PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
@@ -119,7 +120,7 @@ if(BUILD_TESTING)
         tests/core_test.cpp
     )
     if(WIN32)
-        target_sources(s3cmd-test PRIVATE src/bucket_creation_dialog.rc)
+        target_sources(s3cmd-test PRIVATE src/bucket_creation_dialog.rc src/properties_dialog.rc)
     endif()
     target_link_libraries(s3cmd-test PRIVATE
         s3cmd-core
