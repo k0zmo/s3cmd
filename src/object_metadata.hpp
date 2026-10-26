@@ -1,5 +1,6 @@
 #pragma once
 
+#include <aws/core/utils/DateTime.h>
 #include <aws/s3/model/ObjectStorageClass.h>
 
 #include <algorithm>
@@ -13,11 +14,13 @@
 
 namespace s3cmd {
 
-// S3 object metadata that we get for free from ListObjectV2
+// S3 entry metadata that we get for free from ListObjectsV2.
 struct ObjectMetadata
 {
     Aws::S3::Model::ObjectStorageClass storage_class{};
     std::wstring etag;
+    std::uint64_t size{};
+    Aws::Utils::DateTime modified{};
 };
 
 template <typename String = std::wstring>

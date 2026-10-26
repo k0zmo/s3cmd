@@ -74,6 +74,10 @@ The plugin never deletes bucket contents as part of a bucket deletion.
 
 The plugin exposes `Region` for bucket entries and `Storage class` plus `ETag` for object entries as Total Commander content fields. Add them to a custom-column view when needed.
 
+Select Properties for a bucket, object, or folder to copy its real `s3://` address.
+Bucket and object properties show their region and tags.
+Object properties also show size, modification time, storage class, and ETag.
+For an object, select an expiry duration and Generate link to create a presigned download URL.
 ## Features
 
 - Lists the default profile and named profiles from the AWS configuration and credentials files.
@@ -97,6 +101,8 @@ The plugin exposes `Region` for bucket entries and `Storage class` plus `ETag` f
 - Registers existing buckets when automatic bucket discovery is unavailable.
 - Creates S3 buckets in a selected region and deletes empty buckets.
 - Exposes `Region`, `Storage class`, and `ETag` as content fields.
+- Shows S3 addresses, metadata, and tags in a native Properties dialog.
+- Generates presigned object download links with a selected expiry duration.
 - Reuses S3 clients and supports concurrent background transfers during one plugin session.
 - Resumes interrupted downloads only while the source object still has the recorded ETag.
 

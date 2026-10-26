@@ -7,6 +7,7 @@
 #include "fsplugin.h"
 #include "log.hpp"
 #include "object_metadata.hpp"
+#include "properties_dialog.hpp"
 #include "resume.hpp"
 #include "sso.hpp"
 #include "utils.hpp"
@@ -36,7 +37,9 @@
 #include <aws/s3/model/DeleteBucketRequest.h>
 #include <aws/s3/model/DeleteObjectRequest.h>
 #include <aws/s3/model/GetBucketLocationRequest.h>
+#include <aws/s3/model/GetBucketTaggingRequest.h>
 #include <aws/s3/model/GetObjectRequest.h>
+#include <aws/s3/model/GetObjectTaggingRequest.h>
 #include <aws/s3/model/HeadBucketRequest.h>
 #include <aws/s3/model/HeadObjectRequest.h>
 #include <aws/s3/model/ListBucketsRequest.h>
@@ -99,6 +102,7 @@ std::optional<PluginHost> plugin_host{};
 // TC recursively lists directories before calling FsRemoveDir.
 // Profile deletion is unsupported; bucket deletion must never recurse into objects.
 thread_local bool suppress_delete_listing{};
+thread_local bool suppress_presign_logging{};
 
 std::mutex object_metadata_mutex;
 ObjectMetadataCache object_metadata;
@@ -513,6 +517,119 @@ bool remote_exists(Aws::S3::S3Client& client, const RemotePath& path)
     throw std::runtime_error(outcome.GetError().GetMessage());
 }
 
+S3Properties load_tags(Aws::S3::S3Client& client, const RemotePath& path, S3Properties properties,
+                       const std::atomic<bool>& cancelled)
+{
+    const auto continue_request = [&cancelled](const Aws::Http::HttpRequest*) {
+        return !cancelled.load();
+    };
+    const auto read_tags = [&properties](const auto& outcome) {
+        if (outcome.IsSuccess())
+        {
+            for (const auto& tag : outcome.GetResult().GetTagSet())
+                properties.tags.emplace_back(tag.GetKey(), tag.GetValue());
+            properties.tag_status = properties.tags.empty() ? "No tags." : "";
+        }
+        else if (outcome.GetError().GetExceptionName() == "NoSuchTagSet")
+        {
+            properties.tag_status = "No tags.";
+        }
+        else
+        {
+            properties.tag_status =
+                std::format("Tags unavailable: {}", outcome.GetError().GetMessage());
+        }
+    };
+    if (properties.kind == PropertiesKind::bucket)
+    {
+        Aws::S3::Model::GetBucketTaggingRequest request;
+        request.SetBucket(path.bucket);
+        request.SetContinueRequestHandler(continue_request);
+        read_tags(client.GetBucketTagging(request));
+    }
+    else
+    {
+        Aws::S3::Model::GetObjectTaggingRequest request;
+        request.SetBucket(path.bucket);
+        request.SetKey(path.key);
+        request.SetContinueRequestHandler(continue_request);
+        read_tags(client.GetObjectTagging(request));
+    }
+    return properties;
+}
+
+void show_properties(HWND owner, const wchar_t* remote_name)
+{
+    std::optional<AwsLease> lease;
+    const auto path = RemotePath::make(remote_name);
+    const auto cached = cached_object_metadata(RemotePathView::make(remote_name));
+    // Fill initial properies
+    S3Properties properties;
+    properties.kind = path.key.empty() ? PropertiesKind::bucket
+                      : !cached        ? PropertiesKind::prefix
+                                       : PropertiesKind::object;
+    const auto key = properties.kind == PropertiesKind::prefix ? path.directory_prefix() : path.key;
+    properties.address = std::format("s3://{}/{}", path.bucket, key);
+    properties.region = ProfileConfig(path.profile).bucket_region(path.bucket);
+    if (properties.kind == PropertiesKind::prefix)
+    {
+        properties.details = "Folder (S3 prefix)";
+        properties.tag_status.clear();
+    }
+    else if (properties.kind == PropertiesKind::object)
+    {
+        const auto storage = Aws::S3::Model::ObjectStorageClassMapper::GetNameForObjectStorageClass(
+            cached->storage_class);
+        properties.details = std::format(
+            "Size: {} bytes\r\nModified: {}\r\nStorage class: {}\r\nETag: {}", cached->size,
+            cached->modified.ToGmtString(Aws::Utils::DateFormat::ISO_8601), storage,
+            to_utf8(cached->etag));
+    }
+    else
+    {
+        properties.details = "S3 bucket";
+    }
+
+    std::shared_ptr<ClientEntry> entry;
+    PropertiesDialog dialog(
+        std::move(properties),
+        // Prepare
+        [&](S3Properties& properties) {
+            if (properties.kind == PropertiesKind::prefix)
+                return;
+            if (properties.region.empty())
+                properties.region = discover_bucket_region(path.profile, path.bucket);
+            lease.emplace();
+            entry = get_client_entry(path, properties.region);
+        },
+        // Load
+        [&](S3Properties properties, const std::atomic<bool>& cancelled) {
+            if (properties.kind == PropertiesKind::prefix || cancelled)
+                return properties;
+            return load_tags(*entry->client, path, std::move(properties), cancelled);
+        },
+        // Presign
+        [&](unsigned seconds) {
+            // The SDK logs signing material at Debug/Trace. Suppress it only on this thread.
+            struct QuietSigning
+            {
+                QuietSigning() { suppress_presign_logging = true; }
+                ~QuietSigning() { suppress_presign_logging = false; }
+            } quiet;
+            if (entry->credentials->GetAWSCredentials().IsEmpty())
+            {
+                throw std::runtime_error(
+                    "AWS credentials unavailable. Sign in and reopen Properties.");
+            }
+            const auto url = entry->client->GeneratePresignedUrl(
+                path.bucket, path.key, Aws::Http::HttpMethod::HTTP_GET, seconds);
+            if (url.empty())
+                throw std::runtime_error("Cannot generate a download link.");
+            return url;
+        });
+    dialog.show(owner);
+}
+
 class FindState
 {
 public:
@@ -727,8 +844,9 @@ private:
                                  static_cast<std::uint64_t>(object.GetSize()),
                                  to_file_time(object.GetLastModified())))
                 {
-                    metadata[entries_.back().name] = {object.GetStorageClass(),
-                                                      to_wide(object.GetETag())};
+                    metadata[entries_.back().name] = {
+                        object.GetStorageClass(), to_wide(object.GetETag()),
+                        static_cast<std::uint64_t>(object.GetSize()), object.GetLastModified()};
                 }
             }
 
@@ -810,6 +928,8 @@ int initialize(int number, tProgressProcW progress, tLogProcW log, tRequestProcW
         private:
             void ProcessFormattedStatement(Aws::String&& statement) override
             {
+                if (suppress_presign_logging)
+                    return;
                 statement.pop_back(); // FormattedLogSystem always appends a newline
                 s3cmd::log("{}", statement);
             }
@@ -932,7 +1052,7 @@ void status_info(const wchar_t* remote_directory, int start_end, int operation)
     suppress_delete_listing = path.bucket.empty();
 }
 
-int execute_file(wchar_t* remote_name, const wchar_t* verb)
+int execute_file(wchar_t* remote_name, const wchar_t* verb, HWND owner)
 try
 {
     if (!remote_name || !verb)
@@ -972,7 +1092,17 @@ try
             return FS_EXEC_OK;
         return FS_EXEC_YOURSELF;
     }
-    else if (caseicmp(verb, L"properties") == 0 || ncaseicmp(verb, L"quote ", 6) == 0 ||
+    else if (caseicmp(verb, L"properties") == 0)
+    {
+        const auto path = RemotePathView::make(remote_name);
+        if (!path.profile.empty() && !path.bucket.empty() &&
+            !(path.bucket == add_existing_bucket_entry && path.key.empty()))
+        {
+            show_properties(owner, remote_name);
+        }
+        return FS_EXEC_OK;
+    }
+    else if (ncaseicmp(verb, L"quote ", 6) == 0 ||
              ncaseicmp(verb, L"chmod ", 6) == 0 || ncaseicmp(verb, L"mode ", 5) == 0)
     {
         return FS_EXEC_YOURSELF;
