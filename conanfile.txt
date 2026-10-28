@@ -8,7 +8,7 @@ fmt/12.2.0
 catch2/3.14.0
 
 [options]
-*:fPIC=False
+*:fPIC=True
 aws-sdk-cpp/*:access-management=False
 aws-sdk-cpp/*:identity-management=False
 aws-sdk-cpp/*:queues=False
