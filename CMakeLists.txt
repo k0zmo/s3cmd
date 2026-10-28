@@ -35,10 +35,11 @@ endif()
 
 find_package(tomlplusplus CONFIG REQUIRED)
 find_package(httplib CONFIG REQUIRED)
+find_package(fmt CONFIG REQUIRED)
 
 add_library(s3cmd-core STATIC
     src/fsplugin.h
-    src/prereq.h
+    src/prereq.hpp
     src/config.hpp                 src/config.cpp
     src/core.hpp                   src/core.cpp
     src/bucket_creation_dialog.hpp src/bucket_creation_dialog.cpp
@@ -54,9 +55,13 @@ add_library(s3cmd-core STATIC
 target_compile_features(s3cmd-core PUBLIC cxx_std_20)
 target_compile_definitions(s3cmd-core PUBLIC NOMINMAX WIN32_LEAN_AND_MEAN)
 target_include_directories(s3cmd-core PUBLIC "${s3cmd_SOURCE_DIR}/src")
-target_link_libraries(s3cmd-core PRIVATE
-    httplib::httplib
-    tomlplusplus::tomlplusplus
+target_link_libraries(s3cmd-core )
+target_link_libraries(s3cmd-core
+    PRIVATE
+        httplib::httplib
+        tomlplusplus::tomlplusplus
+    PUBLIC
+        fmt::fmt
 )
 
 if(TARGET AWS::aws-sdk-cpp-s3)

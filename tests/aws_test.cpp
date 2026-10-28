@@ -46,28 +46,28 @@ class TemporaryAppData
 public:
     TemporaryAppData()
         : path_(std::filesystem::temp_directory_path() /
-                (L"s3cmd-aws-" + std::to_wstring(GetCurrentProcessId()) + L"-" +
-                 std::to_wstring(GetTickCount64())))
+                ("s3cmd-aws-" + std::to_string(GetCurrentProcessId()) + "-" +
+                 std::to_string(GetTickCount64())))
     {
         wchar_t* previous{};
         std::size_t size{};
-        if (_wdupenv_s(&previous, &size, L"APPDATA") != 0)
+        if (_wdupenv_s(&previous, &size, s3cmd::win32_string(u"APPDATA")) != 0)
             throw std::runtime_error("Cannot read APPDATA");
         if (previous)
         {
-            old_ = previous;
+            old_ = s3cmd::utf16_string(previous);
             std::free(previous);
         }
 
         std::filesystem::create_directories(path_);
-        if (_wputenv_s(L"APPDATA", path_.c_str()) != 0)
+        if (_wputenv_s(s3cmd::win32_string(u"APPDATA"), path_.c_str()) != 0)
             throw std::runtime_error("Cannot set APPDATA");
         s3cmd::reset_config();
     }
 
     ~TemporaryAppData()
     {
-        _wputenv_s(L"APPDATA", old_.c_str());
+        _wputenv_s(s3cmd::win32_string(u"APPDATA"), s3cmd::win32_string(old_.c_str()));
         std::error_code ignored;
         std::filesystem::remove_all(path_, ignored);
     }
@@ -76,7 +76,7 @@ public:
 
 private:
     std::filesystem::path path_;
-    std::wstring old_;
+    std::u16string old_;
 };
 
 Aws::S3::S3Client make_client(const char* profile, const char* region)
@@ -178,12 +178,12 @@ TEST_CASE("a bucket can be entered using its own region", "[integration]")
     if (*list_buckets == "denied")
         REQUIRE(s3cmd::ProfileConfig(*profile).register_bucket(*bucket, *region));
 
-    auto profile_path = L"\\" + s3cmd::to_wide(*profile);
-    const auto bucket_name = s3cmd::to_wide(*bucket);
-    auto directory = profile_path + L"\\" + bucket_name;
+    auto profile_path = u"\\" + s3cmd::to_utf16(*profile);
+    const auto bucket_name = s3cmd::to_utf16(*bucket);
+    auto directory = profile_path + u"\\" + bucket_name;
 
     // Total Commander may open a saved bucket path without listing its profile first.
-    WIN32_FIND_DATAW entry{};
+    WfxFindData entry{};
     auto handle = s3cmd::find_first(directory.data(), &entry);
     REQUIRE(handle != INVALID_HANDLE_VALUE);
     s3cmd::find_close(handle);
@@ -201,7 +201,7 @@ TEST_CASE("a bucket can be entered using its own region", "[integration]")
 
     for (std::size_t index = 0; index < components.size(); ++index)
     {
-        const auto expected = s3cmd::to_wide(components[index]);
+        const auto expected = s3cmd::to_utf16(components[index]);
         handle = s3cmd::find_first(directory.data(), &entry);
         REQUIRE(handle != INVALID_HANDLE_VALUE);
 
@@ -221,7 +221,7 @@ TEST_CASE("a bucket can be entered using its own region", "[integration]")
         if (index + 1 < components.size())
         {
             REQUIRE((attributes & FILE_ATTRIBUTE_DIRECTORY) != 0);
-            directory += L"\\" + expected;
+            directory += u"\\" + expected;
         }
     }
 }
@@ -242,10 +242,10 @@ TEST_CASE("Get rejects an untracked partial local file", "[integration]")
     REQUIRE(s3cmd::ProfileConfig(*profile).register_bucket(*bucket, *region));
     PluginSession session;
 
-    auto remote = s3cmd::to_wide("\\" + *profile + "\\" + *bucket + "\\" + *object);
-    std::replace(remote.begin(), remote.end(), L'/', L'\\');
-    const auto local = app_data.path() / L"resumed-download";
-    auto local_name = local.wstring();
+    auto remote = s3cmd::to_utf16("\\" + *profile + "\\" + *bucket + "\\" + *object);
+    std::replace(remote.begin(), remote.end(), u'/', u'\\');
+    const auto local = app_data.path() / u"resumed-download";
+    auto local_name = local.u16string();
 
     REQUIRE(s3cmd::get_file(remote.data(), local_name.data(), 0, nullptr) == FS_FILE_OK);
     const auto size = std::filesystem::file_size(local);

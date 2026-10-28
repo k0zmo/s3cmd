@@ -4,8 +4,9 @@
 #include "resource.h"
 
 #include <Windows.h>
+#include <fmt/xchar.h>
+
 #include <algorithm>
-#include <format>
 
 extern "C" IMAGE_DOS_HEADER __ImageBase;
 
@@ -22,7 +23,7 @@ HICON load_icon(int resource_id, int size)
 
 } // namespace
 
-int extract_custom_icon(wchar_t* remote_name, int extract_flags, HICON* icon)
+int extract_custom_icon(char16_t* remote_name, int extract_flags, HICON* icon)
 {
     if (remote_name == nullptr || icon == nullptr)
         return FS_ICON_USEDEFAULT;
@@ -32,10 +33,10 @@ int extract_custom_icon(wchar_t* remote_name, int extract_flags, HICON* icon)
         if (path.bucket.empty())
         {
             // We still want to have a default icon for "one level up" entry
-            if (!path.profile.empty() && path.profile != L"..")
+            if (!path.profile.empty() && path.profile != u"..")
                 return IDI_PROFILE;
         }
-        else if (path.key.empty() && path.bucket != L"..")
+        else if (path.key.empty() && path.bucket != u"..")
         {
             return IDI_BUCKET;
         }
@@ -52,8 +53,8 @@ int extract_custom_icon(wchar_t* remote_name, int extract_flags, HICON* icon)
 
     // Return icon name remote_name to improve caching strategy of the calling app.
     // We also append the size since at least double commander doesn't key on it
-    const auto name = std::format(L"s3cmd.{}.{}",
-                                  resource_id == IDI_PROFILE ? L"profile" : L"bucket", size);
+    const auto name = fmt::format(u"s3cmd.{}.{}",
+                                  resource_id == IDI_PROFILE ? u"profile" : u"bucket", size);
     std::copy_n(name.c_str(), name.size() + 1, remote_name);
     return FS_ICON_EXTRACTED_DESTROY;
 }

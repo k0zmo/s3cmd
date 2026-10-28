@@ -28,12 +28,12 @@ WFX_EXPORT int __stdcall FsInitW(int number, tProgressProcW progress, tLogProcW 
     return s3cmd::initialize(number, progress, log, request);
 }
 
-WFX_EXPORT HANDLE __stdcall FsFindFirstW(wchar_t* path, WIN32_FIND_DATAW* find_data)
+WFX_EXPORT HANDLE __stdcall FsFindFirstW(char16_t* path, WfxFindData* find_data)
 {
     return s3cmd::find_first(path, find_data);
 }
 
-WFX_EXPORT BOOL __stdcall FsFindNextW(HANDLE handle, WIN32_FIND_DATAW* find_data)
+WFX_EXPORT BOOL __stdcall FsFindNextW(HANDLE handle, WfxFindData* find_data)
 {
     return s3cmd::find_next(handle, find_data);
 }
@@ -43,23 +43,23 @@ WFX_EXPORT int __stdcall FsFindClose(HANDLE handle)
     return s3cmd::find_close(handle);
 }
 
-WFX_EXPORT void __stdcall FsStatusInfoW(wchar_t* remote_directory, int start_end, int operation)
+WFX_EXPORT void __stdcall FsStatusInfoW(char16_t* remote_directory, int start_end, int operation)
 {
     s3cmd::status_info(remote_directory, start_end, operation);
 }
 
-WFX_EXPORT int __stdcall FsExecuteFileW(HWND main_win, wchar_t* remote_name, wchar_t* verb)
+WFX_EXPORT int __stdcall FsExecuteFileW(HWND main_win, char16_t* remote_name, char16_t* verb)
 {
     return s3cmd::execute_file(remote_name, verb, main_win);
 }
 
-WFX_EXPORT int __stdcall FsGetFileW(wchar_t* remote_name, wchar_t* local_name, int copy_flags,
+WFX_EXPORT int __stdcall FsGetFileW(char16_t* remote_name, char16_t* local_name, int copy_flags,
                                     RemoteInfoStruct* info)
 {
     return s3cmd::get_file(remote_name, local_name, copy_flags, info);
 }
 
-WFX_EXPORT int __stdcall FsPutFileW(wchar_t* local_name, wchar_t* remote_name, int copy_flags)
+WFX_EXPORT int __stdcall FsPutFileW(char16_t* local_name, char16_t* remote_name, int copy_flags)
 {
     return s3cmd::put_file(local_name, remote_name, copy_flags);
 }
@@ -69,22 +69,22 @@ WFX_EXPORT int __stdcall FsGetBackgroundFlags()
     return BG_DOWNLOAD | BG_UPLOAD;
 }
 
-WFX_EXPORT BOOL __stdcall FsDeleteFileW(wchar_t* remote_name)
+WFX_EXPORT BOOL __stdcall FsDeleteFileW(char16_t* remote_name)
 {
     return s3cmd::delete_file(remote_name);
 }
 
-WFX_EXPORT BOOL __stdcall FsMkDirW(wchar_t* remote_name)
+WFX_EXPORT BOOL __stdcall FsMkDirW(char16_t* remote_name)
 {
     return s3cmd::make_directory(remote_name);
 }
 
-WFX_EXPORT BOOL __stdcall FsRemoveDirW(wchar_t* remote_name)
+WFX_EXPORT BOOL __stdcall FsRemoveDirW(char16_t* remote_name)
 {
     return s3cmd::remove_directory(remote_name);
 }
 
-WFX_EXPORT int __stdcall FsRenMovFileW(wchar_t* old_name, wchar_t* new_name, BOOL move,
+WFX_EXPORT int __stdcall FsRenMovFileW(char16_t* old_name, char16_t* new_name, BOOL move,
                                        BOOL overwrite, RemoteInfoStruct* info)
 {
     return s3cmd::rename_or_move(old_name, new_name, move, overwrite, info);
@@ -95,7 +95,7 @@ WFX_EXPORT void __stdcall FsGetDefRootName(char* name, int max_length)
     s3cmd::get_default_root_name(name, max_length);
 }
 
-WFX_EXPORT int __stdcall FsExtractCustomIconW(wchar_t* remote_name, int extract_flags,
+WFX_EXPORT int __stdcall FsExtractCustomIconW(char16_t* remote_name, int extract_flags,
                                               HICON* icon)
 {
     return s3cmd::extract_custom_icon(remote_name, extract_flags, icon);
@@ -107,7 +107,7 @@ WFX_EXPORT int __stdcall FsContentGetSupportedField(int field_index, char* field
     return s3cmd::content_get_supported_field(field_index, field_name, units, max_length);
 }
 
-WFX_EXPORT int __stdcall FsContentGetValueW(wchar_t* file_name, int field_index, int, void* value,
+WFX_EXPORT int __stdcall FsContentGetValueW(char16_t* file_name, int field_index, int, void* value,
                                             int max_length, int)
 {
     return s3cmd::content_get_value(file_name, field_index, value, max_length);

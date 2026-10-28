@@ -1,5 +1,5 @@
 #include "sso.hpp"
-#include "prereq.h"
+#include "prereq.hpp"
 #include "core.hpp"
 #include "config.hpp"
 #include "log.hpp"
@@ -29,6 +29,7 @@
 #include <aws/sso-oidc/model/StartDeviceAuthorizationRequest.h>
 
 #include <httplib.h>
+#include <fmt/xchar.h>
 
 #include <shellapi.h>
 
@@ -38,7 +39,6 @@
 #include <cstddef>
 #include <cstdint>
 #include <filesystem>
-#include <format>
 #include <ios>
 #include <fstream>
 #include <mutex>
@@ -63,7 +63,7 @@ SsoLoginFailed::SsoLoginFailed(std::string message)
 }
 
 SsoLoginCancelled::SsoLoginCancelled(std::string_view profile)
-    : SsoLoginFailed(std::format("AWS SSO login for profile '{}' was cancelled", profile))
+    : SsoLoginFailed(fmt::format("AWS SSO login for profile '{}' was cancelled", profile))
 {
 }
 
@@ -74,10 +74,10 @@ bool wait_for_sso(PluginHost& host,
                   std::binary_semaphore& ready,
                   steady_clock::time_point deadline)
 {
-    const auto source = to_wide(profile);
+    const auto source = to_utf16(profile);
     while (steady_clock::now() < deadline)
     {
-        if (host.notify_progress(source.c_str(), L"Waiting for AWS SSO login", 0))
+        if (host.notify_progress(source.c_str(), u"Waiting for AWS SSO login", 0))
             throw SsoLoginCancelled(profile);
         const auto next = std::min(deadline, steady_clock::now() + 100ms);
         if (ready.try_acquire_until(next))
@@ -137,7 +137,7 @@ Aws::SSOOIDC::Model::RegisterClientResult
     const auto registration = oidc.RegisterClient(request);
     if (!registration.IsSuccess())
     {
-        throw SsoLoginFailed(std::format("AWS SSO client registration failed: {}",
+        throw SsoLoginFailed(fmt::format("AWS SSO client registration failed: {}",
                                          registration.GetError().GetMessage()));
     }
 
@@ -170,9 +170,10 @@ Aws::SSOOIDC::Model::RegisterClientResult
 
 bool open_url(std::string_view url)
 {
-    const auto wide_url = to_wide(url);
-    return reinterpret_cast<std::intptr_t>(ShellExecuteW(nullptr, L"open", wide_url.c_str(),
-                                                         nullptr, nullptr, SW_SHOWNORMAL)) > 32;
+    const auto wide_url = to_utf16(url);
+    return reinterpret_cast<std::intptr_t>(
+               ShellExecuteW(nullptr, win32_string(u"open"), win32_string(wide_url.c_str()),
+                             nullptr, nullptr, SW_SHOWNORMAL)) > 32;
 }
 
 std::string base64_url(const Aws::Utils::ByteBuffer& buf)
@@ -299,7 +300,7 @@ void perform_pkce_sso_login(PluginHost& plugin_host, std::string_view profile_na
     if (port <= 0)
         throw SsoLoginFailed("Cannot start the AWS SSO browser callback server");
     const auto redirect_uri =
-        std::format("http://127.0.0.1:{}/oauth/callback", port);
+        fmt::format("http://127.0.0.1:{}/oauth/callback", port);
 
     Aws::SSOOIDC::Model::RegisterClientRequest register_request;
     register_request.SetClientName("s3cmd");
@@ -313,7 +314,7 @@ void perform_pkce_sso_login(PluginHost& plugin_host, std::string_view profile_na
         register_sso_client(sso_cache_directory(), start_url, region, register_request, oidc);
 
     const auto dns_suffix = region.starts_with("cn-") ? "amazonaws.com.cn" : "amazonaws.com";
-    const auto authorization_url = std::format(
+    const auto authorization_url = fmt::format(
         "https://oidc.{}.{}/authorize?response_type=code&client_id={}&redirect_uri={}&state={}"
         "&code_challenge_method=S256&scopes={}&code_challenge={}",
         region,
@@ -344,12 +345,12 @@ void perform_pkce_sso_login(PluginHost& plugin_host, std::string_view profile_na
     {
         if (!open_url(authorization_url))
         {
-            auto url_buffer = to_wide(authorization_url);
-            url_buffer.push_back(L'\0'); // RequestProc's maxlen includes the terminator.
+            auto url_buffer = to_utf16(authorization_url);
+            url_buffer.push_back(u'\0'); // RequestProc's maxlen includes the terminator.
             if (!plugin_host.notify_message_box_result(
                 PluginHost::message_box_type::url, title,
-                L"The AWS SSO browser could not be opened automatically.\n\n"
-                L"Copy or open this URL manually, then click OK to keep waiting.",
+                u"The AWS SSO browser could not be opened automatically.\n\n"
+                u"Copy or open this URL manually, then click OK to keep waiting.",
                 url_buffer))
             {
                 throw SsoLoginCancelled(profile_name);
@@ -372,12 +373,12 @@ void perform_pkce_sso_login(PluginHost& plugin_host, std::string_view profile_na
 
     if (!completed)
     {
-        throw SsoLoginFailed(std::format("AWS SSO login for profile '{}' timed out", profile_name));
+        throw SsoLoginFailed(fmt::format("AWS SSO login for profile '{}' timed out", profile_name));
     }
     if (callback_error)
     {
         throw SsoLoginFailed(
-            std::format("AWS SSO browser authorization failed: {}", *callback_error));
+            fmt::format("AWS SSO browser authorization failed: {}", *callback_error));
     }
 
     Aws::SSOOIDC::Model::CreateTokenRequest token_request;
@@ -391,7 +392,7 @@ void perform_pkce_sso_login(PluginHost& plugin_host, std::string_view profile_na
     if (!token.IsSuccess())
     {
         throw SsoLoginFailed(
-            std::format("AWS SSO token request failed: {}", token.GetError().GetMessage()));
+            fmt::format("AWS SSO token request failed: {}", token.GetError().GetMessage()));
     }
 
     write_sso_token(profile_name, start_url, region, registration, token.GetResult());
@@ -417,7 +418,7 @@ void perform_device_sso_login(PluginHost& plugin_host, std::string_view profile_
     const auto authorization = oidc.StartDeviceAuthorization(start_request);
     if (!authorization.IsSuccess())
     {
-        throw SsoLoginFailed(std::format("AWS SSO device authorization failed: {}",
+        throw SsoLoginFailed(fmt::format("AWS SSO device authorization failed: {}",
                                          authorization.GetError().GetMessage()));
     }
 
@@ -426,13 +427,13 @@ void perform_device_sso_login(PluginHost& plugin_host, std::string_view profile_
                           ? device.GetVerificationUri()
                           : device.GetVerificationUriComplete();
     const auto browser_opened = open_url(url);
-    auto url_buffer = to_wide(url);
-    url_buffer.push_back(L'\0'); // RequestProc's maxlen includes the terminator.
-    const auto message = std::format(
-        L"Complete AWS SSO login for profile '{}' in your browser.\n\n"
-        L"Code: {}\n\nYou can copy the URL from the field below.\n\n"
-        L"Click OK after AWS reports success.",
-        to_wide(profile_name), to_wide(device.GetUserCode()));
+    auto url_buffer = to_utf16(url);
+    url_buffer.push_back(u'\0'); // RequestProc's maxlen includes the terminator.
+    const auto message = fmt::format(
+        u"Complete AWS SSO login for profile '{}' in your browser.\n\n"
+        u"Code: {}\n\nYou can copy the URL from the field below.\n\n"
+        u"Click OK after AWS reports success.",
+        to_utf16(profile_name), to_utf16(device.GetUserCode()));
     if (!plugin_host.notify_message_box_result(
             PluginHost::message_box_type::url, title, message.c_str(), url_buffer))
     {
@@ -478,11 +479,11 @@ void perform_device_sso_login(PluginHost& plugin_host, std::string_view profile_
             break;
         default:
             throw SsoLoginFailed(
-                std::format("AWS SSO token request failed: {}", token.GetError().GetMessage()));
+                fmt::format("AWS SSO token request failed: {}", token.GetError().GetMessage()));
         }
     }
 
-    throw SsoLoginFailed(std::format("AWS SSO login for profile '{}' timed out", profile_name));
+    throw SsoLoginFailed(fmt::format("AWS SSO login for profile '{}' timed out", profile_name));
 }
 
 } // namespace
@@ -499,7 +500,7 @@ void perform_sso_login(PluginHost& plugin_host,
     const auto& region = session.GetSsoRegion();
     if (start_url.empty() || region.empty())
     {
-        throw SsoLoginFailed(std::format(
+        throw SsoLoginFailed(fmt::format(
             "AWS SSO profile '{}' is missing sso_start_url or sso_region", profile_name));
     }
 
@@ -510,9 +511,9 @@ void perform_sso_login(PluginHost& plugin_host,
 
     if (!plugin_host.notify_message_box(
             PluginHost::message_box_type::msg_yes_no, title,
-            L"AWS SSO credentials for profile '{}' are unavailable or expired.\n\n"
-            L"Start browser login?",
-            to_wide(profile_name)))
+            u"AWS SSO credentials for profile '{}' are unavailable or expired.\n\n"
+            u"Start browser login?",
+            to_utf16(profile_name)))
     {
         throw SsoLoginCancelled(profile_name);
     }
@@ -538,9 +539,9 @@ void perform_sso_login(PluginHost& plugin_host,
         {
             log("[s3cmd] AWS SSO PKCE login failed: {}", error.what());
             if (!plugin_host.notify_message_box(PluginHost::message_box_type::msg_yes_no, title,
-                                                L"AWS SSO browser login failed:\n{}\n\n"
-                                                L"Try device-code login instead?",
-                                                to_wide(error.what())))
+                                                u"AWS SSO browser login failed:\n{}\n\n"
+                                                u"Try device-code login instead?",
+                                                to_utf16(error.what())))
             {
                 throw;
             }

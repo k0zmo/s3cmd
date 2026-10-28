@@ -25,6 +25,7 @@
 #include <commctrl.h>
 
 #include <atomic>
+#include <algorithm>
 #include <array>
 #include <chrono>
 #include <cstdlib>
@@ -43,16 +44,16 @@ namespace {
 int request_count{};
 int request_type{};
 bool request_accept{true};
-std::wstring request_text;
-std::vector<std::wstring> request_inputs;
-std::wstring log_text;
+std::u16string request_text;
+std::vector<std::u16string> request_inputs;
+std::u16string log_text;
 std::atomic<bool> transfer_waiting{};
 std::atomic<bool> transfer_canceled{};
 DWORD transfer_caller{};
 bool transfer_wrong_thread{};
 std::vector<int> transfer_percentages;
 
-int __stdcall cancel_stalled_transfer(int, wchar_t*, wchar_t*, int percent)
+int __stdcall cancel_stalled_transfer(int, char16_t*, char16_t*, int percent)
 {
     transfer_percentages.push_back(percent);
     transfer_wrong_thread |= GetCurrentThreadId() != transfer_caller;
@@ -62,15 +63,15 @@ int __stdcall cancel_stalled_transfer(int, wchar_t*, wchar_t*, int percent)
     return 1;
 }
 
-BOOL __stdcall capture_request(int, int type, wchar_t*, wchar_t* text, wchar_t*, int)
+BOOL __stdcall capture_request(int, int type, char16_t*, char16_t* text, char16_t*, int)
 {
     ++request_count;
     request_type = type;
-    request_text = text ? text : L"";
+    request_text = text ? text : u"";
     return request_accept;
 }
 
-BOOL __stdcall answer_request(int number, int type, wchar_t* title, wchar_t* text, wchar_t* out,
+BOOL __stdcall answer_request(int number, int type, char16_t* title, char16_t* text, char16_t* out,
                               int max_length)
 {
     if (!capture_request(number, type, title, text, out, max_length) ||
@@ -78,14 +79,17 @@ BOOL __stdcall answer_request(int number, int type, wchar_t* title, wchar_t* tex
     {
         return FALSE;
     }
-    wcsncpy_s(out, max_length, request_inputs[request_count - 1].c_str(), _TRUNCATE);
+    const auto& input = request_inputs[request_count - 1];
+    const auto length = std::min(input.size(), static_cast<std::size_t>(max_length - 1));
+    std::copy_n(input.data(), length, out);
+    out[length] = u'\0';
     return TRUE;
 }
 
-void __stdcall capture_log(int, int type, wchar_t* text)
+void __stdcall capture_log(int, int type, char16_t* text)
 {
     if (type == MSGTYPE_IMPORTANTERROR)
-        log_text = text ? text : L"";
+        log_text = text ? text : u"";
 }
 
 struct TemporaryEnvironment
@@ -124,11 +128,11 @@ struct PluginSession
     ~PluginSession() { s3cmd::shutdown(); }
 };
 
-std::wstring dialog_text(HWND dialog, int control)
+std::u16string dialog_text(HWND dialog, int control)
 {
     const auto length = GetWindowTextLengthW(GetDlgItem(dialog, control));
-    std::wstring text(static_cast<std::size_t>(length) + 1, L'\0');
-    GetDlgItemTextW(dialog, control, text.data(), static_cast<int>(text.size()));
+    std::u16string text(static_cast<std::size_t>(length) + 1, u'\0');
+    GetDlgItemTextW(dialog, control, s3cmd::win32_string(text.data()), static_cast<int>(text.size()));
     text.resize(length);
     return text;
 }
@@ -184,27 +188,27 @@ struct TemporaryConfig
 {
     TemporaryConfig()
         : root(std::filesystem::temp_directory_path() /
-               (L"s3cmd-" + std::to_wstring(GetCurrentProcessId()) + L"-" +
-                std::to_wstring(GetTickCount64()))),
-          path(root / L"s3cmd" / L"s3cmd.toml")
+               ("s3cmd-" + std::to_string(GetCurrentProcessId()) + "-" +
+                std::to_string(GetTickCount64()))),
+          path(root / u"s3cmd" / u"s3cmd.toml")
     {
         wchar_t* previous{};
         std::size_t size{};
-        if (_wdupenv_s(&previous, &size, L"APPDATA") != 0)
+        if (_wdupenv_s(&previous, &size, s3cmd::win32_string(u"APPDATA")) != 0)
             throw std::runtime_error("Cannot read APPDATA");
         if (previous)
         {
-            old_app_data = previous;
+            old_app_data = s3cmd::utf16_string(previous);
             std::free(previous);
         }
         std::filesystem::create_directories(root);
-        if (_wputenv_s(L"APPDATA", root.c_str()) != 0)
+        if (_wputenv_s(s3cmd::win32_string(u"APPDATA"), root.c_str()) != 0)
             throw std::runtime_error("Cannot set APPDATA");
     }
 
     ~TemporaryConfig()
     {
-        _wputenv_s(L"APPDATA", old_app_data.c_str());
+        _wputenv_s(s3cmd::win32_string(u"APPDATA"), s3cmd::win32_string(old_app_data.c_str()));
         std::error_code ignored;
         std::filesystem::remove_all(root, ignored);
     }
@@ -221,7 +225,7 @@ struct TemporaryConfig
 
     std::filesystem::path root;
     std::filesystem::path path;
-    std::wstring old_app_data;
+    std::u16string old_app_data;
 };
 
 TemporaryConfig& temporary_config()
@@ -232,11 +236,11 @@ TemporaryConfig& temporary_config()
 }
 
 void write_resume_record(const TemporaryConfig& config, const std::filesystem::path& local,
-                         std::wstring_view remote, std::string_view e_tag, std::uint64_t size)
+                         std::u16string_view remote, std::string_view e_tag, std::uint64_t size)
 {
-    const auto key = s3cmd::to_utf8(std::filesystem::absolute(local).lexically_normal().native());
+    const auto key = s3cmd::to_utf8(std::filesystem::absolute(local).lexically_normal().u16string());
     std::filesystem::create_directories(config.path.parent_path());
-    std::ofstream file(config.path.parent_path() / L"resume.toml");
+    std::ofstream file(config.path.parent_path() / u"resume.toml");
     file << "[downloads.'" << key << "']\n"
          << "remote = '" << s3cmd::to_utf8(remote) << "'\n"
          << "etag = '" << e_tag << "'\n"
@@ -261,7 +265,7 @@ std::string read_file(const std::filesystem::path& path)
 TEST_CASE("Download commit preserves an unexpected destination", "[unit]")
 {
     auto& config = temporary_config();
-    const auto local = config.root / L"download";
+    const auto local = config.root / u"download";
     s3cmd::ResumeFile resume{local, "remote"};
     std::ofstream(local, std::ios::binary) << "existing";
     std::ofstream(resume.download_path(), std::ios::binary) << "replacement";
@@ -278,9 +282,9 @@ TEST_CASE("Download commit preserves an unexpected destination", "[unit]")
 TEST_CASE("Plugin initialization prunes invalid resume entries", "[unit]")
 {
     auto& config = temporary_config();
-    const auto valid = config.root / L"valid";
-    const auto missing = config.root / L"missing";
-    const auto complete = config.root / L"complete";
+    const auto valid = config.root / u"valid";
+    const auto missing = config.root / u"missing";
+    const auto complete = config.root / u"complete";
     s3cmd::ResumeFile valid_resume{valid, "remote"};
     s3cmd::ResumeFile missing_resume{missing, "remote"};
     s3cmd::ResumeFile complete_resume{complete, "remote"};
@@ -292,9 +296,9 @@ TEST_CASE("Plugin initialization prunes invalid resume entries", "[unit]")
 
     {
         PluginSession session;
-        const auto document = read_file(config.path.parent_path() / L"resume.toml");
+        const auto document = read_file(config.path.parent_path() / u"resume.toml");
         const auto key = [](const std::filesystem::path& path) {
-            return s3cmd::to_utf8(std::filesystem::absolute(path).lexically_normal().native());
+            return s3cmd::to_utf8(std::filesystem::absolute(path).lexically_normal().u16string());
         };
         CHECK(document.find(key(valid)) != std::string::npos);
         CHECK(document.find(key(missing)) == std::string::npos);
@@ -307,11 +311,11 @@ TEST_CASE("Plugin initialization prunes invalid resume entries", "[unit]")
 TEST_CASE("Get rejects an untracked local file without a resume state", "[unit]")
 {
     auto& config = temporary_config();
-    const auto local = config.root / L"download";
+    const auto local = config.root / u"download";
     std::ofstream(local, std::ios::binary) << "partial";
     PluginSession session;
 
-    CHECK(s3cmd::get_file(L"\\resume-test\\bucket\\object", local.c_str(), FS_COPYFLAGS_RESUME,
+    CHECK(s3cmd::get_file(u"\\resume-test\\bucket\\object", local.u16string().c_str(), FS_COPYFLAGS_RESUME,
                           nullptr) == FS_FILE_NOTSUPPORTED);
     CHECK(read_file(local) == "partial");
 }
@@ -319,9 +323,9 @@ TEST_CASE("Get rejects an untracked local file without a resume state", "[unit]"
 TEST_CASE("Get discards HTTP error bodies before retry", "[unit]")
 {
     auto& config = temporary_config();
-    const auto local = config.root / L"download";
+    const auto local = config.root / u"download";
     auto differently_cased_local = local;
-    differently_cased_local.replace_filename(L"DOWNLOAD");
+    differently_cased_local.replace_filename(u"DOWNLOAD");
     std::string object = "prefix and the rest of the object";
     std::atomic<bool> reject{true};
     std::atomic<bool> stall{};
@@ -342,7 +346,7 @@ TEST_CASE("Get discards HTTP error bodies before retry", "[unit]")
             ++head_requests;
         if (probe_duplicate.exchange(false))
             duplicate_result =
-                s3cmd::get_file(L"\\resume-test\\bucket\\object", differently_cased_local.c_str(),
+                s3cmd::get_file(u"\\resume-test\\bucket\\object", differently_cased_local.u16string().c_str(),
                                 FS_COPYFLAGS_OVERWRITE, nullptr);
         if (delay)
             std::this_thread::sleep_for(std::chrono::milliseconds(250));
@@ -407,7 +411,7 @@ TEST_CASE("Get discards HTTP error bodies before retry", "[unit]")
     {
         reject = false;
         probe_duplicate = true;
-        CHECK(s3cmd::get_file(L"\\resume-test\\bucket\\object", local.c_str(),
+        CHECK(s3cmd::get_file(u"\\resume-test\\bucket\\object", local.u16string().c_str(),
                               FS_COPYFLAGS_OVERWRITE, nullptr) == FS_FILE_OK);
         CHECK(duplicate_result == FS_FILE_WRITEERROR);
         CHECK(read_file(local) == object);
@@ -417,7 +421,7 @@ TEST_CASE("Get discards HTTP error bodies before retry", "[unit]")
     {
         reject = false;
         object.assign(128 * 1024, 'x');
-        REQUIRE(s3cmd::get_file(L"\\resume-test\\bucket\\object", local.c_str(), 0, nullptr) ==
+        REQUIRE(s3cmd::get_file(u"\\resume-test\\bucket\\object", local.u16string().c_str(), 0, nullptr) ==
                 FS_FILE_OK);
         CHECK(read_file(local) == object);
         return;
@@ -426,7 +430,7 @@ TEST_CASE("Get discards HTTP error bodies before retry", "[unit]")
     {
         reject = false;
         std::ofstream(download, std::ios::binary) << std::string(object.size(), 'x');
-        CHECK(s3cmd::get_file(L"\\resume-test\\bucket\\object", local.c_str(),
+        CHECK(s3cmd::get_file(u"\\resume-test\\bucket\\object", local.u16string().c_str(),
                               FS_COPYFLAGS_RESUME | FS_COPYFLAGS_MOVE,
                               nullptr) == FS_FILE_NOTSUPPORTED);
         CHECK(read_file(download) == std::string(object.size(), 'x'));
@@ -436,9 +440,9 @@ TEST_CASE("Get discards HTTP error bodies before retry", "[unit]")
     {
         ignore_range = true;
         std::ofstream(download, std::ios::binary) << "prefix";
-        write_resume_record(config, local, L"\\resume-test\\bucket\\object", "\"test\"",
+        write_resume_record(config, local, u"\\resume-test\\bucket\\object", "\"test\"",
                             object.size());
-        CHECK(s3cmd::get_file(L"\\resume-test\\bucket\\object", local.c_str(), FS_COPYFLAGS_RESUME,
+        CHECK(s3cmd::get_file(u"\\resume-test\\bucket\\object", local.u16string().c_str(), FS_COPYFLAGS_RESUME,
                               nullptr) == FS_FILE_READERROR);
         CHECK(read_file(download) == "prefix");
         CHECK(head_requests == 0);
@@ -450,7 +454,7 @@ TEST_CASE("Get discards HTTP error bodies before retry", "[unit]")
         delay = true;
         std::ofstream(local, std::ios::binary) << "existing target";
         std::ofstream(download, std::ios::binary) << object.substr(0, 6);
-        write_resume_record(config, local, L"\\resume-test\\bucket\\object", "\"test\"",
+        write_resume_record(config, local, u"\\resume-test\\bucket\\object", "\"test\"",
                             object.size());
         RemoteInfoStruct info{};
         info.SizeLow = static_cast<DWORD>(object.size());
@@ -460,7 +464,7 @@ TEST_CASE("Get discards HTTP error bodies before retry", "[unit]")
         {
             listed = nullptr;
         }
-        REQUIRE(s3cmd::get_file(L"\\resume-test\\bucket\\object", local.c_str(),
+        REQUIRE(s3cmd::get_file(u"\\resume-test\\bucket\\object", local.u16string().c_str(),
                                 FS_COPYFLAGS_RESUME, listed) == FS_FILE_OK);
         REQUIRE(transfer_percentages.size() >= 4);
         const auto expected = static_cast<int>(6 * 100 / object.size());
@@ -487,7 +491,7 @@ TEST_CASE("Get discards HTTP error bodies before retry", "[unit]")
     {
         stall = true;
         std::ofstream(local, std::ios::binary) << "existing target";
-        CHECK(s3cmd::get_file(L"\\resume-test\\bucket\\object", local.c_str(),
+        CHECK(s3cmd::get_file(u"\\resume-test\\bucket\\object", local.u16string().c_str(),
                               FS_COPYFLAGS_OVERWRITE, nullptr) == FS_FILE_USERABORT);
         CHECK(transfer_canceled);
         CHECK_FALSE(transfer_wrong_thread);
@@ -497,8 +501,8 @@ TEST_CASE("Get discards HTTP error bodies before retry", "[unit]")
     SECTION("missing listing metadata skips the resume record")
     {
         reject = false;
-        std::filesystem::create_directories(config.path.parent_path() / L"resume.toml");
-        CHECK(s3cmd::get_file(L"\\resume-test\\bucket\\object", local.c_str(),
+        std::filesystem::create_directories(config.path.parent_path() / u"resume.toml");
+        CHECK(s3cmd::get_file(u"\\resume-test\\bucket\\object", local.u16string().c_str(),
                               FS_COPYFLAGS_OVERWRITE, nullptr) == FS_FILE_OK);
         CHECK_FALSE(std::filesystem::exists(download));
         return;
@@ -508,28 +512,28 @@ TEST_CASE("Get discards HTTP error bodies before retry", "[unit]")
         prefix = object.substr(0, 6);
         flags = FS_COPYFLAGS_RESUME;
         std::ofstream(download, std::ios::binary) << prefix;
-        write_resume_record(config, local, L"\\resume-test\\bucket\\object", "\"test\"",
+        write_resume_record(config, local, u"\\resume-test\\bucket\\object", "\"test\"",
                             object.size());
     }
     SECTION("cancel upload while waiting for response headers")
     {
         stall = true;
         std::ofstream(local, std::ios::binary) << object;
-        CHECK(s3cmd::put_file(local.c_str(), L"\\resume-test\\bucket\\object", FS_COPYFLAGS_MOVE) ==
+        CHECK(s3cmd::put_file(local.u16string().c_str(), u"\\resume-test\\bucket\\object", FS_COPYFLAGS_MOVE) ==
               FS_FILE_USERABORT);
         CHECK(transfer_canceled);
         CHECK_FALSE(transfer_wrong_thread);
         CHECK(std::filesystem::exists(local));
         return;
     }
-    REQUIRE(s3cmd::get_file(L"\\resume-test\\bucket\\object", local.c_str(), flags, nullptr) ==
+    REQUIRE(s3cmd::get_file(u"\\resume-test\\bucket\\object", local.u16string().c_str(), flags, nullptr) ==
             (flags == FS_COPYFLAGS_RESUME ? FS_FILE_NOTSUPPORTED : FS_FILE_READERROR));
     REQUIRE(read_file(download) == prefix);
     CHECK_FALSE(std::filesystem::exists(local));
     if (flags == FS_COPYFLAGS_RESUME)
         CHECK(if_match == "\"test\"");
     reject = false;
-    REQUIRE(s3cmd::get_file(L"\\resume-test\\bucket\\object", local.c_str(), FS_COPYFLAGS_OVERWRITE,
+    REQUIRE(s3cmd::get_file(u"\\resume-test\\bucket\\object", local.u16string().c_str(), FS_COPYFLAGS_OVERWRITE,
                             nullptr) == FS_FILE_OK);
     CHECK(read_file(local) == object);
     CHECK_FALSE(std::filesystem::exists(download));
@@ -599,21 +603,21 @@ TEST_CASE("Get resume state survives restart and rejects a changed object", "[un
     TemporaryEnvironment region("AWS_DEFAULT_REGION", "us-east-1");
     TemporaryEnvironment checksum("AWS_REQUEST_CHECKSUM_CALCULATION", "when_required");
     REQUIRE(s3cmd::ProfileConfig("resume-test").register_bucket("bucket", "us-east-1"));
-    const auto local = config.root / L"download";
+    const auto local = config.root / u"download";
     const auto download = download_path(local);
     std::ofstream(local, std::ios::binary) << "existing target";
 
     {
         PluginSession session(0, cancel_stalled_transfer);
-        wchar_t directory[] = L"\\resume-test\\bucket";
-        WIN32_FIND_DATAW entry{};
+        char16_t directory[] = u"\\resume-test\\bucket";
+        WfxFindData entry{};
         const auto handle = s3cmd::find_first(directory, &entry);
         REQUIRE(handle != INVALID_HANDLE_VALUE);
         s3cmd::find_close(handle);
         RemoteInfoStruct info{};
         info.SizeLow = entry.nFileSizeLow;
         info.SizeHigh = entry.nFileSizeHigh;
-        CHECK(s3cmd::get_file(L"\\resume-test\\bucket\\object", local.c_str(),
+        CHECK(s3cmd::get_file(u"\\resume-test\\bucket\\object", local.u16string().c_str(),
                               FS_COPYFLAGS_OVERWRITE, &info) == FS_FILE_USERABORT);
     }
     REQUIRE(read_file(local) == "existing target");
@@ -628,16 +632,16 @@ TEST_CASE("Get resume state survives restart and rejects a changed object", "[un
     info.SizeLow = static_cast<DWORD>(object.size());
     {
         PluginSession session;
-        CHECK(s3cmd::get_file(L"\\resume-test\\bucket\\object", local.c_str(), 0, &info) ==
+        CHECK(s3cmd::get_file(u"\\resume-test\\bucket\\object", local.u16string().c_str(), 0, &info) ==
               FS_FILE_EXISTSRESUMEALLOWED);
-        CHECK(s3cmd::get_file(L"\\resume-test\\bucket\\object", local.c_str(), FS_COPYFLAGS_RESUME,
+        CHECK(s3cmd::get_file(u"\\resume-test\\bucket\\object", local.u16string().c_str(), FS_COPYFLAGS_RESUME,
                               &info) == FS_FILE_NOTSUPPORTED);
         CHECK(if_match == "\"original\"");
         CHECK(read_file(local) == "existing target");
         CHECK(read_file(download) == "prefix");
-        CHECK(s3cmd::get_file(L"\\resume-test\\bucket\\object", local.c_str(), 0, &info) ==
+        CHECK(s3cmd::get_file(u"\\resume-test\\bucket\\object", local.u16string().c_str(), 0, &info) ==
               FS_FILE_EXISTS);
-        CHECK(s3cmd::get_file(L"\\resume-test\\bucket\\object", local.c_str(),
+        CHECK(s3cmd::get_file(u"\\resume-test\\bucket\\object", local.u16string().c_str(),
                               FS_COPYFLAGS_OVERWRITE, &info) == FS_FILE_OK);
     }
     CHECK(read_file(local) == object);
@@ -785,13 +789,13 @@ TEST_CASE("bucket creation lets an invalid initial name be corrected", "[unit]")
     static std::function<void(HWND)> exercise;
     exercise = [&](HWND dialog) {
         exercised = true;
-        std::array<wchar_t, 128> text{};
-        GetDlgItemTextW(dialog, IDC_BUCKET_PREFIX, text.data(), static_cast<int>(text.size()));
+        std::array<char16_t, 128> text{};
+        GetDlgItemTextW(dialog, IDC_BUCKET_PREFIX, s3cmd::win32_string(text.data()), static_cast<int>(text.size()));
         CHECK(s3cmd::to_utf8(text.data()) == initial);
         CHECK_FALSE(IsWindowEnabled(GetDlgItem(dialog, IDOK)));
         CHECK(GetWindowTextLengthW(GetDlgItem(dialog, IDC_BUCKET_ERROR)) > 0);
 
-        SetDlgItemTextW(dialog, IDC_BUCKET_PREFIX, L"corrected-bucket");
+        SetDlgItemTextW(dialog, IDC_BUCKET_PREFIX, s3cmd::win32_string(u"corrected-bucket"));
         CHECK(IsWindowEnabled(GetDlgItem(dialog, IDOK)));
         CHECK(GetWindowTextLengthW(GetDlgItem(dialog, IDC_BUCKET_ERROR)) == 0);
         if (account_regional)
@@ -799,10 +803,10 @@ TEST_CASE("bucket creation lets an invalid initial name be corrected", "[unit]")
             SendDlgItemMessageW(dialog, IDC_BUCKET_NAMESPACE, CB_SETCURSEL, 1, 0);
             SendMessageW(dialog, WM_COMMAND, MAKEWPARAM(IDC_BUCKET_NAMESPACE, CBN_SELCHANGE), 0);
         }
-        GetDlgItemTextW(dialog, IDC_BUCKET_PREVIEW, text.data(), static_cast<int>(text.size()));
-        CHECK(std::wstring_view(text.data()) ==
-              (account_regional ? L"corrected-bucket-123456789012-eu-central-1-an"
-                                : L"corrected-bucket"));
+        GetDlgItemTextW(dialog, IDC_BUCKET_PREVIEW, s3cmd::win32_string(text.data()), static_cast<int>(text.size()));
+        CHECK(std::u16string_view(text.data()) ==
+              (account_regional ? u"corrected-bucket-123456789012-eu-central-1-an"
+                                : u"corrected-bucket"));
         SendMessageW(dialog, WM_COMMAND, IDOK, 0);
     };
     const auto hook = SetWindowsHookExW(
@@ -827,32 +831,68 @@ TEST_CASE("bucket creation lets an invalid initial name be corrected", "[unit]")
         (account_regional ? "corrected-bucket-123456789012-eu-central-1-an" : "corrected-bucket"));
 }
 
+TEST_CASE("UTF-16 strings preserve Unicode and reject malformed encoding", "[unit]")
+{
+    const std::u16string utf16 = u"r\u00e9sum\u00e9/\U0001f680";
+    const std::string utf8 = "r\xc3\xa9sum\xc3\xa9/\xf0\x9f\x9a\x80";
+    CHECK(s3cmd::to_utf16(utf8) == utf16);
+    CHECK(s3cmd::to_utf8(utf16) == utf8);
+    CHECK(s3cmd::to_utf16("").empty());
+    CHECK(s3cmd::to_utf8(u"").empty());
+    CHECK(s3cmd::to_utf8(s3cmd::to_utf16(std::string("a\0b", 3))) == std::string("a\0b", 3));
+    CHECK_THROWS_AS(s3cmd::to_utf16("\xc0\xaf"), std::runtime_error);
+    CHECK_THROWS_AS(s3cmd::to_utf8(std::u16string(1, 0xd800)), std::runtime_error);
+    CHECK_THROWS_AS(s3cmd::to_utf8(std::u16string(1, 0xdc00)), std::runtime_error);
+}
+
+TEST_CASE("UTF-16 comparisons respect case, length, and terminators", "[unit]")
+{
+    CHECK(s3cmd::caseicmp(u"Open", u"OPEN") == 0);
+    CHECK(s3cmd::caseicmp(u"", u"") == 0);
+    CHECK(s3cmd::caseicmp(u"ab", u"ABC") < 0);
+    CHECK(s3cmd::caseicmp(u"b", u"A") > 0);
+    CHECK(s3cmd::ncaseicmp(u"Quote object", u"QUOTE ", 6) == 0);
+    CHECK(s3cmd::ncaseicmp(u"a", u"b", 0) == 0);
+    CHECK(s3cmd::ncaseicmp(u"a", u"ab", 2) < 0);
+}
+
+TEST_CASE("host dialogs format UTF-16 strings and numbers", "[unit]")
+{
+    s3cmd::PluginHost host(0, nullptr, nullptr, capture_request);
+    request_count = 0;
+    request_accept = true;
+    CHECK(host.notify_message_box(s3cmd::PluginHost::message_box_type::msg_ok, u"s3cmd",
+                                  u"{}: {}", u"\U0001f680", 42));
+    CHECK(request_count == 1);
+    CHECK(request_text == u"\U0001f680: 42");
+}
+
 TEST_CASE("remote paths identify profile, bucket, and object", "[unit]")
 {
-    CHECK(s3cmd::RemotePath::make(L"\\") == s3cmd::RemotePath{});
-    CHECK(s3cmd::RemotePath::make(L"\\work") == s3cmd::RemotePath{"work", {}, {}});
-    CHECK(s3cmd::RemotePath::make(L"\\work\\my-bucket") ==
+    CHECK(s3cmd::RemotePath::make(u"\\") == s3cmd::RemotePath{});
+    CHECK(s3cmd::RemotePath::make(u"\\work") == s3cmd::RemotePath{"work", {}, {}});
+    CHECK(s3cmd::RemotePath::make(u"\\work\\my-bucket") ==
           s3cmd::RemotePath{"work", "my-bucket", {}});
-    CHECK(s3cmd::RemotePath::make(L"\\work\\my-bucket\\one\\two.txt") ==
+    CHECK(s3cmd::RemotePath::make(u"\\work\\my-bucket\\one\\two.txt") ==
           s3cmd::RemotePath{"work", "my-bucket", "one/two.txt"});
-    CHECK(s3cmd::RemotePath::make(L"\\\\work\\my-bucket\\one\\\\") ==
+    CHECK(s3cmd::RemotePath::make(u"\\\\work\\my-bucket\\one\\\\") ==
           s3cmd::RemotePath{"work", "my-bucket", "one"});
 }
 
-TEST_CASE("remote path views borrow the original wide path", "[unit]")
+TEST_CASE("remote path views borrow the original UTF-16 path", "[unit]")
 {
     using s3cmd::RemotePathView;
     CHECK(RemotePathView::make({}) == RemotePathView{});
-    CHECK(RemotePathView::make(L"\\\\") == RemotePathView{});
-    CHECK(RemotePathView::make(L"\\work\\") == RemotePathView{L"work", {}, {}});
-    CHECK(RemotePathView::make(L"\\work\\bucket\\") == RemotePathView{L"work", L"bucket", {}});
-    CHECK(RemotePathView::make(L"\\work\\..\\") == RemotePathView{L"work", L"..", {}});
-    CHECK(RemotePathView::make(L"\\\\work\\bucket\\one\\\\") ==
-          RemotePathView{L"work", L"bucket", L"one"});
+    CHECK(RemotePathView::make(u"\\\\") == RemotePathView{});
+    CHECK(RemotePathView::make(u"\\work\\") == RemotePathView{u"work", {}, {}});
+    CHECK(RemotePathView::make(u"\\work\\bucket\\") == RemotePathView{u"work", u"bucket", {}});
+    CHECK(RemotePathView::make(u"\\work\\..\\") == RemotePathView{u"work", u"..", {}});
+    CHECK(RemotePathView::make(u"\\\\work\\bucket\\one\\\\") ==
+          RemotePathView{u"work", u"bucket", u"one"});
 
-    const std::wstring path = L"\\w\u00f3rk\\bucket\\one\\two.txt";
+    const std::u16string path = u"\\w\u00f3rk\\bucket\\one\\two.txt";
     const auto view = RemotePathView::make(path);
-    CHECK(view == RemotePathView{L"w\u00f3rk", L"bucket", L"one\\two.txt"});
+    CHECK(view == RemotePathView{u"w\u00f3rk", u"bucket", u"one\\two.txt"});
     CHECK(view.profile.data() == path.data() + 1);
     CHECK(view.bucket.data() == path.data() + 6);
     CHECK(view.key.data() == path.data() + 13);
@@ -930,10 +970,10 @@ TEST_CASE("virtual deletes skip recursive directory listings", "[unit]")
     TemporaryEnvironment region("AWS_DEFAULT_REGION", "us-east-1");
     PluginSession session;
 
-    wchar_t root[] = L"\\";
-    wchar_t profile[] = L"\\work";
-    wchar_t bucket[] = L"\\work\\bucket";
-    WIN32_FIND_DATAW entry{};
+    char16_t root[] = u"\\";
+    char16_t profile[] = u"\\work";
+    char16_t bucket[] = u"\\work\\bucket";
+    WfxFindData entry{};
 
     s3cmd::status_info(root, FS_STATUS_START, FS_STATUS_OP_DELETE);
     SetLastError(ERROR_SUCCESS);
@@ -946,8 +986,8 @@ TEST_CASE("virtual deletes skip recursive directory listings", "[unit]")
     SetLastError(ERROR_SUCCESS);
     CHECK(s3cmd::find_first(bucket, &entry) == INVALID_HANDLE_VALUE);
     CHECK(GetLastError() == ERROR_NO_MORE_FILES);
-    CHECK_FALSE(s3cmd::delete_file(L"\\work\\bucket\\file.txt"));
-    CHECK_FALSE(s3cmd::remove_directory(L"\\work\\bucket\\folder"));
+    CHECK_FALSE(s3cmd::delete_file(u"\\work\\bucket\\file.txt"));
+    CHECK_FALSE(s3cmd::remove_directory(u"\\work\\bucket\\folder"));
     CHECK(s3cmd::remove_directory(bucket) == (delete_status == 204));
     CHECK(bucket_deletes == 1);
     CHECK(object_deletes == 0);
@@ -957,7 +997,7 @@ TEST_CASE("virtual deletes skip recursive directory listings", "[unit]")
     if (delete_status == 204)
         CHECK(config.bucket_region("bucket").empty());
     s3cmd::status_info(profile, FS_STATUS_END, FS_STATUS_OP_DELETE);
-    CHECK(s3cmd::delete_file(L"\\work\\bucket\\file.txt"));
+    CHECK(s3cmd::delete_file(u"\\work\\bucket\\file.txt"));
     CHECK(object_deletes == 1);
 }
 
@@ -970,24 +1010,24 @@ TEST_CASE("directory prefixes use S3 separators", "[unit]")
 
 TEST_CASE("remote files are delegated to the host for opening", "[unit]")
 {
-    wchar_t object[] = L"\\work\\bucket\\file.txt";
-    wchar_t bucket[] = L"\\work\\bucket";
-    wchar_t named_object[] = L"\\work\\bucket\\_Add existing bucket_";
-    CHECK(s3cmd::execute_file(object, L"open") == FS_EXEC_YOURSELF);
-    CHECK(s3cmd::execute_file(object, L"OPEN") == FS_EXEC_YOURSELF);
-    CHECK(s3cmd::execute_file(bucket, L"open") == FS_EXEC_OK);
-    CHECK(s3cmd::execute_file(object, L"MODE I") == FS_EXEC_YOURSELF);
-    CHECK(s3cmd::execute_file(named_object, L"open") == FS_EXEC_YOURSELF);
+    char16_t object[] = u"\\work\\bucket\\file.txt";
+    char16_t bucket[] = u"\\work\\bucket";
+    char16_t named_object[] = u"\\work\\bucket\\_Add existing bucket_";
+    CHECK(s3cmd::execute_file(object, u"open") == FS_EXEC_YOURSELF);
+    CHECK(s3cmd::execute_file(object, u"OPEN") == FS_EXEC_YOURSELF);
+    CHECK(s3cmd::execute_file(bucket, u"open") == FS_EXEC_OK);
+    CHECK(s3cmd::execute_file(object, u"MODE I") == FS_EXEC_YOURSELF);
+    CHECK(s3cmd::execute_file(named_object, u"open") == FS_EXEC_YOURSELF);
 }
 
 TEST_CASE("Properties skips commands and profiles", "[unit]")
 {
     temporary_config();
     PropertiesDriver driver([](HWND dialog) { PropertiesDriver::finish(dialog); });
-    for (const auto name : {L"\\", L"\\work", L"\\work\\_Add existing bucket_"})
+    for (const auto name : {u"\\", u"\\work", u"\\work\\_Add existing bucket_"})
     {
-        std::wstring path(name);
-        CHECK(s3cmd::execute_file(path.data(), L"PROPERTIES") == FS_EXEC_OK);
+        std::u16string path(name);
+        CHECK(s3cmd::execute_file(path.data(), u"PROPERTIES") == FS_EXEC_OK);
     }
     CHECK_FALSE(driver.activated);
 }
@@ -1000,10 +1040,10 @@ TEST_CASE("Properties supports sharing during tag loading and cancels on close",
     std::atomic<unsigned> expiration{};
     int stage{};
     PropertiesDriver driver([&](HWND dialog) {
-        CHECK(dialog_text(dialog, IDC_PROPERTIES_ADDRESS) == L"s3://bucket/folder/file.txt");
+        CHECK(dialog_text(dialog, IDC_PROPERTIES_ADDRESS) == u"s3://bucket/folder/file.txt");
         if (stage == 0 && IsWindowEnabled(GetDlgItem(dialog, IDC_PROPERTIES_GENERATE)))
         {
-            CHECK(dialog_text(dialog, IDC_PROPERTIES_DETAILS) == L"Size: 42 bytes");
+            CHECK(dialog_text(dialog, IDC_PROPERTIES_DETAILS) == u"Size: 42 bytes");
             SendMessageW(dialog, WM_COMMAND, IDC_PROPERTIES_GENERATE, 0);
             CHECK_FALSE(IsWindowEnabled(GetDlgItem(dialog, IDC_PROPERTIES_GENERATE)));
             ++stage;
@@ -1078,25 +1118,25 @@ TEST_CASE("Properties preserves the address and handles authentication and worke
     int stage{};
     int attempts{};
     PropertiesDriver driver([&](HWND dialog) {
-        CHECK(dialog_text(dialog, IDC_PROPERTIES_ADDRESS) == L"s3://bucket/file.txt");
+        CHECK(dialog_text(dialog, IDC_PROPERTIES_ADDRESS) == u"s3://bucket/file.txt");
         CHECK(IsWindowEnabled(GetDlgItem(dialog, IDC_PROPERTIES_COPY_ADDRESS)));
         if (prepare_fails)
         {
-            if (dialog_text(dialog, IDC_PROPERTIES_DETAILS) == L"Authentication failed.")
+            if (dialog_text(dialog, IDC_PROPERTIES_DETAILS) == u"Authentication failed.")
             {
                 CHECK_FALSE(IsWindowEnabled(GetDlgItem(dialog, IDC_PROPERTIES_GENERATE)));
                 ++stage;
                 PropertiesDriver::finish(dialog);
             }
         }
-        else if (stage == 0 && dialog_text(dialog, IDC_PROPERTIES_DETAILS) == L"Metadata failed.")
+        else if (stage == 0 && dialog_text(dialog, IDC_PROPERTIES_DETAILS) == u"Metadata failed.")
         {
             CHECK(IsWindowEnabled(GetDlgItem(dialog, IDC_PROPERTIES_GENERATE)));
-            CHECK(dialog_text(dialog, IDC_PROPERTIES_REGION) == L"eu-central-1");
+            CHECK(dialog_text(dialog, IDC_PROPERTIES_REGION) == u"eu-central-1");
             SendMessageW(dialog, WM_COMMAND, IDC_PROPERTIES_GENERATE, 0);
             ++stage;
         }
-        else if (stage == 1 && dialog_text(dialog, IDC_PROPERTIES_LINK_STATUS) == L"Signing failed.")
+        else if (stage == 1 && dialog_text(dialog, IDC_PROPERTIES_LINK_STATUS) == u"Signing failed.")
         {
             CHECK_FALSE(IsWindowEnabled(GetDlgItem(dialog, IDC_PROPERTIES_COPY_URL)));
             CHECK(IsWindowEnabled(GetDlgItem(dialog, IDC_PROPERTIES_GENERATE)));
@@ -1150,7 +1190,7 @@ TEST_CASE("S3 Properties uses listed metadata, fetches tags, and signs the real 
     SECTION("closing during a tag request preserves listed metadata") { cancel = true; }
 
     const std::string object_key = "r\xc3\xa9sum\xc3\xa9 #?.txt";
-    const std::wstring wide_key = L"r\u00e9sum\u00e9 #?.txt";
+    const std::u16string wide_key = u"r\u00e9sum\u00e9 #?.txt";
     std::atomic<int> tag_requests{}, unexpected_requests{};
     httplib::Server server;
     server.set_pre_routing_handler([&](const httplib::Request& request, httplib::Response& response) {
@@ -1204,8 +1244,8 @@ TEST_CASE("S3 Properties uses listed metadata, fetches tags, and signs the real 
     PluginSession session;
     if (!bucket && !unlisted)
     {
-        WIN32_FIND_DATAW data{};
-        const auto listing = s3cmd::find_first(L"\\work\\bucket", &data);
+        WfxFindData data{};
+        const auto listing = s3cmd::find_first(u"\\work\\bucket", &data);
         REQUIRE(listing != INVALID_HANDLE_VALUE);
         s3cmd::find_close(listing);
     }
@@ -1217,41 +1257,41 @@ TEST_CASE("S3 Properties uses listed metadata, fetches tags, and signs the real 
             if (tag_requests > 0)
             {
                 const auto details = dialog_text(dialog, IDC_PROPERTIES_DETAILS);
-                CHECK(details.find(L"42 bytes") != details.npos);
-                CHECK(details.find(L"2026-10-23T12:00:00Z") != details.npos);
-                CHECK(dialog_text(dialog, IDC_PROPERTIES_TAG_STATUS) == L"Loading tags...");
+                CHECK(details.find(u"42 bytes") != details.npos);
+                CHECK(details.find(u"2026-10-23T12:00:00Z") != details.npos);
+                CHECK(dialog_text(dialog, IDC_PROPERTIES_TAG_STATUS) == u"Loading tags...");
                 checked = true;
                 PropertiesDriver::finish(dialog);
             }
             return;
         }
-        if (dialog_text(dialog, IDC_PROPERTIES_DETAILS) == L"Loading properties..." ||
-            dialog_text(dialog, IDC_PROPERTIES_TAG_STATUS) == L"Loading tags...")
+        if (dialog_text(dialog, IDC_PROPERTIES_DETAILS) == u"Loading properties..." ||
+            dialog_text(dialog, IDC_PROPERTIES_TAG_STATUS) == u"Loading tags...")
             return;
         if (!checked)
         {
             checked = true;
-            const auto expected_address = bucket ? L"s3://bucket/" : uncached_file ?
-                L"s3://bucket/" + wide_key + L"/" : folder ?
-                L"s3://bucket/folder/" : L"s3://bucket/" + wide_key;
+            const auto expected_address = bucket ? u"s3://bucket/" : uncached_file ?
+                u"s3://bucket/" + wide_key + u"/" : folder ?
+                u"s3://bucket/folder/" : u"s3://bucket/" + wide_key;
             CHECK(dialog_text(dialog, IDC_PROPERTIES_ADDRESS) == expected_address);
-            CHECK(dialog_text(dialog, IDC_PROPERTIES_REGION) == L"eu-central-1");
+            CHECK(dialog_text(dialog, IDC_PROPERTIES_REGION) == u"eu-central-1");
             CHECK(IsWindowVisible(GetDlgItem(dialog, IDC_PROPERTIES_LINK_GROUP)) == (!bucket && !folder));
             CHECK(IsWindowVisible(GetDlgItem(dialog, IDC_PROPERTIES_TAG_GROUP)) == !folder);
             const auto tags = dialog_text(dialog, IDC_PROPERTIES_TAG_STATUS);
             if (tags_denied)
-                CHECK(tags.find(L"AccessDenied") != tags.npos);
+                CHECK(tags.find(u"AccessDenied") != tags.npos);
             else if (no_tags)
-                CHECK(tags == L"No tags.");
+                CHECK(tags == u"No tags.");
             else if (!folder)
                 CHECK(ListView_GetItemCount(GetDlgItem(dialog, IDC_PROPERTIES_TAGS)) == 1);
             if (!bucket && !folder)
             {
                 const auto details = dialog_text(dialog, IDC_PROPERTIES_DETAILS);
-                CHECK(details.find(L"42 bytes") != details.npos);
-                CHECK(details.find(L"2026-10-23T12:00:00Z") != details.npos);
-                CHECK(details.find(L"STANDARD_IA") != details.npos);
-                CHECK(details.find(L"listed") != details.npos);
+                CHECK(details.find(u"42 bytes") != details.npos);
+                CHECK(details.find(u"2026-10-23T12:00:00Z") != details.npos);
+                CHECK(details.find(u"STANDARD_IA") != details.npos);
+                CHECK(details.find(u"listed") != details.npos);
                 CHECK(IsWindowEnabled(GetDlgItem(dialog, IDC_PROPERTIES_GENERATE)));
                 SendMessageW(dialog, WM_COMMAND, IDC_PROPERTIES_GENERATE, 0);
             }
@@ -1273,10 +1313,10 @@ TEST_CASE("S3 Properties uses listed metadata, fetches tags, and signs the real 
             PropertiesDriver::finish(dialog);
         }
     });
-    std::wstring path = L"\\work\\bucket";
+    std::u16string path = u"\\work\\bucket";
     if (!bucket)
-        path += L"\\" + (folder && !uncached_file ? std::wstring(L"folder") : wide_key);
-    CHECK(s3cmd::execute_file(path.data(), L"properties") == FS_EXEC_OK);
+        path += u"\\" + (folder && !uncached_file ? std::u16string(u"folder") : wide_key);
+    CHECK(s3cmd::execute_file(path.data(), u"properties") == FS_EXEC_OK);
     CHECK(driver.activated);
     CHECK_FALSE(driver.timed_out);
     CHECK(checked);
@@ -1290,7 +1330,7 @@ TEST_CASE("Add existing bucket opens a local registration prompt", "[unit]")
     temporary_config();
     request_count = 0;
     request_accept = true;
-    request_inputs = {L"existing-bucket"};
+    request_inputs = {u"existing-bucket"};
     bool location_allowed{true};
     bool callback_available{true};
     bool expect_registration{true};
@@ -1298,7 +1338,7 @@ TEST_CASE("Add existing bucket opens a local registration prompt", "[unit]")
     SECTION("asks for the region when discovery fails")
     {
         location_allowed = false;
-        request_inputs.push_back(L"eu-west-1");
+        request_inputs.push_back(u"eu-west-1");
     }
     SECTION("cancel leaves the registry unchanged")
     {
@@ -1307,12 +1347,12 @@ TEST_CASE("Add existing bucket opens a local registration prompt", "[unit]")
     }
     SECTION("empty input leaves the registry unchanged")
     {
-        request_inputs = {L""};
+        request_inputs = {u""};
         expect_registration = false;
     }
     SECTION("a path cannot register a directory marker")
     {
-        request_inputs = {L"existing-bucket/folder"};
+        request_inputs = {u"existing-bucket/folder"};
         expect_registration = false;
     }
     SECTION("a missing callback fails without discovery")
@@ -1353,11 +1393,11 @@ TEST_CASE("Add existing bucket opens a local registration prompt", "[unit]")
     TemporaryEnvironment region("AWS_DEFAULT_REGION", "us-east-1");
     PluginSession session(0, nullptr, nullptr, callback_available ? answer_request : nullptr);
 
-    wchar_t remote_name[] = L"\\work\\_Add existing bucket_";
-    CHECK(s3cmd::execute_file(remote_name, L"OPEN") ==
+    char16_t remote_name[] = u"\\work\\_Add existing bucket_";
+    CHECK(s3cmd::execute_file(remote_name, u"OPEN") ==
           (expect_registration ? FS_EXEC_SYMLINK : FS_EXEC_ERROR));
-    CHECK(std::wstring_view(remote_name) ==
-          (expect_registration ? L"\\work" : L"\\work\\_Add existing bucket_"));
+    CHECK(std::u16string_view(remote_name) ==
+          (expect_registration ? u"\\work" : u"\\work\\_Add existing bucket_"));
     CHECK(request_count == (callback_available ? (location_allowed ? 1 : 2) : 0));
     CHECK(location_requests == (expect_registration ? 1 : 0));
     CHECK(saw_location_query == expect_registration);
@@ -1433,10 +1473,10 @@ TEST_CASE("bucket registration is disabled when buckets were discovered", "[unit
 
     request_count = 0;
     request_accept = true;
-    request_inputs = {L"new-bucket"};
+    request_inputs = {u"new-bucket"};
     PluginSession prompted(0, nullptr, nullptr, answer_request);
-    wchar_t action[] = L"\\work\\_Add existing bucket_";
-    CHECK(s3cmd::execute_file(action, L"open") == FS_EXEC_ERROR);
+    char16_t action[] = u"\\work\\_Add existing bucket_";
+    CHECK(s3cmd::execute_file(action, u"open") == FS_EXEC_ERROR);
     CHECK_FALSE(profile.registered_buckets().contains("new-bucket"));
 }
 
@@ -1448,10 +1488,10 @@ TEST_CASE("bucket registration rejects an already registered bucket", "[unit]")
 
     request_count = 0;
     request_accept = true;
-    request_inputs = {L"registered-bucket"};
+    request_inputs = {u"registered-bucket"};
     PluginSession prompted(0, nullptr, nullptr, answer_request);
-    wchar_t action[] = L"\\work\\_Add existing bucket_";
-    CHECK(s3cmd::execute_file(action, L"open") == FS_EXEC_ERROR);
+    char16_t action[] = u"\\work\\_Add existing bucket_";
+    CHECK(s3cmd::execute_file(action, u"open") == FS_EXEC_ERROR);
 }
 
 TEST_CASE("registered regions override discovered regions", "[unit]")
@@ -1482,17 +1522,23 @@ TEST_CASE("Region is exposed as a Total Commander content field", "[unit]")
     CHECK(std::string_view(name) == "ETag");
     CHECK(s3cmd::content_get_supported_field(3, name, units, sizeof(name)) == ft_nomorefields);
 
-    wchar_t bucket_path[] = L"\\work\\owned-bucket";
-    wchar_t value[32]{};
+    char16_t bucket_path[] = u"\\work\\owned-bucket";
+    char16_t value[32]{};
     {
         PluginSession session;
         CHECK(s3cmd::content_get_value(bucket_path, 0, value, sizeof(value)) == ft_stringw);
-        CHECK(std::wstring_view(value) == L"ap-southeast-1");
+        CHECK(std::u16string_view(value) == u"ap-southeast-1");
+
+        char16_t short_value[4]{u'?', u'?', u'?', u'?'};
+        CHECK(s3cmd::content_get_value(bucket_path, 0, short_value, 7) == ft_stringw);
+        CHECK(std::u16string_view(short_value) == u"ap");
+        CHECK(short_value[3] == u'?');
+        CHECK(s3cmd::content_get_value(bucket_path, 0, short_value, 1) == ft_fileerror);
 
         s3cmd::reset_config();
         CHECK(s3cmd::content_get_value(bucket_path, 0, value, sizeof(value)) == ft_fieldempty);
 
-        wchar_t object_path[] = L"\\work\\owned-bucket\\file.txt";
+        char16_t object_path[] = u"\\work\\owned-bucket\\file.txt";
         CHECK(s3cmd::content_get_value(object_path, 0, value, sizeof(value)) == ft_fieldempty);
     }
 
@@ -1504,10 +1550,10 @@ TEST_CASE("Object metadata retention is bounded by entry count", "[unit]")
 {
     using namespace s3cmd;
     using Aws::S3::Model::ObjectStorageClass;
-    const MetadataDirectory<> a{L"work", L"bucket", L"a\\"};
-    const MetadataDirectory<> b{L"work", L"bucket", L"b\\"};
-    const MetadataDirectory<> c{L"work", L"bucket", L"c\\"};
-    const ObjectMetadataMap objects{{L"file.txt", {ObjectStorageClass::STANDARD, L"abc123"}}};
+    const MetadataDirectory<> a{u"work", u"bucket", u"a\\"};
+    const MetadataDirectory<> b{u"work", u"bucket", u"b\\"};
+    const MetadataDirectory<> c{u"work", u"bucket", u"c\\"};
+    const ObjectMetadataMap objects{{u"file.txt", {ObjectStorageClass::STANDARD, u"abc123"}}};
     ObjectMetadataCache cache(4);
     cache.add(a, objects);
     cache.add(b, objects);
@@ -1515,50 +1561,50 @@ TEST_CASE("Object metadata retention is bounded by entry count", "[unit]")
 
     SECTION("a successful lookup retains the older directory")
     {
-        REQUIRE(cache.find(a, L"file.txt"));
+        REQUIRE(cache.find(a, u"file.txt"));
         cache.add(c, objects);
-        CHECK(cache.find(b, L"file.txt") == nullptr);
-        CHECK(cache.find(a, L"file.txt") != nullptr);
-        CHECK(cache.find(c, L"file.txt") != nullptr);
+        CHECK(cache.find(b, u"file.txt") == nullptr);
+        CHECK(cache.find(a, u"file.txt") != nullptr);
+        CHECK(cache.find(c, u"file.txt") != nullptr);
         CHECK(cache.retained_entries() == 4);
         cache.add(b, objects);
-        CHECK(cache.find(b, L"file.txt") != nullptr);
+        CHECK(cache.find(b, u"file.txt") != nullptr);
     }
     SECTION("misses do not update recency")
     {
-        CHECK(cache.find(a, L"missing") == nullptr);
+        CHECK(cache.find(a, u"missing") == nullptr);
         cache.add(c, objects);
-        CHECK(cache.find(a, L"file.txt") == nullptr);
-        CHECK(cache.find(b, L"file.txt") != nullptr);
+        CHECK(cache.find(a, u"file.txt") == nullptr);
+        CHECK(cache.find(b, u"file.txt") != nullptr);
     }
     SECTION("replacement updates recency without accumulating entries")
     {
         cache.add(a, objects);
         CHECK(cache.retained_entries() == 4);
         cache.add(c, objects);
-        CHECK(cache.find(b, L"file.txt") == nullptr);
-        CHECK(cache.find(a, L"file.txt") != nullptr);
+        CHECK(cache.find(b, u"file.txt") == nullptr);
+        CHECK(cache.find(a, u"file.txt") != nullptr);
     }
     SECTION("an oversized directory stays complete until a new publication")
     {
-        ObjectMetadataMap large{{L"one", {ObjectStorageClass::STANDARD, L"first"}},
-                                {L"two", {ObjectStorageClass::STANDARD, L"second"}},
-                                {L"three", {ObjectStorageClass::STANDARD, L"third"}},
-                                {L"four", {ObjectStorageClass::STANDARD, L"fourth"}}};
+        ObjectMetadataMap large{{u"one", {ObjectStorageClass::STANDARD, u"first"}},
+                                {u"two", {ObjectStorageClass::STANDARD, u"second"}},
+                                {u"three", {ObjectStorageClass::STANDARD, u"third"}},
+                                {u"four", {ObjectStorageClass::STANDARD, u"fourth"}}};
         cache.add(c, std::move(large));
         CHECK(cache.retained_entries() == 5);
-        CHECK(cache.find(a, L"file.txt") == nullptr);
-        CHECK(cache.find(b, L"file.txt") == nullptr);
-        CHECK(cache.find(c, L"one") != nullptr);
-        CHECK(cache.find(c, L"two") != nullptr);
+        CHECK(cache.find(a, u"file.txt") == nullptr);
+        CHECK(cache.find(b, u"file.txt") == nullptr);
+        CHECK(cache.find(c, u"one") != nullptr);
+        CHECK(cache.find(c, u"two") != nullptr);
         cache.add(a, objects);
-        CHECK(cache.find(c, L"one") == nullptr);
+        CHECK(cache.find(c, u"one") == nullptr);
         CHECK(cache.retained_entries() == 2);
     }
     SECTION("empty replacements still consume one entry and clear old objects")
     {
         cache.add(a, {});
-        CHECK(cache.find(a, L"file.txt") == nullptr);
+        CHECK(cache.find(a, u"file.txt") == nullptr);
         CHECK(cache.retained_entries() == 3);
         ObjectMetadataCache empty_cache(1);
         empty_cache.add(a, {});
@@ -1569,7 +1615,7 @@ TEST_CASE("Object metadata retention is bounded by entry count", "[unit]")
     {
         cache.clear();
         CHECK(cache.retained_entries() == 0);
-        CHECK(cache.find(a, L"file.txt") == nullptr);
+        CHECK(cache.find(a, u"file.txt") == nullptr);
         cache.add(a, objects);
         CHECK(cache.retained_entries() == 2);
     }
@@ -1629,17 +1675,17 @@ TEST_CASE("Bucket listing shows a registration hint once per empty profile", "[u
         PluginSession session(0, nullptr, nullptr, callback_available ? capture_request : nullptr);
         for (int refresh = 0; refresh < 2; ++refresh)
         {
-            WIN32_FIND_DATAW entry{};
-            const auto handle = s3cmd::find_first(L"\\work", &entry);
+            WfxFindData entry{};
+            const auto handle = s3cmd::find_first(u"\\work", &entry);
             if (!listing_allowed)
             {
                 REQUIRE(handle != INVALID_HANDLE_VALUE);
-                CHECK(std::wstring_view(entry.cFileName) == L"_Add existing bucket_");
+                CHECK(std::u16string_view(entry.cFileName) == u"_Add existing bucket_");
                 CHECK_FALSE(entry.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY);
                 if (registered)
                 {
                     REQUIRE(s3cmd::find_next(handle, &entry));
-                    CHECK(std::wstring_view(entry.cFileName) == L"private-bucket");
+                    CHECK(std::u16string_view(entry.cFileName) == u"private-bucket");
                 }
                 CHECK_FALSE(s3cmd::find_next(handle, &entry));
                 s3cmd::find_close(handle);
@@ -1655,20 +1701,20 @@ TEST_CASE("Bucket listing shows a registration hint once per empty profile", "[u
         if (expect_hint)
         {
             CHECK(request_type == RT_MsgOK);
-            CHECK(request_text.find(L"work") != request_text.npos);
-            CHECK(request_text.find(L"_Add existing bucket_") != request_text.npos);
-            CHECK(request_text.find(L"existing bucket") != request_text.npos);
+            CHECK(request_text.find(u"work") != request_text.npos);
+            CHECK(request_text.find(u"_Add existing bucket_") != request_text.npos);
+            CHECK(request_text.find(u"existing bucket") != request_text.npos);
         }
     }
     PluginSession restarted(0, nullptr, nullptr, capture_request);
-    WIN32_FIND_DATAW entry{};
-    const auto handle = s3cmd::find_first(L"\\work", &entry);
+    WfxFindData entry{};
+    const auto handle = s3cmd::find_first(u"\\work", &entry);
     if (handle != INVALID_HANDLE_VALUE)
         s3cmd::find_close(handle);
     CHECK(request_count == (listing_allowed || registered ? 0 : 1));
     if (!listing_allowed && !registered)
     {
-        const auto other = s3cmd::find_first(L"\\other", &entry);
+        const auto other = s3cmd::find_first(u"\\other", &entry);
         REQUIRE(other != INVALID_HANDLE_VALUE);
         s3cmd::find_close(other);
         CHECK(request_count == 2);
@@ -1692,11 +1738,11 @@ TEST_CASE("ListObjectsV2 metadata is exposed as content fields", "[unit]")
         const auto second_page = request.has_param("continuation-token");
         if (second_page)
         {
-            wchar_t value[32]{};
+            char16_t value[32]{};
             saw_previous_snapshot =
-                s3cmd::content_get_value(L"\\work\\owned-bucket\\folder\\file.txt", 2, value,
+                s3cmd::content_get_value(u"\\work\\owned-bucket\\folder\\file.txt", 2, value,
                                          sizeof(value)) == ft_stringw &&
-                std::wstring_view(value) == L"abc123";
+                std::u16string_view(value) == u"abc123";
         }
         if (mode == 3 && second_page)
         {
@@ -1757,19 +1803,19 @@ TEST_CASE("ListObjectsV2 metadata is exposed as content fields", "[unit]")
     TemporaryEnvironment region("AWS_DEFAULT_REGION", "us-east-1");
     PluginSession session;
 
-    wchar_t path[] = L"\\work\\owned-bucket\\folder";
-    WIN32_FIND_DATAW entry{};
+    char16_t path[] = u"\\work\\owned-bucket\\folder";
+    WfxFindData entry{};
     const auto handle = s3cmd::find_first(path, &entry);
     REQUIRE(handle != INVALID_HANDLE_VALUE);
-    CHECK(std::wstring_view(entry.cFileName) == L"file.txt");
+    CHECK(std::u16string_view(entry.cFileName) == u"file.txt");
     s3cmd::find_close(handle);
 
-    wchar_t object_path[] = L"\\work\\owned-bucket\\folder\\file.txt";
-    wchar_t value[32]{};
+    char16_t object_path[] = u"\\work\\owned-bucket\\folder\\file.txt";
+    char16_t value[32]{};
     CHECK(s3cmd::content_get_value(object_path, 1, value, sizeof(value)) == ft_stringw);
-    CHECK(std::wstring_view(value) == L"STANDARD");
+    CHECK(std::u16string_view(value) == u"STANDARD");
     CHECK(s3cmd::content_get_value(object_path, 2, value, sizeof(value)) == ft_stringw);
-    CHECK(std::wstring_view(value) == L"abc123");
+    CHECK(std::u16string_view(value) == u"abc123");
     CHECK(list_requests == 1);
 
     SECTION("an empty listing removes previous metadata")
@@ -1788,10 +1834,10 @@ TEST_CASE("ListObjectsV2 metadata is exposed as content fields", "[unit]")
         s3cmd::find_close(refreshed);
         CHECK(saw_previous_snapshot);
         CHECK(s3cmd::content_get_value(object_path, 2, value, sizeof(value)) == ft_stringw);
-        CHECK(std::wstring_view(value) == L"updated");
-        CHECK(s3cmd::content_get_value(L"\\work\\owned-bucket\\folder\\other.txt", 1, value,
+        CHECK(std::u16string_view(value) == u"updated");
+        CHECK(s3cmd::content_get_value(u"\\work\\owned-bucket\\folder\\other.txt", 1, value,
                                        sizeof(value)) == ft_stringw);
-        CHECK(std::wstring_view(value) == L"STANDARD_IA");
+        CHECK(std::u16string_view(value) == u"STANDARD_IA");
         CHECK(list_requests == 3);
     }
     SECTION("a later page failure preserves the previous snapshot")
@@ -1800,8 +1846,8 @@ TEST_CASE("ListObjectsV2 metadata is exposed as content fields", "[unit]")
         CHECK(s3cmd::find_first(path, &entry) == INVALID_HANDLE_VALUE);
         CHECK(saw_previous_snapshot);
         CHECK(s3cmd::content_get_value(object_path, 2, value, sizeof(value)) == ft_stringw);
-        CHECK(std::wstring_view(value) == L"abc123");
-        CHECK(s3cmd::content_get_value(L"\\work\\owned-bucket\\folder\\other.txt", 2, value,
+        CHECK(std::u16string_view(value) == u"abc123");
+        CHECK(s3cmd::content_get_value(u"\\work\\owned-bucket\\folder\\other.txt", 2, value,
                                        sizeof(value)) == ft_fieldempty);
         CHECK(list_requests == 3);
     }
@@ -1815,7 +1861,7 @@ TEST_CASE("ListObjectsV2 metadata is exposed as content fields", "[unit]")
         REQUIRE(refreshed != INVALID_HANDLE_VALUE);
         s3cmd::find_close(refreshed);
         CHECK(s3cmd::content_get_value(object_path, 2, value, sizeof(value)) == ft_stringw);
-        CHECK(std::wstring_view(value) == L"abc123");
+        CHECK(std::u16string_view(value) == u"abc123");
         CHECK(list_requests == 2);
     }
     SECTION("shutdown clears metadata")
@@ -1836,8 +1882,8 @@ TEST_CASE("expired SSO profiles require supported login configuration", "[unit]"
     }
 
     auto& ini = temporary_config();
-    const auto config = ini.root / L"config";
-    const auto credentials = ini.root / L"credentials";
+    const auto config = ini.root / u"config";
+    const auto credentials = ini.root / u"credentials";
     {
         std::ofstream file(config);
         REQUIRE(file);
@@ -1869,26 +1915,26 @@ TEST_CASE("expired SSO profiles require supported login configuration", "[unit]"
     log_text.clear();
     PluginSession session(7, nullptr, capture_log, capture_request);
 
-    wchar_t path[] = L"\\expired";
-    WIN32_FIND_DATAW entry{};
+    char16_t path[] = u"\\expired";
+    WfxFindData entry{};
     CHECK(s3cmd::find_first(path, &entry) == INVALID_HANDLE_VALUE);
     CHECK(GetLastError() == (legacy ? (DWORD)ERROR_LOGON_FAILURE : (DWORD)ERROR_CANCELLED));
     CHECK(request_count == 1);
     if (legacy)
     {
         CHECK(request_type == RT_MsgOK);
-        CHECK(request_text.find(L"legacy configuration") != std::wstring::npos);
-        CHECK(request_text.find(L"aws configure sso --profile \"expired\"") != std::wstring::npos);
-        CHECK(request_text.find(L"aws sso login --profile \"expired\"") != std::wstring::npos);
-        CHECK(request_text.find(L"Start browser login") == std::wstring::npos);
-        CHECK(log_text.find(request_text) != std::wstring::npos);
+        CHECK(request_text.find(u"legacy configuration") != std::u16string::npos);
+        CHECK(request_text.find(u"aws configure sso --profile \"expired\"") != std::u16string::npos);
+        CHECK(request_text.find(u"aws sso login --profile \"expired\"") != std::u16string::npos);
+        CHECK(request_text.find(u"Start browser login") == std::u16string::npos);
+        CHECK(log_text.find(request_text) != std::u16string::npos);
     }
     else
     {
         CHECK(request_type == RT_MsgYesNo);
-        CHECK(request_text.find(L"Start browser login") != std::wstring::npos);
-        CHECK(request_text.find(L"aws sso login") == std::wstring::npos);
-        CHECK(log_text.find(L"was cancelled") != std::wstring::npos);
+        CHECK(request_text.find(u"Start browser login") != std::u16string::npos);
+        CHECK(request_text.find(u"aws sso login") == std::u16string::npos);
+        CHECK(log_text.find(u"was cancelled") != std::u16string::npos);
     }
 
     CHECK(s3cmd::find_first(path, &entry) == INVALID_HANDLE_VALUE);

@@ -1,7 +1,7 @@
 #include "s3.hpp"
 #include "bucket_creation_dialog.hpp"
 #include "config.hpp"
-#include "prereq.h"
+#include "prereq.hpp"
 #include "core.hpp"
 #include "creds.hpp"
 #include "fsplugin.h"
@@ -54,6 +54,8 @@
 // FIXME: This should be removed
 #include <Windows.h> // GetCurrentThreadId, SetLastError
 
+#include <fmt/xchar.h>
+
 #include <algorithm>
 #include <array>
 #include <atomic>
@@ -65,7 +67,6 @@
 #include <debugapi.h>
 #include <exception>
 #include <filesystem>
-#include <format>
 #include <fstream>
 #include <future>
 #include <ios>
@@ -90,7 +91,7 @@ namespace s3cmd {
 namespace {
 
 constexpr std::uint64_t max_single_part_size = 5ULL * 1024 * 1024 * 1024;
-constexpr std::wstring_view add_existing_bucket_entry = L"_Add existing bucket_";
+constexpr std::u16string_view add_existing_bucket_entry = u"_Add existing bucket_";
 
 std::shared_mutex aws_lifecycle_mtx;
 Aws::SDKOptions aws_options;
@@ -111,11 +112,11 @@ std::optional<ObjectMetadata> cached_object_metadata(RemotePathView path)
 {
     if (path.profile.empty() || path.bucket.empty() || path.key.empty())
         return std::nullopt;
-    const auto separator = path.key.rfind(L'\\');
-    const auto name_start = separator == std::wstring_view::npos ? 0 : separator + 1;
+    const auto separator = path.key.rfind(u'\\');
+    const auto name_start = separator == std::u16string_view::npos ? 0 : separator + 1;
     std::scoped_lock lock(object_metadata_mutex);
     if (const auto* found = object_metadata.find(
-            MetadataDirectory<std::wstring_view>{path.profile, path.bucket,
+            MetadataDirectory<std::u16string_view>{path.profile, path.bucket,
                                                  path.key.substr(0, name_start)},
             path.key.substr(name_start)))
     {
@@ -154,7 +155,7 @@ public:
                         const std::filesystem::path& rhs) const
         {
 #ifdef _WIN32
-            return caseicmp(lhs.c_str(), rhs.c_str()) < 0;
+            return caseicmp(utf16_string(lhs.c_str()), utf16_string(rhs.c_str())) < 0;
 #else
             return lhs < rhs;
 #endif
@@ -284,7 +285,7 @@ std::shared_ptr<ClientEntry> get_client_entry(const RemotePath& path,
             const auto profile = Aws::Config::GetCachedConfigProfile(path.profile);
             if (!profile.IsSsoSessionSet())
             {
-                const auto message = std::format(
+                const auto message = fmt::format(
                     "AWS SSO profile '{}' uses legacy configuration. Built-in login needs a "
                     "sso_session entry that points to an [sso-session] section.\n\n"
                     "To update this profile, run:\naws configure sso --profile \"{}\"\n"
@@ -293,7 +294,7 @@ std::shared_ptr<ClientEntry> get_client_entry(const RemotePath& path,
                     "aws sso login --profile \"{}\"\nThen retry the operation.",
                     path.profile, path.profile, path.profile);
                 plugin_host->notify_message_box(PluginHost::message_box_type::msg_ok, title,
-                                                to_wide(message).c_str());
+                                                to_utf16(message).c_str());
                 throw SsoLoginFailed(message);
             }
             perform_sso_login(*plugin_host, profile, prefer_sso_device_code());
@@ -302,7 +303,7 @@ std::shared_ptr<ClientEntry> get_client_entry(const RemotePath& path,
             auto refreshed = make_client(configuration, path);
             if (refreshed->credentials->GetAWSCredentials().IsEmpty())
             {
-                throw SsoLoginFailed(std::format(
+                throw SsoLoginFailed(fmt::format(
                     "AWS SSO login for profile '{}' did not produce credentials", path.profile));
             }
             entry = std::move(refreshed);
@@ -321,9 +322,9 @@ std::shared_ptr<Aws::S3::S3Client> get_client(const RemotePath& path,
 
 void log_error(std::string_view operation, std::string_view message)
 {
-    const auto text = std::format("{}: {}", operation, message);
+    const auto text = fmt::format("{}: {}", operation, message);
     assert(plugin_host);
-    plugin_host->notify_log(to_wide(text).data());
+    plugin_host->notify_log(to_utf16(text).data());
     log("[s3cmd] {}", text);
 }
 
@@ -344,12 +345,12 @@ void log_operation(std::string_view operation, const RemotePath& path)
         path.bucket, path.key);
 }
 
-void log_local_operation(std::string_view operation, const wchar_t* path)
+void log_local_operation(std::string_view operation, const char16_t* path)
 {
     log("[s3cmd] operation={} path={}", operation, to_utf8(path));
 }
 
-bool report_progress(const wchar_t* source, const wchar_t* target, int percent)
+bool report_progress(const char16_t* source, const char16_t* target, int percent)
 {
     assert(plugin_host);
     return plugin_host->notify_progress(source, target, percent);
@@ -367,7 +368,7 @@ class TransferProgress
 {
 public:
     // Constructor for Get request
-    TransferProgress(const wchar_t* source, const wchar_t* target,
+    TransferProgress(const char16_t* source, const char16_t* target,
                      Aws::S3::Model::GetObjectRequest& request, std::uint64_t transferred = 0,
                      std::uint64_t total = 0, bool resume = false)
         : TransferProgress{source, target, total, request, transferred}
@@ -386,7 +387,7 @@ public:
     }
 
     // Constructor for Put request
-    TransferProgress(const wchar_t* source, const wchar_t* target,
+    TransferProgress(const char16_t* source, const char16_t* target,
                      Aws::S3::Model::PutObjectRequest& request)
         : TransferProgress{source, target, static_cast<std::uint64_t>(request.GetContentLength()),
                            request}
@@ -425,7 +426,7 @@ public:
 private:
     // Common constructor for both Get and Put requests
     template <typename Request>
-    TransferProgress(const wchar_t* source, const wchar_t* target, std::uint64_t total,
+    TransferProgress(const char16_t* source, const char16_t* target, std::uint64_t total,
                      Request& request, std::uint64_t transferred = 0)
         : source_{source},
           target_{target},
@@ -455,8 +456,8 @@ private:
             percent_ = next;
     }
 
-    const wchar_t* source_;
-    const wchar_t* target_;
+    const char16_t* source_;
+    const char16_t* target_;
     std::uint64_t total_{};
     const std::uint64_t initial_transferred_{};
     std::uint64_t transferred_{};
@@ -483,11 +484,11 @@ bool register_existing_bucket(const RemotePath& path)
         }
         if (plugin_host->is_notify_message_box_available())
         {
-            auto value = to_wide(region);
+            auto value = to_utf16(region);
             value.resize(64);
             if (!plugin_host->notify_message_box_result(
-                    PluginHost::message_box_type::other, L"Register S3 bucket",
-                    std::format(L"Region for AWS profile '{}':", to_wide(path.profile)).c_str(),
+                    PluginHost::message_box_type::other, u"Register S3 bucket",
+                    fmt::format(u"Region for AWS profile '{}':", to_utf16(path.profile)).c_str(),
                     value))
             {
                 return false;
@@ -537,7 +538,7 @@ S3Properties load_tags(Aws::S3::S3Client& client, const RemotePath& path, S3Prop
         else
         {
             properties.tag_status =
-                std::format("Tags unavailable: {}", outcome.GetError().GetMessage());
+                fmt::format("Tags unavailable: {}", outcome.GetError().GetMessage());
         }
     };
     if (properties.kind == PropertiesKind::bucket)
@@ -558,7 +559,7 @@ S3Properties load_tags(Aws::S3::S3Client& client, const RemotePath& path, S3Prop
     return properties;
 }
 
-void show_properties(HWND owner, const wchar_t* remote_name)
+void show_properties(HWND owner, const char16_t* remote_name)
 {
     std::optional<AwsLease> lease;
     const auto path = RemotePath::make(remote_name);
@@ -569,7 +570,7 @@ void show_properties(HWND owner, const wchar_t* remote_name)
                       : !cached        ? PropertiesKind::prefix
                                        : PropertiesKind::object;
     const auto key = properties.kind == PropertiesKind::prefix ? path.directory_prefix() : path.key;
-    properties.address = std::format("s3://{}/{}", path.bucket, key);
+    properties.address = fmt::format("s3://{}/{}", path.bucket, key);
     properties.region = ProfileConfig(path.profile).bucket_region(path.bucket);
     if (properties.kind == PropertiesKind::prefix)
     {
@@ -580,7 +581,7 @@ void show_properties(HWND owner, const wchar_t* remote_name)
     {
         const auto storage = Aws::S3::Model::ObjectStorageClassMapper::GetNameForObjectStorageClass(
             cached->storage_class);
-        properties.details = std::format(
+        properties.details = fmt::format(
             "Size: {} bytes\r\nModified: {}\r\nStorage class: {}\r\nETag: {}", cached->size,
             cached->modified.ToGmtString(Aws::Utils::DateFormat::ISO_8601), storage,
             to_utf8(cached->etag));
@@ -652,7 +653,7 @@ public:
     }
 
     // Behaves as *input_iterator++
-    bool dereference_move_next(WIN32_FIND_DATAW* data)
+    bool dereference_move_next(WfxFindData* data)
     {
         if (next_ >= entries_.size())
             return false;
@@ -663,12 +664,12 @@ public:
 private:
     struct FindEntry
     {
-        std::wstring name;
+        std::u16string name;
         std::uint64_t size{};
         FILETIME modified{};
         bool directory{};
 
-        void copy(WIN32_FIND_DATAW* data) const
+        void copy(WfxFindData* data) const
         {
             *data = {};
             data->dwFileAttributes = directory ? FILE_ATTRIBUTE_DIRECTORY : FILE_ATTRIBUTE_NORMAL;
@@ -676,33 +677,33 @@ private:
             data->nFileSizeLow = static_cast<DWORD>(size);
             data->nFileSizeHigh = static_cast<DWORD>(size >> 32);
             std::copy(name.begin(), name.end(), data->cFileName);
-            data->cFileName[name.size()] = L'\0';
+            data->cFileName[name.size()] = u'\0';
         }
     };
 
-    static bool valid_entry_name(const std::wstring& name)
+    static bool valid_entry_name(const std::u16string& name)
     {
         return !name.empty()              &&
-            name != L"."                  &&
-            name != L".."                 &&
-            name.find(L'\\') == name.npos &&
+            name != u"."                  &&
+            name != u".."                 &&
+            name.find(u'\\') == name.npos &&
             // cFileName has MAX_PATH slots, including the terminating null
             // This only limits displayed entry name, not the complete S3 key/path
             name.size() < MAX_PATH;
     }
 
     // Convert S3-style path to totalcmd (windows forward slashes) style path
-    static std::wstring totalcmd_object_key(std::string_view key)
+    static std::u16string totalcmd_object_key(std::string_view key)
     {
-        auto result = to_wide(key);
-        std::replace(result.begin(), result.end(), L'/', L'\\');
+        auto result = to_utf16(key);
+        std::replace(result.begin(), result.end(), u'/', u'\\');
         return result;
     }
 
     bool append_entry(std::string_view name, bool directory, std::uint64_t size = 0,
                       FILETIME modified = {})
     {
-        auto wide_name = to_wide(name);
+        auto wide_name = to_utf16(name);
         if (!valid_entry_name(wide_name))
             return false;
         entries_.push_back({std::move(wide_name), size, modified, directory});
@@ -780,12 +781,12 @@ private:
                 pc.take_bucket_registration_hint())
             {
                 plugin_host->notify_message_box(
-                    PluginHost::message_box_type::msg_ok, L"Register S3 bucket",
-                    L"Cannot list buckets for AWS profile '{}'.\n\n"
-                    L"Open '{}' in this profile and enter the bucket name. "
-                    L"The plugin finds its region or asks you to enter it.\n\n"
-                    L"This registers the bucket locally. It does not create a bucket in AWS.",
-                    to_wide(path.profile), add_existing_bucket_entry);
+                    PluginHost::message_box_type::msg_ok, u"Register S3 bucket",
+                    u"Cannot list buckets for AWS profile '{}'.\n\n"
+                    u"Open '{}' in this profile and enter the bucket name. "
+                    u"The plugin finds its region or asks you to enter it.\n\n"
+                    u"This registers the bucket locally. It does not create a bucket in AWS.",
+                    to_utf16(path.profile), add_existing_bucket_entry);
             }
         }
 
@@ -845,7 +846,7 @@ private:
                                  to_file_time(object.GetLastModified())))
                 {
                     metadata[entries_.back().name] = {
-                        object.GetStorageClass(), to_wide(object.GetETag()),
+                        object.GetStorageClass(), to_utf16(object.GetETag()),
                         static_cast<std::uint64_t>(object.GetSize()), object.GetLastModified()};
                 }
             }
@@ -858,7 +859,7 @@ private:
         // Update metadata for this directory
         std::scoped_lock lock(object_metadata_mutex);
         object_metadata.add(
-            {to_wide(path.profile), to_wide(path.bucket), totalcmd_object_key(prefix)},
+            {to_utf16(path.profile), to_utf16(path.bucket), totalcmd_object_key(prefix)},
             std::move(metadata));
     }
 
@@ -986,7 +987,7 @@ void shutdown()
     aws_init_thread_id = std::thread::id{};
 }
 
-HANDLE find_first(const wchar_t* path, WIN32_FIND_DATAW* find_data)
+HANDLE find_first(const char16_t* path, WfxFindData* find_data)
 {
     if (suppress_delete_listing)
     {
@@ -1024,7 +1025,7 @@ HANDLE find_first(const wchar_t* path, WIN32_FIND_DATAW* find_data)
     }
 }
 
-bool find_next(HANDLE handle, WIN32_FIND_DATAW* find_data)
+bool find_next(HANDLE handle, WfxFindData* find_data)
 {
     if (!handle || handle == INVALID_HANDLE_VALUE)
         return false;
@@ -1038,7 +1039,7 @@ int find_close(HANDLE handle)
     return 0;
 }
 
-void status_info(const wchar_t* remote_directory, int start_end, int operation)
+void status_info(const char16_t* remote_directory, int start_end, int operation)
 {
     if (operation != FS_STATUS_OP_DELETE)
         return;
@@ -1052,13 +1053,13 @@ void status_info(const wchar_t* remote_directory, int start_end, int operation)
     suppress_delete_listing = path.bucket.empty();
 }
 
-int execute_file(wchar_t* remote_name, const wchar_t* verb, HWND owner)
+int execute_file(char16_t* remote_name, const char16_t* verb, HWND owner)
 try
 {
     if (!remote_name || !verb)
         return FS_EXEC_ERROR;
 
-    if (caseicmp(verb, L"open") == 0)
+    if (caseicmp(verb, u"open") == 0)
     {
         const auto path = RemotePathView::make(remote_name);
         if (!path.profile.empty() && path.bucket == add_existing_bucket_entry && path.key.empty())
@@ -1066,17 +1067,17 @@ try
             if (!plugin_host || !plugin_host->is_notify_message_box_available())
                 return FS_EXEC_ERROR;
 
-            std::wstring name(64, L'\0');
+            std::u16string name(64, u'\0');
             if (!plugin_host->notify_message_box_result(PluginHost::message_box_type::other,
-                                                        L"Add existing bucket",
-                                                        L"Existing S3 bucket name:", name))
+                                                        u"Add existing bucket",
+                                                        u"Existing S3 bucket name:", name))
             {
                 return FS_EXEC_ERROR;
             }
 
-            const std::wstring_view bucket(name.c_str());
-            if (bucket.empty() || bucket == L"." || bucket == L".." ||
-                bucket.find_first_of(L"\\/") != bucket.npos)
+            const std::u16string_view bucket(name.c_str());
+            if (bucket.empty() || bucket == u"." || bucket == u".." ||
+                bucket.find_first_of(u"\\/") != bucket.npos)
             {
                 return FS_EXEC_ERROR;
             }
@@ -1085,14 +1086,14 @@ try
                 return FS_EXEC_ERROR;
 
             // FS_EXEC_OK does not refresh after "open". Redirect to the profile listing.
-            remote_name[path.profile.data() + path.profile.size() - remote_name] = L'\0';
+            remote_name[path.profile.data() + path.profile.size() - remote_name] = u'\0';
             return FS_EXEC_SYMLINK;
         }
         if (path.profile.empty() || path.bucket.empty() || path.key.empty())
             return FS_EXEC_OK;
         return FS_EXEC_YOURSELF;
     }
-    else if (caseicmp(verb, L"properties") == 0)
+    else if (caseicmp(verb, u"properties") == 0)
     {
         const auto path = RemotePathView::make(remote_name);
         if (!path.profile.empty() && !path.bucket.empty() &&
@@ -1102,8 +1103,8 @@ try
         }
         return FS_EXEC_OK;
     }
-    else if (ncaseicmp(verb, L"quote ", 6) == 0 ||
-             ncaseicmp(verb, L"chmod ", 6) == 0 || ncaseicmp(verb, L"mode ", 5) == 0)
+    else if (ncaseicmp(verb, u"quote ", 6) == 0 ||
+             ncaseicmp(verb, u"chmod ", 6) == 0 || ncaseicmp(verb, u"mode ", 5) == 0)
     {
         return FS_EXEC_YOURSELF;
     }
@@ -1119,7 +1120,7 @@ catch (const std::exception& error)
     return FS_EXEC_ERROR;
 }
 
-int get_file(const wchar_t* remote_name, const wchar_t* local_name, int copy_flags,
+int get_file(const char16_t* remote_name, const char16_t* local_name, int copy_flags,
              const RemoteInfoStruct* info)
 try
 {
@@ -1217,7 +1218,7 @@ try
             request.SetKey(path.key);
             if (resume)
             {
-                const auto range = std::format("bytes={}-", offset);
+                const auto range = fmt::format("bytes={}-", offset);
                 request.SetRange(range);
                 request.SetIfMatch(resume_state->record.etag);
             }
@@ -1306,7 +1307,7 @@ catch (const std::exception& error)
     return FS_FILE_READERROR;
 }
 
-int put_file(const wchar_t* local_name, const wchar_t* remote_name, int copy_flags)
+int put_file(const char16_t* local_name, const char16_t* remote_name, int copy_flags)
 try
 {
     if ((copy_flags & FS_COPYFLAGS_RESUME) != 0)
@@ -1367,7 +1368,7 @@ try
         std::filesystem::remove(local_name, ec);
         if (ec)
         {
-            log_error("Delete local source", std::format("error {}", ec.value()));
+            log_error("Delete local source", fmt::format("error {}", ec.value()));
             return FS_FILE_READERROR;
         }
     }
@@ -1385,7 +1386,7 @@ catch (const std::exception& error)
     return FS_FILE_WRITEERROR;
 }
 
-bool delete_file(const wchar_t* remote_name)
+bool delete_file(const char16_t* remote_name)
 try
 {
     const auto path = RemotePath::make(remote_name);
@@ -1410,7 +1411,7 @@ catch (const std::exception& error)
     return false;
 }
 
-bool make_directory(const wchar_t* remote_name)
+bool make_directory(const char16_t* remote_name)
 try
 {
     const auto path = RemotePath::make(remote_name);
@@ -1435,7 +1436,7 @@ try
             Aws::STS::STSClient client(entry->credentials, nullptr, configuration);
             const auto outcome = client.GetCallerIdentity(Aws::STS::Model::GetCallerIdentityRequest{});
             if (!outcome.IsSuccess())
-                throw std::runtime_error(std::format("Cannot obtain the AWS account ID: {}", outcome.GetError().GetMessage()));
+                throw std::runtime_error(fmt::format("Cannot obtain the AWS account ID: {}", outcome.GetError().GetMessage()));
             const auto account = outcome.GetResult().GetAccount();
             if (account.size() != 12 || account.find_first_not_of("0123456789") != account.npos)
                 throw std::runtime_error("AWS returned an invalid account ID.");
@@ -1532,7 +1533,7 @@ catch (const std::exception& error)
     return false;
 }
 
-bool remove_directory(const wchar_t* remote_name)
+bool remove_directory(const char16_t* remote_name)
 try
 {
     const auto path = RemotePath::make(remote_name);
@@ -1608,7 +1609,7 @@ catch (const std::exception& error)
     return false;
 }
 
-int rename_or_move(const wchar_t* old_name, const wchar_t* new_name,  bool move, bool overwrite,
+int rename_or_move(const char16_t* old_name, const char16_t* new_name,  bool move, bool overwrite,
                    const RemoteInfoStruct* info)
 try
 {
@@ -1629,7 +1630,7 @@ try
         return FS_FILE_NOTFOUND;
 
     const auto copy_operation =
-        std::format("CopyObject source={}/{}/{}", source.profile, source.bucket, source.key);
+        fmt::format("CopyObject source={}/{}/{}", source.profile, source.bucket, source.key);
     log_operation(copy_operation, target);
 
     AwsLease lease;
@@ -1640,7 +1641,7 @@ try
     Aws::S3::Model::CopyObjectRequest copy;
     copy.SetBucket(target.bucket);
     copy.SetKey(target.key);
-    auto copy_source = std::format("{}/{}", source.bucket, source.key);
+    auto copy_source = fmt::format("{}/{}", source.bucket, source.key);
     copy.SetCopySource(std::move(copy_source));
     const auto copy_outcome = target_client->CopyObject(copy);
     if (!copy_outcome.IsSuccess())
@@ -1704,21 +1705,21 @@ int content_get_supported_field(int field_index, char* field_name, char* units, 
     return ft_string;
 }
 
-int content_get_value(const wchar_t* file_name, int field_index, void* field_value, int max_length)
+int content_get_value(const char16_t* file_name, int field_index, void* field_value, int max_length)
 {
     if (field_index < 0 || field_index >= 3)
         return ft_nosuchfield;
-    if (!file_name || !field_value || max_length < static_cast<int>(sizeof(wchar_t)))
+    if (!file_name || !field_value || max_length < static_cast<int>(sizeof(char16_t)))
         return ft_fileerror;
 
-    const auto copy_value = [&](std::wstring_view value) {
+    const auto copy_value = [&](std::u16string_view value) {
         if (value.empty())
             return ft_fieldempty;
-        auto* output = static_cast<wchar_t*>(field_value);
-        const auto capacity = static_cast<std::size_t>(max_length) / sizeof(wchar_t);
+        auto* output = static_cast<char16_t*>(field_value);
+        const auto capacity = static_cast<std::size_t>(max_length) / sizeof(char16_t);
         const auto length = std::min(value.size(), capacity - 1);
         std::copy_n(value.data(), length, output);
-        output[length] = L'\0';
+        output[length] = u'\0';
         return ft_stringw;
     };
 
@@ -1730,7 +1731,7 @@ int content_get_value(const wchar_t* file_name, int field_index, void* field_val
         if (path.profile.empty() || path.bucket.empty())
             return ft_fieldempty; // No region for keys
         // Get region from a cached config
-        return copy_value(to_wide(
+        return copy_value(to_utf16(
             ProfileConfig(to_utf8(path.profile)).bucket_region(to_utf8(path.bucket))));
     }
     // Keys fields
@@ -1752,12 +1753,12 @@ int content_get_value(const wchar_t* file_name, int field_index, void* field_val
             const auto storage_class =
                 Aws::S3::Model::ObjectStorageClassMapper::GetNameForObjectStorageClass(
                     found->storage_class);
-            return copy_value(to_wide(storage_class));
+            return copy_value(to_utf16(storage_class));
         }
         case 2: // Etag
         {
-            std::wstring_view etag{found->etag};
-            if (etag.size() > 2 && etag.starts_with(L'"') && etag.ends_with(L'"'))
+            std::u16string_view etag{found->etag};
+            if (etag.size() > 2 && etag.starts_with(u'"') && etag.ends_with(u'"'))
                 return copy_value(etag.substr(1, etag.size() - 2));
             return copy_value(etag);
         }

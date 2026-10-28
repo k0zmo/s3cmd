@@ -4,7 +4,7 @@
 
 #include <algorithm>
 #include <array>
-#include <format>
+#include <fmt/format.h>
 #include <stdexcept>
 
 extern "C" IMAGE_DOS_HEADER __ImageBase;
@@ -13,15 +13,15 @@ namespace s3cmd {
 
 namespace {
 
-constexpr const wchar_t* regions[] = {
-    L"af-south-1",     L"ap-east-1",      L"ap-east-2",      L"ap-northeast-1", L"ap-northeast-2",
-    L"ap-northeast-3", L"ap-south-1",     L"ap-south-2",     L"ap-southeast-1", L"ap-southeast-2",
-    L"ap-southeast-3", L"ap-southeast-4", L"ap-southeast-5", L"ap-southeast-6", L"ap-southeast-7",
-    L"ca-central-1",   L"ca-west-1",      L"cn-north-1",     L"cn-northwest-1", L"eu-central-1",
-    L"eu-central-2",   L"eu-north-1",     L"eu-south-1",     L"eu-south-2",     L"eu-west-1",
-    L"eu-west-2",      L"eu-west-3",      L"eusc-de-east-1", L"il-central-1",   L"me-central-1",
-    L"me-south-1",     L"mx-central-1",   L"sa-east-1",      L"us-east-1",      L"us-east-2",
-    L"us-gov-east-1",  L"us-gov-west-1",  L"us-west-1",      L"us-west-2"};
+constexpr const char16_t* regions[] = {
+    u"af-south-1",     u"ap-east-1",      u"ap-east-2",      u"ap-northeast-1", u"ap-northeast-2",
+    u"ap-northeast-3", u"ap-south-1",     u"ap-south-2",     u"ap-southeast-1", u"ap-southeast-2",
+    u"ap-southeast-3", u"ap-southeast-4", u"ap-southeast-5", u"ap-southeast-6", u"ap-southeast-7",
+    u"ca-central-1",   u"ca-west-1",      u"cn-north-1",     u"cn-northwest-1", u"eu-central-1",
+    u"eu-central-2",   u"eu-north-1",     u"eu-south-1",     u"eu-south-2",     u"eu-west-1",
+    u"eu-west-2",      u"eu-west-3",      u"eusc-de-east-1", u"il-central-1",   u"me-central-1",
+    u"me-south-1",     u"mx-central-1",   u"sa-east-1",      u"us-east-1",      u"us-east-2",
+    u"us-gov-east-1",  u"us-gov-west-1",  u"us-west-1",      u"us-west-2"};
 
 std::string build_bucket_name(std::string_view prefix, const BucketCreationOptions& options)
 {
@@ -29,7 +29,7 @@ std::string build_bucket_name(std::string_view prefix, const BucketCreationOptio
                ? std::string(prefix)
                // For example: mybucket-123456789012-us-east-1-an
                // Other variant: mybucket--123456789012--us-east-1--an
-               : std::format("{}-{}-{}-an", prefix, options.account_id, options.region);
+               : fmt::format("{}-{}-{}-an", prefix, options.account_id, options.region);
 }
 
 std::string validate_bucket_name(std::string_view prefix, const BucketCreationOptions& options)
@@ -106,20 +106,20 @@ BucketCreationDialog::BucketCreationDialog(
 void BucketCreationDialog::update(HWND dialog)
 {
     const auto prefix_control = GetDlgItem(dialog, IDC_BUCKET_PREFIX);
-    std::wstring prefix(GetWindowTextLengthW(prefix_control) + 1, L'\0');
-    GetWindowTextW(prefix_control, prefix.data(), static_cast<int>(prefix.size()));
+    std::u16string prefix(GetWindowTextLengthW(prefix_control) + 1, u'\0');
+    GetWindowTextW(prefix_control, win32_string(prefix.data()), static_cast<int>(prefix.size()));
     prefix_ = to_utf8(prefix.c_str());
-    std::array<wchar_t, 65> region{};
-    GetDlgItemTextW(dialog, IDC_BUCKET_REGION, region.data(), static_cast<int>(region.size()));
+    std::array<char16_t, 65> region{};
+    GetDlgItemTextW(dialog, IDC_BUCKET_REGION, win32_string(region.data()), static_cast<int>(region.size()));
     options_.region = to_utf8(region.data());
     options_.account_regional = SendDlgItemMessageW(dialog, IDC_BUCKET_NAMESPACE, CB_GETCURSEL, 0, 0) == 1;
     auto name = options_.account_regional && options_.account_id.empty() ?
         std::string("Account ID unavailable") : build_bucket_name(prefix_, options_);
-    SetDlgItemTextW(dialog, IDC_BUCKET_PREVIEW, to_wide(name).c_str());
+    SetDlgItemTextW(dialog, IDC_BUCKET_PREVIEW, win32_string(to_utf16(name).c_str()));
     const auto error = options_.account_regional && !lookup_error_.empty()
                            ? lookup_error_
                            : validate_bucket_name(prefix_, options_);
-    SetDlgItemTextW(dialog, IDC_BUCKET_ERROR, to_wide(error).c_str());
+    SetDlgItemTextW(dialog, IDC_BUCKET_ERROR, win32_string(to_utf16(error).c_str()));
     EnableWindow(GetDlgItem(dialog, IDOK), error.empty());
 
     options_.bucket_name = std::move(name);
@@ -131,7 +131,7 @@ void BucketCreationDialog::lookup_account(HWND dialog)
         return;
 
     lookup_error_.clear();
-    SetDlgItemTextW(dialog, IDC_BUCKET_ERROR, L"Looking up the AWS account ID...");
+    SetDlgItemTextW(dialog, IDC_BUCKET_ERROR, win32_string(u"Looking up the AWS account ID..."));
     UpdateWindow(dialog);
     const auto cursor = SetCursor(LoadCursorW(nullptr, reinterpret_cast<LPCWSTR>(IDC_WAIT)));
     try
@@ -152,12 +152,12 @@ INT_PTR CALLBACK BucketCreationDialog::dialog_proc(HWND dialog, UINT message, WP
     if (message == WM_INITDIALOG)
     {
         state = reinterpret_cast<BucketCreationDialog*>(lparam);
-        SetDlgItemTextW(dialog, IDC_BUCKET_PREFIX, to_wide(state->prefix_).c_str());
+        SetDlgItemTextW(dialog, IDC_BUCKET_PREFIX, win32_string(to_utf16(state->prefix_).c_str()));
         SetWindowLongPtrW(dialog, DWLP_USER, reinterpret_cast<LONG_PTR>(state));
         SendDlgItemMessageW(dialog, IDC_BUCKET_NAMESPACE, CB_ADDSTRING, 0,
-                            reinterpret_cast<LPARAM>(L"Global"));
+                            reinterpret_cast<LPARAM>(u"Global"));
         SendDlgItemMessageW(dialog, IDC_BUCKET_NAMESPACE, CB_ADDSTRING, 0,
-                            reinterpret_cast<LPARAM>(L"Account regional"));
+                            reinterpret_cast<LPARAM>(u"Account regional"));
         SendDlgItemMessageW(dialog, IDC_BUCKET_NAMESPACE, CB_SETCURSEL, 0, 0);
         for (const auto region : regions)
         {
@@ -165,7 +165,7 @@ INT_PTR CALLBACK BucketCreationDialog::dialog_proc(HWND dialog, UINT message, WP
                                 reinterpret_cast<LPARAM>(region));
         }
         SendDlgItemMessageW(dialog, IDC_BUCKET_REGION, CB_LIMITTEXT, 63, 0);
-        SetDlgItemTextW(dialog, IDC_BUCKET_REGION, to_wide(state->options_.region).c_str());
+        SetDlgItemTextW(dialog, IDC_BUCKET_REGION, win32_string(to_utf16(state->options_.region).c_str()));
         state->update(dialog);
         return TRUE;
     }
@@ -206,10 +206,10 @@ INT_PTR CALLBACK BucketCreationDialog::dialog_proc(HWND dialog, UINT message, WP
                 SendDlgItemMessageW(dialog, IDC_BUCKET_REGION, CB_GETCURSEL, 0, 0);
             if (selected != CB_ERR)
             {
-                std::array<wchar_t, 65> region{};
+                std::array<char16_t, 65> region{};
                 SendDlgItemMessageW(dialog, IDC_BUCKET_REGION, CB_GETLBTEXT, selected,
                                     reinterpret_cast<LPARAM>(region.data()));
-                SetDlgItemTextW(dialog, IDC_BUCKET_REGION, region.data());
+                SetDlgItemTextW(dialog, IDC_BUCKET_REGION, win32_string(region.data()));
             }
             state->update(dialog);
         }

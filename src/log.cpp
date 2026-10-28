@@ -3,19 +3,18 @@
 
 #include <Windows.h>
 
-#include <format>
 #include <iterator>
 #include <string>
 #include <string_view>
 
 namespace s3cmd {
 
-void vlog(std::string_view format_str, std::format_args args)
+void vlog(std::string_view format_str, fmt::format_args args)
 {
     std::string buf;
-    std::vformat_to(std::back_inserter(buf), format_str, args);
+    fmt::vformat_to(std::back_inserter(buf), format_str, args);
     buf.push_back('\n');
-    OutputDebugStringW(to_wide(buf).c_str());
+    OutputDebugStringW(win32_string(to_utf16(buf).c_str()));
 }
 
 } // namespace s3cmd

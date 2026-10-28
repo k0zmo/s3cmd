@@ -1,5 +1,6 @@
 #include "config.hpp"
 #include "toml.hpp"
+#include "prereq.hpp"
 
 #include <toml++/toml.hpp>
 
@@ -128,13 +129,13 @@ const std::filesystem::path& config_directory_path()
         wchar_t* app_data{};
         std::size_t size{};
         // _wdupenv_s allocates a correctly sized UTF-16 copy.
-        if (_wdupenv_s(&app_data, &size, L"APPDATA") != 0 || !app_data || !*app_data)
+        if (_wdupenv_s(&app_data, &size, win32_string(u"APPDATA")) != 0 || !app_data || !*app_data)
         {
             std::free(app_data);
             throw std::runtime_error("APPDATA is not set");
         }
         std::unique_ptr<wchar_t, decltype(&std::free)> releaser(app_data, &std::free);
-        return std::filesystem::path(releaser.get()) / L"s3cmd";
+        return std::filesystem::path(releaser.get()) / u"s3cmd";
 #else
         if (const auto* config_home = std::getenv("XDG_CONFIG_HOME"); config_home && *config_home)
             return std::filesystem::path(config_home) / "s3cmd";

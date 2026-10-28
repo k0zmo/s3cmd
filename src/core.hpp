@@ -2,7 +2,8 @@
 
 #include "fsplugin.h"
 
-#include <format>
+#include <fmt/xchar.h>
+
 #include <string>
 #include <string_view>
 
@@ -18,10 +19,10 @@ public:
 
     // Reports progress; returns true if the host requests cancellation.
     // Returns false when no progress callback is available.
-    bool notify_progress(const wchar_t* source, const wchar_t* target, int percent);
+    bool notify_progress(const char16_t* source, const char16_t* target, int percent);
 
     // Logs an important error; does nothing when no log callback is available.
-    void notify_log(const wchar_t* message);
+    void notify_log(const char16_t* message);
 
 	// Request types matching the WFX RT_* constants.
 	enum class message_box_type : int
@@ -45,18 +46,17 @@ public:
     // Shows a host dialog without text input.
     // Returns value depends on the type of dialog that was shown and what user selected
     bool notify_message_box(message_box_type type,
-                            const wchar_t* title,
-                            const wchar_t* text);
+                            const char16_t* title,
+                            const char16_t* text);
 
     // Formats the dialog text, then calls notify_message_box().
     template <typename... Args>
     bool notify_message_box(message_box_type type,
-                            const wchar_t* title,
-                            std::wstring_view format_str,
+                            const char16_t* title,
+                            std::u16string_view format_str,
                             const Args&... args)
     {
-        return vnotify_message_box(type, title, format_str,
-                                   std::make_wformat_args(args...));
+        return notify_message_box(type, title, fmt::format(format_str, args...).c_str());
     }
 
     // Shows a host dialog using `out` as the text input buffer.
@@ -64,15 +64,9 @@ public:
     // Its size is passed to the host and is not adjusted after the call.
     // Returns value depends on the type of dialog that was shown and what user selected
     bool notify_message_box_result(message_box_type type,
-                                   const wchar_t* title,
-                                   const wchar_t* text,
-                                   std::wstring& out);
-
-private:
-    bool vnotify_message_box(message_box_type type,
-                             const wchar_t* title,
-                             std::wstring_view format_str,
-                             std::wformat_args args);
+                                   const char16_t* title,
+                                   const char16_t* text,
+                                   std::u16string& out);
 
 private:
     int plugin_number_;
@@ -83,11 +77,11 @@ private:
 
 struct RemotePathView
 {
-    std::wstring_view profile;
-    std::wstring_view bucket;
-    std::wstring_view key;
+    std::u16string_view profile;
+    std::u16string_view bucket;
+    std::u16string_view key;
 
-    static RemotePathView make(std::wstring_view path) noexcept;
+    static RemotePathView make(std::u16string_view path) noexcept;
 
     bool operator==(const RemotePathView&) const = default;
 };
@@ -99,7 +93,7 @@ struct RemotePath
     std::string key;
 
     // Splits totalcmd's path (i.e. \\{{profile}}\{{bucket}}\{{key}}) into profile, bucket and key
-    static RemotePath make(std::wstring_view path);
+    static RemotePath make(std::u16string_view path);
 
     // Returns key as an S3 directory prefix, adding a trailing '/' when needed.
     // It assumes `key` refers to a directory, thus this function should only be called for S3

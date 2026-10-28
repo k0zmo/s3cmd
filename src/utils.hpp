@@ -1,5 +1,7 @@
 #pragma once
 
+#include "prereq.hpp"
+
 #include <charconv>
 #include <cstddef>
 #include <optional>
@@ -9,11 +11,11 @@
 
 namespace s3cmd {
 
-int caseicmp(const wchar_t* lhs, const wchar_t* rhs);
-int ncaseicmp(const wchar_t* lhs, const wchar_t* rhs, std::size_t count);
+int caseicmp(const char16_t* lhs, const char16_t* rhs);
+int ncaseicmp(const char16_t* lhs, const char16_t* rhs, std::size_t count);
 
-std::wstring to_wide(std::string_view text);
-std::string to_utf8(std::wstring_view text);
+std::u16string to_utf16(std::string_view text);
+std::string to_utf8(std::u16string_view text);
 
 template <typename T>
 std::optional<T> parse_number(std::string_view text)

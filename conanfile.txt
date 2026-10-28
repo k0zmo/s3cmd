@@ -2,6 +2,7 @@
 aws-sdk-cpp/1.11.692
 cpp-httplib/0.47.0
 tomlplusplus/3.4.0
+fmt/12.2.0
 
 [test_requires]
 catch2/3.14.0

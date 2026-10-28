@@ -18,7 +18,7 @@ constexpr unsigned expirations[] = {900, 3600, 86400};
 
 void set_text(HWND dialog, int control, const std::string& text)
 {
-    SetDlgItemTextW(dialog, control, to_wide(text).c_str());
+    SetDlgItemTextW(dialog, control, win32_string(to_utf16(text).c_str()));
 }
 } // namespace
 
@@ -68,15 +68,15 @@ void PropertiesDialog::update(HWND dialog)
     ListView_DeleteAllItems(list);
     for (const auto& [key, value] : properties_.tags)
     {
-        auto wide_key = to_wide(key);
-        auto wide_value = to_wide(value);
+        auto wide_key = to_utf16(key);
+        auto wide_value = to_utf16(value);
         LVITEMW item{};
         item.mask = LVIF_TEXT;
         item.iItem = ListView_GetItemCount(list);
-        item.pszText = wide_key.data();
+        item.pszText = win32_string(wide_key.data());
         const auto row = SendMessageW(list, LVM_INSERTITEMW, 0, reinterpret_cast<LPARAM>(&item));
         item.iSubItem = 1;
-        item.pszText = wide_value.data();
+        item.pszText = win32_string(wide_value.data());
         SendMessageW(list, LVM_SETITEMTEXTW, row, reinterpret_cast<LPARAM>(&item));
     }
     const bool can_sign =
@@ -91,9 +91,9 @@ void PropertiesDialog::copy(HWND dialog, int control)
     const auto length = GetWindowTextLengthW(edit);
     if (!length)
         return;
-    std::wstring text(static_cast<std::size_t>(length) + 1, L'\0');
-    GetWindowTextW(edit, text.data(), static_cast<int>(text.size()));
-    const auto bytes = text.size() * sizeof(wchar_t);
+    std::u16string text(static_cast<std::size_t>(length) + 1, u'\0');
+    GetWindowTextW(edit, win32_string(text.data()), static_cast<int>(text.size()));
+    const auto bytes = text.size() * sizeof(char16_t);
     const auto memory = GlobalAlloc(GMEM_MOVEABLE, bytes);
     if (!memory)
         throw std::runtime_error("Cannot allocate clipboard text.");
@@ -142,7 +142,7 @@ void PropertiesDialog::poll(HWND dialog)
             const auto url = signing_.get();
             set_text(dialog, IDC_PROPERTIES_URL, url);
             EnableWindow(GetDlgItem(dialog, IDC_PROPERTIES_COPY_URL), !url.empty());
-            SetDlgItemTextW(dialog, IDC_PROPERTIES_LINK_STATUS, L"Link generated.");
+            SetDlgItemTextW(dialog, IDC_PROPERTIES_LINK_STATUS, win32_string(u"Link generated."));
         }
         catch (const std::exception& error)
         {
@@ -159,7 +159,7 @@ void PropertiesDialog::close(HWND dialog)
     // Keep the dialog and SDK alive until cancellation finishes, while pumping UI messages.
     closing_ = true;
     cancelled_ = true;
-    SetWindowTextW(dialog, L"S3 Properties - Closing...");
+    SetWindowTextW(dialog, win32_string(u"S3 Properties - Closing..."));
     EnableWindow(GetDlgItem(dialog, IDCANCEL), FALSE);
     update(dialog);
     poll(dialog);
@@ -182,12 +182,12 @@ INT_PTR CALLBACK PropertiesDialog::dialog_proc(HWND dialog, UINT message, WPARAM
             LVCOLUMNW column{};
             column.mask = LVCF_TEXT | LVCF_WIDTH;
             column.cx = (bounds.right - bounds.left) / 3;
-            column.pszText = const_cast<wchar_t*>(L"Key");
+            column.pszText = win32_string(const_cast<char16_t*>(u"Key"));
             SendMessageW(list, LVM_INSERTCOLUMNW, 0, reinterpret_cast<LPARAM>(&column));
             column.cx = (bounds.right - bounds.left) * 2 / 3 - GetSystemMetrics(SM_CXVSCROLL);
-            column.pszText = const_cast<wchar_t*>(L"Value");
+            column.pszText = win32_string(const_cast<char16_t*>(u"Value"));
             SendMessageW(list, LVM_INSERTCOLUMNW, 1, reinterpret_cast<LPARAM>(&column));
-            for (const auto expiry : {L"15 minutes", L"1 hour", L"24 hours"})
+            for (const auto expiry : {u"15 minutes", u"1 hour", u"24 hours"})
             {
                 SendDlgItemMessageW(dialog, IDC_PROPERTIES_EXPIRY, CB_ADDSTRING, 0,
                                     reinterpret_cast<LPARAM>(expiry));
@@ -239,8 +239,8 @@ INT_PTR CALLBACK PropertiesDialog::dialog_proc(HWND dialog, UINT message, WPARAM
             case IDC_PROPERTIES_EXPIRY:
                 if (HIWORD(wparam) == CBN_SELCHANGE)
                 {
-                    SetDlgItemTextW(dialog, IDC_PROPERTIES_URL, L"");
-                    SetDlgItemTextW(dialog, IDC_PROPERTIES_LINK_STATUS, L"");
+                    SetDlgItemTextW(dialog, IDC_PROPERTIES_URL, win32_string(u""));
+                    SetDlgItemTextW(dialog, IDC_PROPERTIES_LINK_STATUS, win32_string(u""));
                     EnableWindow(GetDlgItem(dialog, IDC_PROPERTIES_COPY_URL), FALSE);
                 }
                 return TRUE;
@@ -253,9 +253,9 @@ INT_PTR CALLBACK PropertiesDialog::dialog_proc(HWND dialog, UINT message, WPARAM
                     SendDlgItemMessageW(dialog, IDC_PROPERTIES_EXPIRY, CB_GETCURSEL, 0, 0);
                 if (selected < 0 || selected >= 3)
                     return TRUE;
-                SetDlgItemTextW(dialog, IDC_PROPERTIES_URL, L"");
+                SetDlgItemTextW(dialog, IDC_PROPERTIES_URL, win32_string(u""));
                 EnableWindow(GetDlgItem(dialog, IDC_PROPERTIES_COPY_URL), FALSE);
-                SetDlgItemTextW(dialog, IDC_PROPERTIES_LINK_STATUS, L"Generating link...");
+                SetDlgItemTextW(dialog, IDC_PROPERTIES_LINK_STATUS, win32_string(u"Generating link..."));
                 state->signing_ = std::async(std::launch::async, [state, selected] {
                     return state->presign_(expirations[selected]);
                 });
@@ -268,7 +268,7 @@ INT_PTR CALLBACK PropertiesDialog::dialog_proc(HWND dialog, UINT message, WPARAM
     catch (const std::exception& error)
     {
         set_text(dialog, IDC_PROPERTIES_DETAILS, error.what());
-        SetDlgItemTextW(dialog, IDC_PROPERTIES_TAG_STATUS, L"Properties unavailable.");
+        SetDlgItemTextW(dialog, IDC_PROPERTIES_TAG_STATUS, win32_string(u"Properties unavailable."));
     }
     return FALSE;
 }
