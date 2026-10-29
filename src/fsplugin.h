@@ -1,8 +1,57 @@
 #pragma once
 
-#include <Windows.h>
+#include <stddef.h>
+#include <stdint.h>
 
-#include <cstddef>
+#ifdef _WIN32
+#  include <Windows.h>
+#  define DCPCALL __stdcall
+#else
+#  define DCPCALL
+#  define MAX_PATH 260
+
+typedef int32_t LONG;
+typedef uint32_t DWORD;
+typedef uint16_t WORD;
+typedef void* HANDLE;
+typedef HANDLE HICON;
+typedef HANDLE HBITMAP;
+typedef HANDLE HWND;
+typedef int32_t BOOL;
+typedef char CHAR;
+typedef char16_t WCHAR;
+typedef intptr_t LPARAM;
+typedef uintptr_t WPARAM;
+
+// Double Commander's non-Windows records have byte alignment.
+#pragma pack(push, 1)
+
+typedef struct
+{
+    DWORD dwLowDateTime;
+    DWORD dwHighDateTime;
+} FILETIME;
+
+typedef struct
+{
+    DWORD dwFileAttributes;
+    FILETIME ftCreationTime;
+    FILETIME ftLastAccessTime;
+    FILETIME ftLastWriteTime;
+    DWORD nFileSizeHigh;
+    DWORD nFileSizeLow;
+    DWORD dwReserved0;
+    DWORD dwReserved1;
+    CHAR cFileName[MAX_PATH];
+    CHAR cAlternateFileName[14];
+} WIN32_FIND_DATAA, *LPWIN32_FIND_DATAA;
+
+#pragma pack(pop)
+#endif
+
+#ifndef _WIN32
+#pragma pack(push, 1)
+#endif
 
 // Same as WIN32_FIND_DATAW but uses char16_t instead of WCHAR
 struct WfxFindData
@@ -19,15 +68,14 @@ struct WfxFindData
     char16_t cAlternateFileName[14];
 };
 
-static_assert(sizeof(WfxFindData) == sizeof(WIN32_FIND_DATAW));
-static_assert(alignof(WfxFindData) == alignof(WIN32_FIND_DATAW));
-static_assert(offsetof(WfxFindData, cFileName) == 
-              offsetof(WIN32_FIND_DATAW, cFileName));
-static_assert(offsetof(WfxFindData, cAlternateFileName) ==
-              offsetof(WIN32_FIND_DATAW, cAlternateFileName));
+#ifndef _WIN32
+#pragma pack(pop)
+#endif
 
 // Total Commander file-system plugin interface, version 2.1 (27.April.2010).
 // The comments below are embedded from the corresponding pages in docs/.
+// Double Commander additions follow sdk/wfxplugin.h:
+// https://github.com/doublecmd/doublecmd/blob/master/sdk/wfxplugin.h
 
 // File was copied successfully.
 #define FS_FILE_OK 0
@@ -198,6 +246,33 @@ static_assert(offsetof(WfxFindData, cAlternateFileName) ==
 // Plugin requires a separate connection for background transfers; ask the user first.
 #define BG_ASK_USER 4
 
+#ifndef _WIN32
+
+// Attributes returned by FsFindFirst/FsFindNext, including Unix mode bits.
+#define FILE_ATTRIBUTE_NORMAL 0x00000080
+#define FILE_ATTRIBUTE_DIRECTORY 0x00000010
+#define FILE_ATTRIBUTE_REPARSE_POINT 0x00000400
+#define FILE_ATTRIBUTE_UNIX_MODE 0x80000000
+
+// Double Commander's custom icon formats.
+#define FS_ICON_FORMAT_HICON 0 // Windows icon handle.
+#define FS_ICON_FORMAT_FILE 1 // File name returned in RemoteName.
+#define FS_ICON_FORMAT_BINARY 2 // PNG or ICO bytes, released through Free.
+
+typedef void(DCPCALL* tFreeProc)(void* Pointer);
+
+#pragma pack(push, 1)
+typedef struct
+{
+    void* Pointer;
+    uintptr_t Size;
+    uintptr_t Format;
+    tFreeProc Free;
+} TWfxIcon, *PWfxIcon;
+#pragma pack(pop)
+
+#endif
+
 /** Details of the remote file passed to FsGetFile and FsRenMovFile.
  * SizeLow/SizeHigh contain the 64-bit size; LastWriteTime and Attr describe
  * the remote file and may be copied to the local file. The parameter may be
@@ -222,27 +297,27 @@ typedef struct
 // ProgressProc is called during a transfer. Return 1 to abort, 0 to continue.
 // SourceName and TargetName identify the current file; PercentDone is its
 // percentage, not the percentage of the complete multi-file operation.
-typedef int(__stdcall* tProgressProc)(int PluginNr, char* SourceName, char* TargetName,
-                                      int PercentDone);
-typedef int(__stdcall* tProgressProcW)(int PluginNr, char16_t* SourceName, char16_t* TargetName,
-                                       int PercentDone);
+typedef int(DCPCALL* tProgressProc)(int PluginNr, char* SourceName, char* TargetName,
+                                    int PercentDone);
+typedef int(DCPCALL* tProgressProcW)(int PluginNr, char16_t* SourceName, char16_t* TargetName,
+                                     int PercentDone);
 // LogProc reports connection state and messages. MSGTYPE_CONNECT enables the
 // Disconnect button and must be used if FsDisconnect is implemented.
-typedef void(__stdcall* tLogProc)(int PluginNr, int MsgType, char* LogString);
-typedef void(__stdcall* tLogProcW)(int PluginNr, int MsgType, char16_t* LogString);
+typedef void(DCPCALL* tLogProc)(int PluginNr, int MsgType, char* LogString);
+typedef void(DCPCALL* tLogProcW)(int PluginNr, int MsgType, char16_t* LogString);
 
 // RequestProc asks the user for input. RequestType selects a localized
 // standard prompt; ReturnedText has room for maxlen characters.
-typedef BOOL(__stdcall* tRequestProc)(int PluginNr, int RequestType, char* CustomTitle,
-                                      char* CustomText, char* ReturnedText, int maxlen);
-typedef BOOL(__stdcall* tRequestProcW)(int PluginNr, int RequestType, char16_t* CustomTitle,
-                                       char16_t* CustomText, char16_t* ReturnedText, int maxlen);
+typedef BOOL(DCPCALL* tRequestProc)(int PluginNr, int RequestType, char* CustomTitle,
+                                    char* CustomText, char* ReturnedText, int maxlen);
+typedef BOOL(DCPCALL* tRequestProcW)(int PluginNr, int RequestType, char16_t* CustomTitle,
+                                     char16_t* CustomText, char16_t* ReturnedText, int maxlen);
 // CryptProc accesses Total Commander's secure password store. Mode is one of
 // the FS_CRYPT_* values; maxlen includes the terminating null character.
-typedef int(__stdcall* tCryptProc)(int PluginNr, int CryptoNr, int Mode, char* ConnectionName,
-                                   char* Password, int maxlen);
-typedef int(__stdcall* tCryptProcW)(int PluginNr, int CryptoNr, int Mode, char16_t* ConnectionName,
-                                    char16_t* Password, int maxlen);
+typedef int(DCPCALL* tCryptProc)(int PluginNr, int CryptoNr, int Mode, char* ConnectionName,
+                                 char* Password, int maxlen);
+typedef int(DCPCALL* tCryptProcW)(int PluginNr, int CryptoNr, int Mode, char16_t* ConnectionName,
+                                  char16_t* Password, int maxlen);
 
 // FsInit is called when the plugin is loaded. Store the callbacks for later
 // use and return 0; the return value is currently unused.
@@ -250,93 +325,99 @@ typedef int(__stdcall* tCryptProcW)(int PluginNr, int CryptoNr, int Mode, char16
 extern "C" {
 #endif
 
-int __stdcall FsInit(int PluginNr, tProgressProc pProgressProc, tLogProc pLogProc,
-                     tRequestProc pRequestProc);
-int __stdcall FsInitW(int PluginNr, tProgressProcW pProgressProcW, tLogProcW pLogProcW,
-                      tRequestProcW pRequestProcW);
+int DCPCALL FsInit(int PluginNr, tProgressProc pProgressProc, tLogProc pLogProc,
+                   tRequestProc pRequestProc);
+int DCPCALL FsInitW(int PluginNr, tProgressProcW pProgressProcW, tLogProcW pLogProcW,
+                    tRequestProcW pRequestProcW);
 // Registers the secure-password callback. It is only needed when the plugin
 // uses Total Commander's password store.
-void __stdcall FsSetCryptCallback(tCryptProc pCryptProc, int CryptoNr, int Flags);
-void __stdcall FsSetCryptCallbackW(tCryptProcW pCryptProcW, int CryptoNr, int Flags);
+void DCPCALL FsSetCryptCallback(tCryptProc pCryptProc, int CryptoNr, int Flags);
+void DCPCALL FsSetCryptCallbackW(tCryptProcW pCryptProcW, int CryptoNr, int Flags);
 // Starts a directory listing. Path is a full backslash-separated plugin path;
 // the root is a single backslash and never includes the displayed root name.
 // Return a find handle, or INVALID_HANDLE_VALUE on failure.
-HANDLE __stdcall FsFindFirst(char* Path, WIN32_FIND_DATA* FindData);
-HANDLE __stdcall FsFindFirstW(char16_t* Path, WfxFindData* FindData);
+HANDLE DCPCALL FsFindFirst(char* Path, WIN32_FIND_DATAA* FindData);
+HANDLE DCPCALL FsFindFirstW(char16_t* Path, WfxFindData* FindData);
 
 // Continues a listing started by FsFindFirst. Return FALSE at end or on error.
-BOOL __stdcall FsFindNext(HANDLE Hdl, WIN32_FIND_DATA* FindData);
-BOOL __stdcall FsFindNextW(HANDLE Hdl, WfxFindData* FindData);
+BOOL DCPCALL FsFindNext(HANDLE Hdl, WIN32_FIND_DATAA* FindData);
+BOOL DCPCALL FsFindNextW(HANDLE Hdl, WfxFindData* FindData);
 // Ends a FsFindFirst/FsFindNext loop. The return value is currently unused;
 // return 0.
-int __stdcall FsFindClose(HANDLE Hdl);
+int DCPCALL FsFindClose(HANDLE Hdl);
 // Creates the directory named by the full plugin path. Return TRUE on success.
-BOOL __stdcall FsMkDir(char* Path);
-BOOL __stdcall FsMkDirW(char16_t* Path);
+BOOL DCPCALL FsMkDir(char* Path);
+BOOL DCPCALL FsMkDirW(char16_t* Path);
 // Executes a remote file or shows its properties. Verb is typically open,
 // properties, chmod, or quote. RemoteName="\\" and Verb="properties" opens
 // the plugin configuration dialog.
-int __stdcall FsExecuteFile(HWND MainWin, char* RemoteName, char* Verb);
-int __stdcall FsExecuteFileW(HWND MainWin, char16_t* RemoteName, char16_t* Verb);
+int DCPCALL FsExecuteFile(HWND MainWin, char* RemoteName, char* Verb);
+int DCPCALL FsExecuteFileW(HWND MainWin, char16_t* RemoteName, char16_t* Verb);
 // Copies or moves a remote file. Move selects rename/move versus copy;
 // OverWrite selects replacement of an existing target.
-int __stdcall FsRenMovFile(char* OldName, char* NewName, BOOL Move, BOOL OverWrite,
-                           RemoteInfoStruct* ri);
-int __stdcall FsRenMovFileW(char16_t* OldName, char16_t* NewName, BOOL Move, BOOL OverWrite,
-                            RemoteInfoStruct* ri);
+int DCPCALL FsRenMovFile(char* OldName, char* NewName, BOOL Move, BOOL OverWrite,
+                         RemoteInfoStruct* ri);
+int DCPCALL FsRenMovFileW(char16_t* OldName, char16_t* NewName, BOOL Move, BOOL OverWrite,
+                          RemoteInfoStruct* ri);
 // Downloads a remote file to a local path. CopyFlags is a combination of
 // FS_COPYFLAGS_OVERWRITE, FS_COPYFLAGS_RESUME, and FS_COPYFLAGS_MOVE.
-int __stdcall FsGetFile(char* RemoteName, char* LocalName, int CopyFlags, RemoteInfoStruct* ri);
+int DCPCALL FsGetFile(char* RemoteName, char* LocalName, int CopyFlags, RemoteInfoStruct* ri);
 
-int __stdcall FsGetFileW(char16_t* RemoteName, char16_t* LocalName, int CopyFlags, RemoteInfoStruct* ri);
+int DCPCALL FsGetFileW(char16_t* RemoteName, char16_t* LocalName, int CopyFlags,
+                       RemoteInfoStruct* ri);
 // Uploads a local file to the plugin file system. CopyFlags uses the same
 // overwrite/resume/move flags as FsGetFile.
-int __stdcall FsPutFile(char* LocalName, char* RemoteName, int CopyFlags);
-int __stdcall FsPutFileW(char16_t* LocalName, char16_t* RemoteName, int CopyFlags);
+int DCPCALL FsPutFile(char* LocalName, char* RemoteName, int CopyFlags);
+int DCPCALL FsPutFileW(char16_t* LocalName, char16_t* RemoteName, int CopyFlags);
 // Deletes a remote file. Return TRUE on success.
-BOOL __stdcall FsDeleteFile(char* RemoteName);
-BOOL __stdcall FsDeleteFileW(char16_t* RemoteName);
+BOOL DCPCALL FsDeleteFile(char* RemoteName);
+BOOL DCPCALL FsDeleteFileW(char16_t* RemoteName);
 // Removes a remote directory. Return TRUE on success.
-BOOL __stdcall FsRemoveDir(char* RemoteName);
-BOOL __stdcall FsRemoveDirW(char16_t* RemoteName);
+BOOL DCPCALL FsRemoveDir(char* RemoteName);
+BOOL DCPCALL FsRemoveDirW(char16_t* RemoteName);
 // Closes the connection identified by DisconnectRoot. Implement only when
 // FsInit's log callback reports MSGTYPE_CONNECT.
-BOOL __stdcall FsDisconnect(char* DisconnectRoot);
-BOOL __stdcall FsDisconnectW(char16_t* DisconnectRoot);
+BOOL DCPCALL FsDisconnect(char* DisconnectRoot);
+BOOL DCPCALL FsDisconnectW(char16_t* DisconnectRoot);
 // Sets Windows file attributes. Implement only when supported.
-BOOL __stdcall FsSetAttr(char* RemoteName, int NewAttr);
-BOOL __stdcall FsSetAttrW(char16_t* RemoteName, int NewAttr);
+BOOL DCPCALL FsSetAttr(char* RemoteName, int NewAttr);
+BOOL DCPCALL FsSetAttrW(char16_t* RemoteName, int NewAttr);
 // Sets Windows file times. A null time leaves that time unchanged.
-BOOL __stdcall FsSetTime(char* RemoteName, FILETIME* CreationTime, FILETIME* LastAccessTime,
-                         FILETIME* LastWriteTime);
-BOOL __stdcall FsSetTimeW(char16_t* RemoteName, FILETIME* CreationTime, FILETIME* LastAccessTime,
-                          FILETIME* LastWriteTime);
+BOOL DCPCALL FsSetTime(char* RemoteName, FILETIME* CreationTime, FILETIME* LastAccessTime,
+                       FILETIME* LastWriteTime);
+BOOL DCPCALL FsSetTimeW(char16_t* RemoteName, FILETIME* CreationTime, FILETIME* LastAccessTime,
+                        FILETIME* LastWriteTime);
 // Announces the start or end of an operation. Use it to allocate/free buffers
 // or flush caches; it is optional when no such lifecycle work is needed.
-void __stdcall FsStatusInfo(char* RemoteDir, int InfoStartEnd, int InfoOperation);
-void __stdcall FsStatusInfoW(char16_t* RemoteDir, int InfoStartEnd, int InfoOperation);
+void DCPCALL FsStatusInfo(char* RemoteDir, int InfoStartEnd, int InfoOperation);
+void DCPCALL FsStatusInfoW(char16_t* RemoteDir, int InfoStartEnd, int InfoOperation);
 // Supplies the root name shown in Network Neighborhood. This is called during
 // installation, before FsInit, and the name is not included in plugin paths.
-void __stdcall FsGetDefRootName(char* DefRootName, int maxlen);
+void DCPCALL FsGetDefRootName(char* DefRootName, int maxlen);
 // Supplies a custom file/directory icon. The icon handle must be returned in
 // TheIcon; the function may return an icon name for Total Commander to cache.
-int __stdcall FsExtractCustomIcon(char* RemoteName, int ExtractFlags, HICON* TheIcon);
-int __stdcall FsExtractCustomIconW(char16_t* RemoteName, int ExtractFlags, HICON* TheIcon);
+#ifdef _WIN32
+int DCPCALL FsExtractCustomIcon(char* RemoteName, int ExtractFlags, HICON* TheIcon);
+int DCPCALL FsExtractCustomIconW(char16_t* RemoteName, int ExtractFlags, HICON* TheIcon);
+#else
+int DCPCALL FsExtractCustomIcon(char* RemoteName, int ExtractFlags, PWfxIcon TheIcon);
+int DCPCALL FsExtractCustomIconW(char16_t* RemoteName, int ExtractFlags, PWfxIcon TheIcon);
+#endif
 // Receives the interface version and suggested settings-file location after
 // FsInit. Use a unique INI section because the file is shared by plugins.
-void __stdcall FsSetDefaultParams(FsDefaultParamStruct* dps);
+void DCPCALL FsSetDefaultParams(FsDefaultParamStruct* dps);
 
 // Supplies a custom thumbnail bitmap. ReturnedBitmap must receive the bitmap
 // handle; width and height are the maximum requested dimensions.
-int __stdcall FsGetPreviewBitmap(char* RemoteName, int width, int height, HBITMAP* ReturnedBitmap);
-int __stdcall FsGetPreviewBitmapW(char16_t* RemoteName, int width, int height,
-                                  HBITMAP* ReturnedBitmap);
+int DCPCALL FsGetPreviewBitmap(char* RemoteName, int width, int height, HBITMAP* ReturnedBitmap);
+int DCPCALL FsGetPreviewBitmapW(char16_t* RemoteName, int width, int height,
+                                HBITMAP* ReturnedBitmap);
 // Identifies a temporary-panel plugin. Do not export this for normal plugins.
-BOOL __stdcall FsLinksToLocalFiles(void);
+BOOL DCPCALL FsLinksToLocalFiles(void);
 // Converts a temporary-panel path to a local file path. Do not export this for
 // normal plugins; temporary-panel implementations must be thread-safe.
-BOOL __stdcall FsGetLocalName(char* RemoteName, int maxlen);
-BOOL __stdcall FsGetLocalNameW(char16_t* RemoteName, int maxlen);
+BOOL DCPCALL FsGetLocalName(char* RemoteName, int maxlen);
+BOOL DCPCALL FsGetLocalNameW(char16_t* RemoteName, int maxlen);
 
 // ************************** content plugin extension ****************************
 // The content functions are optional. FieldIndex starts at zero and field
@@ -421,39 +502,39 @@ typedef struct
 } ttimeformat, *ptimeformat;
 
 // Describes one supported field and its optional | separated units.
-int __stdcall FsContentGetSupportedField(int FieldIndex, char* FieldName, char* Units, int maxlen);
+int DCPCALL FsContentGetSupportedField(int FieldIndex, char* FieldName, char* Units, int maxlen);
 // Retrieves one field value. FieldValue's type is selected by the field type
 // returned from FsContentGetSupportedField.
-int __stdcall FsContentGetValue(char* FileName, int FieldIndex, int UnitIndex, void* FieldValue,
-                                int maxlen, int flags);
-int __stdcall FsContentGetValueW(char16_t* FileName, int FieldIndex, int UnitIndex, void* FieldValue,
-                                 int maxlen, int flags);
+int DCPCALL FsContentGetValue(char* FileName, int FieldIndex, int UnitIndex, void* FieldValue,
+                              int maxlen, int flags);
+int DCPCALL FsContentGetValueW(char16_t* FileName, int FieldIndex, int UnitIndex, void* FieldValue,
+                               int maxlen, int flags);
 
 // Requests cancellation of a slow FsContentGetValue operation.
-void __stdcall FsContentStopGetValue(char* FileName);
-void __stdcall FsContentStopGetValueW(char16_t* FileName);
+void DCPCALL FsContentStopGetValue(char* FileName);
+void DCPCALL FsContentStopGetValueW(char16_t* FileName);
 // Returns 1 for ascending or -1 for descending default sorting.
-int __stdcall FsContentGetDefaultSortOrder(int FieldIndex);
+int DCPCALL FsContentGetDefaultSortOrder(int FieldIndex);
 // Called before unloading the content-plugin part; release buffers and abort
 // outstanding work here.
-void __stdcall FsContentPluginUnloading(void);
+void DCPCALL FsContentPluginUnloading(void);
 // Returns supported contflags_* values; FieldIndex=-1 requests the aggregate.
-int __stdcall FsContentGetSupportedFieldFlags(int FieldIndex);
+int DCPCALL FsContentGetSupportedFieldFlags(int FieldIndex);
 // Changes one field value. FileName=NULL/FieldIndex=-1 signal the end of a
 // multi-file attribute update.
-int __stdcall FsContentSetValue(char* FileName, int FieldIndex, int UnitIndex, int FieldType,
-                                void* FieldValue, int flags);
-int __stdcall FsContentSetValueW(char16_t* FileName, int FieldIndex, int UnitIndex, int FieldType,
-                                 void* FieldValue, int flags);
+int DCPCALL FsContentSetValue(char* FileName, int FieldIndex, int UnitIndex, int FieldType,
+                              void* FieldValue, int flags);
+int DCPCALL FsContentSetValueW(char16_t* FileName, int FieldIndex, int UnitIndex, int FieldType,
+                               void* FieldValue, int flags);
 
 // Returns the default content view: fields, headers, widths, and options.
-BOOL __stdcall FsContentGetDefaultView(char* ViewContents, char* ViewHeaders, char* ViewWidths,
-                                       char* ViewOptions, int maxlen);
-BOOL __stdcall FsContentGetDefaultViewW(char16_t* ViewContents, char16_t* ViewHeaders, char16_t* ViewWidths,
-                                        char16_t* ViewOptions, int maxlen);
+BOOL DCPCALL FsContentGetDefaultView(char* ViewContents, char* ViewHeaders, char* ViewWidths,
+                                     char* ViewOptions, int maxlen);
+BOOL DCPCALL FsContentGetDefaultViewW(char16_t* ViewContents, char16_t* ViewHeaders,
+                                      char16_t* ViewWidths, char16_t* ViewOptions, int maxlen);
 
 // Returns a combination of BG_DOWNLOAD, BG_UPLOAD, and BG_ASK_USER.
-int __stdcall FsGetBackgroundFlags(void);
+int DCPCALL FsGetBackgroundFlags(void);
 
 #ifdef __cplusplus
 }

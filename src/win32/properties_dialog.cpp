@@ -1,5 +1,6 @@
-#include "properties_dialog.hpp"
-#include "resource.h"
+#include "win32/properties_dialog.hpp"
+#include "win32/resource.h"
+#include "platform.hpp"
 #include "utils.hpp"
 
 #include <commctrl.h>

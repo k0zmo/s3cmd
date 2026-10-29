@@ -4,6 +4,7 @@
 #include "config.hpp"
 #include "log.hpp"
 #include "utils.hpp"
+#include "platform.hpp"
 
 // Windows defines GetObject as GetObjectA
 #undef GetObject
@@ -31,7 +32,9 @@
 #include <httplib.h>
 #include <fmt/xchar.h>
 
+#ifdef _WIN32
 #include <shellapi.h>
+#endif
 
 #include <algorithm>
 #include <cassert>
@@ -170,10 +173,16 @@ Aws::SSOOIDC::Model::RegisterClientResult
 
 bool open_url(std::string_view url)
 {
+#ifdef _WIN32
     const auto wide_url = to_utf16(url);
     return reinterpret_cast<std::intptr_t>(
                ShellExecuteW(nullptr, win32_string(u"open"), win32_string(wide_url.c_str()),
                              nullptr, nullptr, SW_SHOWNORMAL)) > 32;
+#else
+    // TODO: Use xdg-open?
+    (void)url;
+    return false;
+#endif
 }
 
 std::string base64_url(const Aws::Utils::ByteBuffer& buf)

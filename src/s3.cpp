@@ -1,5 +1,4 @@
 #include "s3.hpp"
-#include "bucket_creation_dialog.hpp"
 #include "config.hpp"
 #include "prereq.hpp"
 #include "core.hpp"
@@ -7,10 +6,15 @@
 #include "fsplugin.h"
 #include "log.hpp"
 #include "object_metadata.hpp"
-#include "properties_dialog.hpp"
 #include "resume.hpp"
 #include "sso.hpp"
 #include "utils.hpp"
+#include "platform.hpp"
+
+#ifdef _WIN32
+#  include "win32/bucket_creation_dialog.hpp"
+#  include "win32/properties_dialog.hpp"
+#endif
 
 #include <aws/core/AmazonWebServiceRequest.h>
 #include <aws/core/Aws.h>
@@ -49,12 +53,12 @@
 #include <aws/sts/STSClient.h>
 #include <aws/sts/model/GetCallerIdentityRequest.h>
 
+#include <fmt/xchar.h>
 #include <toml++/toml.hpp>
 
-// FIXME: This should be removed
-#include <Windows.h> // GetCurrentThreadId, SetLastError
-
-#include <fmt/xchar.h>
+#ifdef _WIN32
+#  include <Windows.h> // SetLastError
+#endif
 
 #include <algorithm>
 #include <array>
@@ -64,7 +68,6 @@
 #include <cstdint>
 #include <cstring>
 #include <cstdlib>
-#include <debugapi.h>
 #include <exception>
 #include <filesystem>
 #include <fstream>
@@ -87,6 +90,57 @@
 using namespace std::chrono_literals;
 
 namespace s3cmd {
+
+#ifndef _WIN32
+
+struct BucketCreationOptions
+{
+    std::string bucket_name;
+    std::string region;
+    bool account_regional{};
+    std::string account_id;
+};
+
+class BucketCreationDialog
+{
+public:
+    using AccountIdLookupFn = std::function<std::string(std::string_view)>;
+
+    BucketCreationDialog(std::string_view, std::string_view, AccountIdLookupFn) {}
+
+    std::optional<BucketCreationOptions> show() { return std::nullopt; }
+};
+
+enum class PropertiesKind
+{
+    bucket,
+    object,
+    prefix
+};
+
+struct S3Properties
+{
+    PropertiesKind kind{PropertiesKind::bucket};
+    std::string address;
+    std::string region;
+    std::string details{"Loading properties..."};
+    std::vector<std::pair<std::string, std::string>> tags;
+    std::string tag_status{"Loading tags..."};
+};
+
+class PropertiesDialog
+{
+public:
+    using PrepareFn = std::function<void(S3Properties&)>;
+    using LoadFn = std::function<S3Properties(S3Properties, const std::atomic<bool>&)>;
+    using PresignFn = std::function<std::string(unsigned)>;
+
+public:
+    PropertiesDialog(S3Properties, PrepareFn, LoadFn, PresignFn) {}
+    void show(HWND) {}
+};
+
+#endif
 
 namespace {
 
@@ -903,7 +957,7 @@ std::string discover_bucket_region(const std::string& profile, const std::string
 
 int initialize(int number, tProgressProcW progress, tLogProcW log, tRequestProcW request)
 {
-    s3cmd::log("[s3cmd] Initialize called, plugin={}, thread={}", number, GetCurrentThreadId());
+    s3cmd::log("[s3cmd] Initialize called, plugin={}", number);
 
     std::unique_lock lock(aws_lifecycle_mtx);
     if (!aws_initialized)
@@ -966,7 +1020,7 @@ int initialize(int number, tProgressProcW progress, tLogProcW log, tRequestProcW
 
 void shutdown()
 {
-    log("[s3cmd] Shutdown called, thread={}", GetCurrentThreadId());
+    log("[s3cmd] Shutdown called");
 
     std::unique_lock lock(aws_lifecycle_mtx);
     reset_config();
@@ -1245,7 +1299,17 @@ try
                                       resume ? resume_state->record.size : listed_size, resume};
             const auto outcome = progress.wait(client->GetObjectCallable(request));
             if (progress.has_invalid_range())
+            {
+                // Some HTTP backends write the body before honoring cancellation.
+                // Flush a successful response before restoring the original prefix.
+                if (outcome.IsSuccess())
+                    outcome.GetResult().GetBody().flush();
+                std::error_code ec;
+                std::filesystem::resize_file(download, offset, ec);
+                if (ec)
+                    return FS_FILE_WRITEERROR;
                 return FS_FILE_READERROR;
+            }
             if (!outcome.IsSuccess())
             {
                 // Error bodies use the same stream; only retain bytes from object responses.

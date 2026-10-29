@@ -92,7 +92,7 @@ struct RemotePath
     std::string bucket;
     std::string key;
 
-    // Splits totalcmd's path (i.e. \\{{profile}}\{{bucket}}\{{key}}) into profile, bucket and key
+    // Splits a host path into profile, bucket and key, accepting '\\' and '/' separators.
     static RemotePath make(std::u16string_view path);
 
     // Returns key as an S3 directory prefix, adding a trailing '/' when needed.

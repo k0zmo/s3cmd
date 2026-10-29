@@ -12,6 +12,8 @@ endif()
 set(CMAKE_MODULE_PATH "${s3cmd_SOURCE_DIR}/cmake;${CMAKE_MODULE_PATH}")
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
+set(CMAKE_CXX_EXTENSIONS OFF)
+set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 
 if(S3CMD_USING_CONAN)
     # Sadly, conan package uses different naming scheme
@@ -36,14 +38,16 @@ endif()
 find_package(tomlplusplus CONFIG REQUIRED)
 find_package(httplib CONFIG REQUIRED)
 find_package(fmt CONFIG REQUIRED)
+if(NOT WIN32)
+    find_package(Iconv REQUIRED)
+endif()
 
 add_library(s3cmd-core STATIC
     src/fsplugin.h
     src/prereq.hpp
+    src/platform.hpp
     src/config.hpp                 src/config.cpp
     src/core.hpp                   src/core.cpp
-    src/bucket_creation_dialog.hpp src/bucket_creation_dialog.cpp
-    src/properties_dialog.hpp      src/properties_dialog.cpp
     src/creds.hpp                  src/creds.cpp
     src/log.cpp                    src/log.hpp
     src/resume.cpp                 src/resume.hpp
@@ -53,9 +57,7 @@ add_library(s3cmd-core STATIC
     src/utils.hpp                  src/utils.cpp
 )
 target_compile_features(s3cmd-core PUBLIC cxx_std_20)
-target_compile_definitions(s3cmd-core PUBLIC NOMINMAX WIN32_LEAN_AND_MEAN)
 target_include_directories(s3cmd-core PUBLIC "${s3cmd_SOURCE_DIR}/src")
-target_link_libraries(s3cmd-core )
 target_link_libraries(s3cmd-core
     PRIVATE
         httplib::httplib
@@ -78,23 +80,39 @@ else()
         aws-cpp-sdk-sts
     )
 endif()
+
 if(WIN32)
+    target_sources(s3cmd-core PRIVATE
+        src/win32/bucket_creation_dialog.hpp
+        src/win32/bucket_creation_dialog.cpp
+        src/win32/properties_dialog.hpp
+        src/win32/properties_dialog.cpp
+    )
+    target_compile_definitions(s3cmd-core PUBLIC NOMINMAX WIN32_LEAN_AND_MEAN)
     target_link_libraries(s3cmd-core PUBLIC shell32 comctl32)
+else()
+    target_link_libraries(s3cmd-core PUBLIC Iconv::Iconv)
 endif()
 
 add_library(s3cmd MODULE
     src/main.cpp
-    src/icons.cpp src/icons.hpp
-    src/s3cmd.def
 )
 if(WIN32)
-    target_sources(s3cmd PRIVATE src/s3cmd.rc src/bucket_creation_dialog.rc src/properties_dialog.rc)
+    target_sources(s3cmd PRIVATE
+        src/icons.cpp src/icons.hpp
+        src/win32/s3cmd.rc
+        src/win32/bucket_creation_dialog.rc
+        src/win32/properties_dialog.rc
+    )
 endif()
+
 target_compile_features(s3cmd PRIVATE cxx_std_20)
 target_compile_definitions(s3cmd PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
 target_link_libraries(s3cmd PRIVATE s3cmd-core)
 math(EXPR S3CMD_BITS "${CMAKE_SIZEOF_VOID_P} * 8")
-if(CMAKE_SIZEOF_VOID_P EQUAL 8)
+if(NOT WIN32)
+    set(S3CMD_PLUGIN_SUFFIX ".wfx")
+elseif(CMAKE_SIZEOF_VOID_P EQUAL 8)
     set(S3CMD_PLUGIN_SUFFIX ".wfx64")
 else()
     set(S3CMD_PLUGIN_SUFFIX ".wfx")
@@ -104,6 +122,8 @@ set_target_properties(s3cmd PROPERTIES
     SUFFIX "${S3CMD_PLUGIN_SUFFIX}"
 )
 if(WIN32)
+    target_sources(s3cmd PRIVATE src/win32/s3cmd.def)
+
     include(VersionInfo)
     # Kinda useless since these embedded information are not displayed for files
     # with extensions other than .dll - but let's still embed them
@@ -121,12 +141,19 @@ if(BUILD_TESTING)
     find_package(Catch2 CONFIG REQUIRED)
 
     add_executable(s3cmd-test
-        tests/aws_test.cpp
         tests/core_test.cpp
+        tests/test_helpers.hpp
+        tests/aws_test.cpp
     )
+
     if(WIN32)
-        target_sources(s3cmd-test PRIVATE src/bucket_creation_dialog.rc src/properties_dialog.rc)
+        target_sources(s3cmd-test PRIVATE
+            tests/win32_test.cpp
+            src/win32/bucket_creation_dialog.rc
+            src/win32/properties_dialog.rc
+        )
     endif()
+
     target_link_libraries(s3cmd-test PRIVATE
         s3cmd-core
         Catch2::Catch2WithMain
@@ -163,6 +190,10 @@ install(FILES
 set(CPACK_GENERATOR ZIP)
 set(CPACK_INCLUDE_TOPLEVEL_DIRECTORY OFF)
 set(CPACK_PACKAGE_VERSION "${S3CMD_VERSION}")
-set(CPACK_SYSTEM_NAME "win${S3CMD_BITS}")
+if(WIN32)
+    set(CPACK_SYSTEM_NAME "win${S3CMD_BITS}")
+else()
+    set(CPACK_SYSTEM_NAME "linux${S3CMD_BITS}")
+endif()
 set(CPACK_PROJECT_CONFIG_FILE "${s3cmd_SOURCE_DIR}/cmake/PackageVersion.cmake")
 include(CPack)

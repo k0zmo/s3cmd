@@ -1,6 +1,6 @@
 #include "config.hpp"
+#include "platform.hpp"
 #include "toml.hpp"
-#include "prereq.hpp"
 
 #include <toml++/toml.hpp>
 

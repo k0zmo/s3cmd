@@ -1,5 +1,6 @@
-#include "bucket_creation_dialog.hpp"
-#include "resource.h"
+#include "win32/bucket_creation_dialog.hpp"
+#include "win32/resource.h"
+#include "platform.hpp"
 #include "utils.hpp"
 
 #include <algorithm>

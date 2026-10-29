@@ -1,7 +1,7 @@
 #include "icons.hpp"
 #include "core.hpp"
 #include "fsplugin.h"
-#include "resource.h"
+#include "win32/resource.h"
 
 #include <Windows.h>
 #include <fmt/xchar.h>

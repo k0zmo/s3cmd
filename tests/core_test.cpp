@@ -1,19 +1,17 @@
 #include "s3.hpp"
-#include "bucket_creation_dialog.hpp"
-#include "properties_dialog.hpp"
-#include "resource.h"
 #include "config.hpp"
 #include "creds.hpp"
 #include "core.hpp"
 #include "fsplugin.h"
 #include "object_metadata.hpp"
 #include "resume.hpp"
+#include "utils.hpp"
+#include "test_helpers.hpp"
 
 #include <aws/core/auth/GeneralHTTPCredentialsProvider.h>
 #include <aws/core/auth/SSOCredentialsProvider.h>
 #include <aws/core/auth/STSCredentialsProvider.h>
 #include <aws/core/internal/AWSHttpResourceClient.h>
-#include "utils.hpp"
 #include <aws/core/platform/Environment.h>
 #include <aws/core/utils/logging/AWSLogging.h>
 #include <aws/core/utils/logging/LogLevel.h>
@@ -21,12 +19,8 @@
 #include <catch2/catch_test_macros.hpp>
 #include <httplib.h>
 
-#include <Windows.h> // GetCurrentProcessId, GetTickCount64, SetLastError, GetLastError
-#include <commctrl.h>
-
 #include <atomic>
 #include <algorithm>
-#include <array>
 #include <chrono>
 #include <cstdlib>
 #include <filesystem>
@@ -35,9 +29,13 @@
 #include <stdexcept>
 #include <string>
 #include <string_view>
-#include <system_error>
 #include <thread>
 #include <vector>
+
+using s3cmd::test::PluginSession;
+using s3cmd::test::TemporaryConfig;
+using s3cmd::test::TemporaryEnvironment;
+using s3cmd::test::temporary_config;
 
 namespace {
 
@@ -49,21 +47,21 @@ std::vector<std::u16string> request_inputs;
 std::u16string log_text;
 std::atomic<bool> transfer_waiting{};
 std::atomic<bool> transfer_canceled{};
-DWORD transfer_caller{};
+std::thread::id transfer_caller{};
 bool transfer_wrong_thread{};
 std::vector<int> transfer_percentages;
 
-int __stdcall cancel_stalled_transfer(int, char16_t*, char16_t*, int percent)
+int DCPCALL cancel_stalled_transfer(int, char16_t*, char16_t*, int percent)
 {
     transfer_percentages.push_back(percent);
-    transfer_wrong_thread |= GetCurrentThreadId() != transfer_caller;
+    transfer_wrong_thread |= std::this_thread::get_id() != transfer_caller;
     if (!transfer_waiting)
         return 0;
     transfer_canceled = true;
     return 1;
 }
 
-BOOL __stdcall capture_request(int, int type, char16_t*, char16_t* text, char16_t*, int)
+BOOL DCPCALL capture_request(int, int type, char16_t*, char16_t* text, char16_t*, int)
 {
     ++request_count;
     request_type = type;
@@ -71,8 +69,8 @@ BOOL __stdcall capture_request(int, int type, char16_t*, char16_t* text, char16_
     return request_accept;
 }
 
-BOOL __stdcall answer_request(int number, int type, char16_t* title, char16_t* text, char16_t* out,
-                              int max_length)
+BOOL DCPCALL answer_request(int number, int type, char16_t* title, char16_t* text, char16_t* out,
+                            int max_length)
 {
     if (!capture_request(number, type, title, text, out, max_length) ||
         static_cast<std::size_t>(request_count) > request_inputs.size())
@@ -86,153 +84,10 @@ BOOL __stdcall answer_request(int number, int type, char16_t* title, char16_t* t
     return TRUE;
 }
 
-void __stdcall capture_log(int, int type, char16_t* text)
+void DCPCALL capture_log(int, int type, char16_t* text)
 {
     if (type == MSGTYPE_IMPORTANTERROR)
         log_text = text ? text : u"";
-}
-
-struct TemporaryEnvironment
-{
-    TemporaryEnvironment(const char* variable_name, const char* value) : name(variable_name)
-    {
-        char* previous{};
-        std::size_t size{};
-        if (_dupenv_s(&previous, &size, name.c_str()) != 0)
-            throw std::runtime_error("Cannot read environment variable");
-        if (previous)
-        {
-            old = previous;
-            std::free(previous);
-            existed = true;
-        }
-        if (_putenv_s(name.c_str(), value ? value : "") != 0)
-            throw std::runtime_error("Cannot set environment variable");
-    }
-
-    ~TemporaryEnvironment() { _putenv_s(name.c_str(), existed ? old.c_str() : ""); }
-
-    std::string name;
-    std::string old;
-    bool existed{};
-};
-
-struct PluginSession
-{
-    PluginSession(int number = 0, tProgressProcW progress = nullptr, tLogProcW log = nullptr,
-                  tRequestProcW request = nullptr)
-    {
-        s3cmd::initialize(number, progress, log, request);
-    }
-
-    ~PluginSession() { s3cmd::shutdown(); }
-};
-
-std::u16string dialog_text(HWND dialog, int control)
-{
-    const auto length = GetWindowTextLengthW(GetDlgItem(dialog, control));
-    std::u16string text(static_cast<std::size_t>(length) + 1, u'\0');
-    GetDlgItemTextW(dialog, control, s3cmd::win32_string(text.data()), static_cast<int>(text.size()));
-    text.resize(length);
-    return text;
-}
-
-struct PropertiesDriver
-{
-    explicit PropertiesDriver(std::function<void(HWND)> tick) : tick(std::move(tick))
-    {
-        active = this;
-        hook = SetWindowsHookExW(WH_CBT,
-            [](int code, WPARAM wparam, LPARAM lparam) -> LRESULT {
-                const auto dialog = reinterpret_cast<HWND>(wparam);
-                if (code == HCBT_ACTIVATE && GetDlgItem(dialog, IDC_PROPERTIES_ADDRESS))
-                {
-                    active->activated = true;
-                    SetTimer(dialog, 99, 20, [](HWND window, UINT, UINT_PTR, DWORD) {
-                        if (GetTickCount64() > active->deadline)
-                        {
-                            active->timed_out = true;
-                            finish(window);
-                        }
-                        else
-                            active->tick(window);
-                    });
-                }
-                return CallNextHookEx(nullptr, code, wparam, lparam);
-            }, nullptr, GetCurrentThreadId());
-        if (!hook)
-            throw std::runtime_error("Cannot install the properties test hook");
-    }
-
-    ~PropertiesDriver()
-    {
-        UnhookWindowsHookEx(hook);
-        active = nullptr;
-    }
-
-    static void finish(HWND dialog)
-    {
-        KillTimer(dialog, 99);
-        SendMessageW(dialog, WM_COMMAND, IDCANCEL, 0);
-    }
-
-    static inline PropertiesDriver* active{};
-    std::function<void(HWND)> tick;
-    HHOOK hook{};
-    ULONGLONG deadline{GetTickCount64() + 5000};
-    bool activated{};
-    bool timed_out{};
-};
-
-struct TemporaryConfig
-{
-    TemporaryConfig()
-        : root(std::filesystem::temp_directory_path() /
-               ("s3cmd-" + std::to_string(GetCurrentProcessId()) + "-" +
-                std::to_string(GetTickCount64()))),
-          path(root / u"s3cmd" / u"s3cmd.toml")
-    {
-        wchar_t* previous{};
-        std::size_t size{};
-        if (_wdupenv_s(&previous, &size, s3cmd::win32_string(u"APPDATA")) != 0)
-            throw std::runtime_error("Cannot read APPDATA");
-        if (previous)
-        {
-            old_app_data = s3cmd::utf16_string(previous);
-            std::free(previous);
-        }
-        std::filesystem::create_directories(root);
-        if (_wputenv_s(s3cmd::win32_string(u"APPDATA"), root.c_str()) != 0)
-            throw std::runtime_error("Cannot set APPDATA");
-    }
-
-    ~TemporaryConfig()
-    {
-        _wputenv_s(s3cmd::win32_string(u"APPDATA"), s3cmd::win32_string(old_app_data.c_str()));
-        std::error_code ignored;
-        std::filesystem::remove_all(root, ignored);
-    }
-
-    void reset()
-    {
-        std::error_code error;
-        std::filesystem::remove_all(root, error);
-        if (error)
-            throw std::runtime_error("Cannot reset temporary config");
-        std::filesystem::create_directories(root);
-        s3cmd::reset_config();
-    }
-
-    std::filesystem::path root;
-    std::filesystem::path path;
-    std::u16string old_app_data;
-};
-
-TemporaryConfig& temporary_config()
-{
-    static TemporaryConfig config;
-    config.reset();
-    return config;
 }
 
 void write_resume_record(const TemporaryConfig& config, const std::filesystem::path& local,
@@ -261,6 +116,27 @@ std::string read_file(const std::filesystem::path& path)
 }
 
 } // namespace
+
+TEST_CASE("last error values persist and are isolated between threads", "[unit]")
+{
+    const auto previous = GetLastError();
+    SetLastError(ERROR_NO_MORE_FILES);
+
+    DWORD initial{}, written{}, repeated{};
+    std::jthread worker([&] {
+        initial = GetLastError();
+        SetLastError(0xf0000000u);
+        written = GetLastError();
+        repeated = GetLastError();
+    });
+    worker.join();
+
+    CHECK(initial == ERROR_SUCCESS);
+    CHECK(written == 0xf0000000u);
+    CHECK(repeated == written);
+    CHECK(GetLastError() == ERROR_NO_MORE_FILES);
+    SetLastError(previous);
+}
 
 TEST_CASE("Download commit preserves an unexpected destination", "[unit]")
 {
@@ -324,8 +200,10 @@ TEST_CASE("Get discards HTTP error bodies before retry", "[unit]")
 {
     auto& config = temporary_config();
     const auto local = config.root / u"download";
-    auto differently_cased_local = local;
-    differently_cased_local.replace_filename(u"DOWNLOAD");
+    auto duplicate_local = local.parent_path() / "." / local.filename();
+#ifdef _WIN32
+    duplicate_local.replace_filename(u"DOWNLOAD");
+#endif
     std::string object = "prefix and the rest of the object";
     std::atomic<bool> reject{true};
     std::atomic<bool> stall{};
@@ -339,14 +217,14 @@ TEST_CASE("Get discards HTTP error bodies before retry", "[unit]")
     transfer_waiting = false;
     transfer_canceled = false;
     transfer_wrong_thread = false;
-    transfer_caller = GetCurrentThreadId();
+    transfer_caller = std::this_thread::get_id();
     httplib::Server server;
     const auto respond = [&](const httplib::Request& request, httplib::Response& response) {
         if (request.method == "HEAD")
             ++head_requests;
         if (probe_duplicate.exchange(false))
             duplicate_result =
-                s3cmd::get_file(u"\\resume-test\\bucket\\object", differently_cased_local.u16string().c_str(),
+                s3cmd::get_file(u"\\resume-test\\bucket\\object", duplicate_local.u16string().c_str(),
                                 FS_COPYFLAGS_OVERWRITE, nullptr);
         if (delay)
             std::this_thread::sleep_for(std::chrono::milliseconds(250));
@@ -549,7 +427,7 @@ TEST_CASE("Get resume state survives restart and rejects a changed object", "[un
     transfer_waiting = false;
     transfer_canceled = false;
     transfer_wrong_thread = false;
-    transfer_caller = GetCurrentThreadId();
+    transfer_caller = std::this_thread::get_id();
 
     httplib::Server server;
     server.Get("/bucket", [&](const httplib::Request&, httplib::Response& response) {
@@ -747,11 +625,11 @@ TEST_CASE("credential chain preserves provider order and gates IMDS", "[unit]")
     SECTION("environment still disables IMDS")
     {
         config.disableIMDS = false;
-        REQUIRE(_putenv_s("AWS_EC2_METADATA_DISABLED", "true") == 0);
+        metadata.set("true");
     }
     SECTION("container credentials remain available")
     {
-        REQUIRE(_putenv_s("AWS_CONTAINER_CREDENTIALS_RELATIVE_URI", "/credentials") == 0);
+        relative.set("/credentials");
         expected = 6;
     }
     const s3cmd::CredentialsProviderChain chain(config);
@@ -769,66 +647,6 @@ TEST_CASE("credential chain preserves provider order and gates IMDS", "[unit]")
         else
             CHECK(dynamic_cast<InstanceProfileCredentialsProvider*>(providers[5].get()));
     }
-}
-
-TEST_CASE("bucket creation lets an invalid initial name be corrected", "[unit]")
-{
-    bool account_regional = false;
-    std::string initial = "Invalid_Name";
-    SECTION("global bucket") {}
-    SECTION("account regional bucket")
-    {
-        account_regional = true;
-    }
-    SECTION("overlong initial name")
-    {
-        initial.assign(80, 'a');
-    }
-
-    bool exercised = false;
-    static std::function<void(HWND)> exercise;
-    exercise = [&](HWND dialog) {
-        exercised = true;
-        std::array<char16_t, 128> text{};
-        GetDlgItemTextW(dialog, IDC_BUCKET_PREFIX, s3cmd::win32_string(text.data()), static_cast<int>(text.size()));
-        CHECK(s3cmd::to_utf8(text.data()) == initial);
-        CHECK_FALSE(IsWindowEnabled(GetDlgItem(dialog, IDOK)));
-        CHECK(GetWindowTextLengthW(GetDlgItem(dialog, IDC_BUCKET_ERROR)) > 0);
-
-        SetDlgItemTextW(dialog, IDC_BUCKET_PREFIX, s3cmd::win32_string(u"corrected-bucket"));
-        CHECK(IsWindowEnabled(GetDlgItem(dialog, IDOK)));
-        CHECK(GetWindowTextLengthW(GetDlgItem(dialog, IDC_BUCKET_ERROR)) == 0);
-        if (account_regional)
-        {
-            SendDlgItemMessageW(dialog, IDC_BUCKET_NAMESPACE, CB_SETCURSEL, 1, 0);
-            SendMessageW(dialog, WM_COMMAND, MAKEWPARAM(IDC_BUCKET_NAMESPACE, CBN_SELCHANGE), 0);
-        }
-        GetDlgItemTextW(dialog, IDC_BUCKET_PREVIEW, s3cmd::win32_string(text.data()), static_cast<int>(text.size()));
-        CHECK(std::u16string_view(text.data()) ==
-              (account_regional ? u"corrected-bucket-123456789012-eu-central-1-an"
-                                : u"corrected-bucket"));
-        SendMessageW(dialog, WM_COMMAND, IDOK, 0);
-    };
-    const auto hook = SetWindowsHookExW(
-        WH_CBT,
-        [](int code, WPARAM wparam, LPARAM lparam) -> LRESULT {
-            const auto dialog = reinterpret_cast<HWND>(wparam);
-            if (code == HCBT_ACTIVATE && GetDlgItem(dialog, IDC_BUCKET_PREFIX))
-                exercise(dialog);
-            return CallNextHookEx(nullptr, code, wparam, lparam);
-        },
-        nullptr, GetCurrentThreadId());
-    REQUIRE(hook != nullptr);
-    s3cmd::BucketCreationDialog dialog(initial, "eu-central-1",
-                                       [](std::string_view) { return "123456789012"; });
-    const auto options = dialog.show();
-    UnhookWindowsHookEx(hook);
-    exercise = {};
-    REQUIRE(exercised);
-    REQUIRE(options.has_value());
-    CHECK(
-        options->bucket_name ==
-        (account_regional ? "corrected-bucket-123456789012-eu-central-1-an" : "corrected-bucket"));
 }
 
 TEST_CASE("UTF-16 strings preserve Unicode and reject malformed encoding", "[unit]")
@@ -869,6 +687,14 @@ TEST_CASE("host dialogs format UTF-16 strings and numbers", "[unit]")
 
 TEST_CASE("remote paths identify profile, bucket, and object", "[unit]")
 {
+    CHECK(s3cmd::RemotePath::make(u"/") == s3cmd::RemotePath{});
+    CHECK(s3cmd::RemotePath::make(u"/work") == s3cmd::RemotePath{"work", {}, {}});
+    CHECK(s3cmd::RemotePath::make(u"/work/my-bucket") ==
+          s3cmd::RemotePath{"work", "my-bucket", {}});
+    CHECK(s3cmd::RemotePath::make(u"/work/my-bucket/one/two.txt") ==
+          s3cmd::RemotePath{"work", "my-bucket", "one/two.txt"});
+    CHECK(s3cmd::RemotePath::make(u"//work/my-bucket/one//") ==
+          s3cmd::RemotePath{"work", "my-bucket", "one"});
     CHECK(s3cmd::RemotePath::make(u"\\") == s3cmd::RemotePath{});
     CHECK(s3cmd::RemotePath::make(u"\\work") == s3cmd::RemotePath{"work", {}, {}});
     CHECK(s3cmd::RemotePath::make(u"\\work\\my-bucket") ==
@@ -883,6 +709,12 @@ TEST_CASE("remote path views borrow the original UTF-16 path", "[unit]")
 {
     using s3cmd::RemotePathView;
     CHECK(RemotePathView::make({}) == RemotePathView{});
+    CHECK(RemotePathView::make(u"/") == RemotePathView{});
+    CHECK(RemotePathView::make(u"//") == RemotePathView{});
+    CHECK(RemotePathView::make(u"/work/") == RemotePathView{u"work", {}, {}});
+    CHECK(RemotePathView::make(u"/work/bucket/") == RemotePathView{u"work", u"bucket", {}});
+    CHECK(RemotePathView::make(u"//work/bucket/one//") ==
+          RemotePathView{u"work", u"bucket", u"one"});
     CHECK(RemotePathView::make(u"\\\\") == RemotePathView{});
     CHECK(RemotePathView::make(u"\\work\\") == RemotePathView{u"work", {}, {}});
     CHECK(RemotePathView::make(u"\\work\\bucket\\") == RemotePathView{u"work", u"bucket", {}});
@@ -897,6 +729,15 @@ TEST_CASE("remote path views borrow the original UTF-16 path", "[unit]")
     CHECK(view.bucket.data() == path.data() + 6);
     CHECK(view.key.data() == path.data() + 13);
     CHECK(s3cmd::RemotePath::make(path) ==
+          s3cmd::RemotePath{"w\xc3\xb3rk", "bucket", "one/two.txt"});
+
+    const std::u16string linux_path = u"/w\u00f3rk/bucket/one/two.txt";
+    const auto linux_view = RemotePathView::make(linux_path);
+    CHECK(linux_view == RemotePathView{u"w\u00f3rk", u"bucket", u"one/two.txt"});
+    CHECK(linux_view.profile.data() == linux_path.data() + 1);
+    CHECK(linux_view.bucket.data() == linux_path.data() + 6);
+    CHECK(linux_view.key.data() == linux_path.data() + 13);
+    CHECK(s3cmd::RemotePath::make(linux_path) ==
           s3cmd::RemotePath{"w\xc3\xb3rk", "bucket", "one/two.txt"});
 }
 
@@ -1018,311 +859,6 @@ TEST_CASE("remote files are delegated to the host for opening", "[unit]")
     CHECK(s3cmd::execute_file(bucket, u"open") == FS_EXEC_OK);
     CHECK(s3cmd::execute_file(object, u"MODE I") == FS_EXEC_YOURSELF);
     CHECK(s3cmd::execute_file(named_object, u"open") == FS_EXEC_YOURSELF);
-}
-
-TEST_CASE("Properties skips commands and profiles", "[unit]")
-{
-    temporary_config();
-    PropertiesDriver driver([](HWND dialog) { PropertiesDriver::finish(dialog); });
-    for (const auto name : {u"\\", u"\\work", u"\\work\\_Add existing bucket_"})
-    {
-        std::u16string path(name);
-        CHECK(s3cmd::execute_file(path.data(), u"PROPERTIES") == FS_EXEC_OK);
-    }
-    CHECK_FALSE(driver.activated);
-}
-
-TEST_CASE("Properties supports sharing during tag loading and cancels on close", "[unit]")
-{
-    const auto caller = GetCurrentThreadId();
-    bool prepared_on_caller{};
-    std::atomic<bool> loaded_on_worker{}, snapshot_has_region{}, cancelled{};
-    std::atomic<unsigned> expiration{};
-    int stage{};
-    PropertiesDriver driver([&](HWND dialog) {
-        CHECK(dialog_text(dialog, IDC_PROPERTIES_ADDRESS) == u"s3://bucket/folder/file.txt");
-        if (stage == 0 && IsWindowEnabled(GetDlgItem(dialog, IDC_PROPERTIES_GENERATE)))
-        {
-            CHECK(dialog_text(dialog, IDC_PROPERTIES_DETAILS) == u"Size: 42 bytes");
-            SendMessageW(dialog, WM_COMMAND, IDC_PROPERTIES_GENERATE, 0);
-            CHECK_FALSE(IsWindowEnabled(GetDlgItem(dialog, IDC_PROPERTIES_GENERATE)));
-            ++stage;
-        }
-        else if (stage > 0 && !dialog_text(dialog, IDC_PROPERTIES_URL).empty())
-        {
-            CHECK(IsWindowEnabled(GetDlgItem(dialog, IDC_PROPERTIES_COPY_URL)));
-            if (stage == 1)
-            {
-                CHECK(expiration == 3600);
-                SendDlgItemMessageW(dialog, IDC_PROPERTIES_EXPIRY, CB_SETCURSEL, 2, 0);
-                SendMessageW(dialog, WM_COMMAND,
-                             MAKEWPARAM(IDC_PROPERTIES_EXPIRY, CBN_SELCHANGE), 0);
-                CHECK(dialog_text(dialog, IDC_PROPERTIES_URL).empty());
-                CHECK_FALSE(IsWindowEnabled(GetDlgItem(dialog, IDC_PROPERTIES_COPY_URL)));
-                SendMessageW(dialog, WM_COMMAND, IDC_PROPERTIES_GENERATE, 0);
-                ++stage;
-            }
-            else if (stage == 2)
-            {
-                CHECK(expiration == 86400);
-                SendDlgItemMessageW(dialog, IDC_PROPERTIES_EXPIRY, CB_SETCURSEL, 0, 0);
-                SendMessageW(dialog, WM_COMMAND,
-                             MAKEWPARAM(IDC_PROPERTIES_EXPIRY, CBN_SELCHANGE), 0);
-                SendMessageW(dialog, WM_COMMAND, IDC_PROPERTIES_GENERATE, 0);
-                ++stage;
-            }
-            else
-            {
-                CHECK(expiration == 900);
-                ++stage;
-                PropertiesDriver::finish(dialog);
-            }
-        }
-    });
-    s3cmd::S3Properties properties;
-    properties.kind = s3cmd::PropertiesKind::object;
-    properties.address = "s3://bucket/folder/file.txt";
-    properties.details = "Size: 42 bytes";
-    s3cmd::PropertiesDialog dialog(properties,
-        [&](s3cmd::S3Properties& state) {
-            prepared_on_caller = GetCurrentThreadId() == caller;
-            state.region = "eu-central-1";
-        },
-        [&](s3cmd::S3Properties snapshot, const std::atomic<bool>& stop) {
-            loaded_on_worker = GetCurrentThreadId() != caller;
-            snapshot_has_region = snapshot.region == "eu-central-1";
-            while (!stop)
-                std::this_thread::sleep_for(std::chrono::milliseconds(1));
-            cancelled = true;
-            return snapshot;
-        },
-        [&](unsigned seconds) {
-            expiration = seconds;
-            return "https://example.test/file?signature=test";
-        });
-    dialog.show(nullptr);
-    CHECK(driver.activated);
-    CHECK_FALSE(driver.timed_out);
-    CHECK(stage == 4);
-    CHECK(prepared_on_caller);
-    CHECK(loaded_on_worker);
-    CHECK(snapshot_has_region);
-    CHECK(cancelled);
-}
-
-TEST_CASE("Properties preserves the address and handles authentication and worker errors", "[unit]")
-{
-    bool prepare_fails{};
-    SECTION("authentication failed") { prepare_fails = true; }
-    SECTION("metadata and signing failed") {}
-    int stage{};
-    int attempts{};
-    PropertiesDriver driver([&](HWND dialog) {
-        CHECK(dialog_text(dialog, IDC_PROPERTIES_ADDRESS) == u"s3://bucket/file.txt");
-        CHECK(IsWindowEnabled(GetDlgItem(dialog, IDC_PROPERTIES_COPY_ADDRESS)));
-        if (prepare_fails)
-        {
-            if (dialog_text(dialog, IDC_PROPERTIES_DETAILS) == u"Authentication failed.")
-            {
-                CHECK_FALSE(IsWindowEnabled(GetDlgItem(dialog, IDC_PROPERTIES_GENERATE)));
-                ++stage;
-                PropertiesDriver::finish(dialog);
-            }
-        }
-        else if (stage == 0 && dialog_text(dialog, IDC_PROPERTIES_DETAILS) == u"Metadata failed.")
-        {
-            CHECK(IsWindowEnabled(GetDlgItem(dialog, IDC_PROPERTIES_GENERATE)));
-            CHECK(dialog_text(dialog, IDC_PROPERTIES_REGION) == u"eu-central-1");
-            SendMessageW(dialog, WM_COMMAND, IDC_PROPERTIES_GENERATE, 0);
-            ++stage;
-        }
-        else if (stage == 1 && dialog_text(dialog, IDC_PROPERTIES_LINK_STATUS) == u"Signing failed.")
-        {
-            CHECK_FALSE(IsWindowEnabled(GetDlgItem(dialog, IDC_PROPERTIES_COPY_URL)));
-            CHECK(IsWindowEnabled(GetDlgItem(dialog, IDC_PROPERTIES_GENERATE)));
-            SendMessageW(dialog, WM_COMMAND, IDC_PROPERTIES_GENERATE, 0);
-            ++stage;
-        }
-        else if (stage == 2 && !dialog_text(dialog, IDC_PROPERTIES_URL).empty())
-        {
-            CHECK(IsWindowEnabled(GetDlgItem(dialog, IDC_PROPERTIES_COPY_URL)));
-            ++stage;
-            PropertiesDriver::finish(dialog);
-        }
-    });
-    s3cmd::S3Properties properties;
-    properties.kind = s3cmd::PropertiesKind::object;
-    properties.address = "s3://bucket/file.txt";
-    s3cmd::PropertiesDialog dialog(properties,
-        [&](s3cmd::S3Properties& state) {
-            if (prepare_fails)
-                throw std::runtime_error("Authentication failed.");
-            state.region = "eu-central-1";
-        },
-        [](s3cmd::S3Properties, const std::atomic<bool>&) -> s3cmd::S3Properties {
-            throw std::runtime_error("Metadata failed.");
-        },
-        [&](unsigned) -> std::string {
-            if (++attempts == 1)
-                throw std::runtime_error("Signing failed.");
-            return "https://example.test/signed";
-        });
-    dialog.show(nullptr);
-    CHECK(driver.activated);
-    CHECK_FALSE(driver.timed_out);
-    CHECK(stage == (prepare_fails ? 1 : 3));
-    CHECK(attempts == (prepare_fails ? 0 : 2));
-}
-
-TEST_CASE("S3 Properties uses listed metadata, fetches tags, and signs the real address", "[unit]")
-{
-    temporary_config();
-    REQUIRE(s3cmd::ProfileConfig("work").register_bucket("bucket", "eu-central-1"));
-    bool bucket{}, folder{}, unlisted{}, uncached_file{}, tags_denied{}, no_tags{}, cancel{};
-    SECTION("object") {}
-    SECTION("object tags denied") { tags_denied = true; }
-    SECTION("bucket tags") { bucket = true; }
-    SECTION("bucket without tags") { bucket = no_tags = true; }
-    SECTION("bucket tags denied") { bucket = tags_denied = true; }
-    SECTION("listed virtual folder") { folder = true; }
-    SECTION("unlisted virtual folder") { folder = unlisted = true; }
-    SECTION("uncached file is treated as a folder") { folder = unlisted = uncached_file = true; }
-    SECTION("closing during a tag request preserves listed metadata") { cancel = true; }
-
-    const std::string object_key = "r\xc3\xa9sum\xc3\xa9 #?.txt";
-    const std::u16string wide_key = u"r\u00e9sum\u00e9 #?.txt";
-    std::atomic<int> tag_requests{}, unexpected_requests{};
-    httplib::Server server;
-    server.set_pre_routing_handler([&](const httplib::Request& request, httplib::Response& response) {
-        if (request.method == "GET" && request.has_param("tagging"))
-        {
-            ++tag_requests;
-            if (cancel)
-                std::this_thread::sleep_for(std::chrono::milliseconds(200));
-            if (request.path != (bucket ? "/bucket" : "/bucket/" + object_key))
-                ++unexpected_requests;
-            if (tags_denied || no_tags)
-            {
-                response.status = tags_denied ? 403 : 404;
-                const auto code = tags_denied ? "AccessDenied" : "NoSuchTagSet";
-                response.set_content(std::string("<Error><Code>") + code + "</Code><Message>" +
-                                     code + "</Message></Error>", "application/xml");
-            }
-            else
-                response.set_content("<Tagging><TagSet><Tag><Key>project</Key><Value>demo</Value>"
-                                     "</Tag></TagSet></Tagging>", "application/xml");
-        }
-        else if (request.method == "GET" && request.path == "/bucket" &&
-                 request.has_param("list-type"))
-        {
-            response.set_content("<ListBucketResult><CommonPrefixes><Prefix>folder/</Prefix>"
-                                 "</CommonPrefixes><Contents><Key>" + object_key + "</Key>"
-                                 "<Size>42</Size><ETag>\"listed\"</ETag><StorageClass>STANDARD_IA"
-                                 "</StorageClass><LastModified>2026-10-23T12:00:00.000Z</LastModified>"
-                                 "</Contents></ListBucketResult>", "application/xml");
-        }
-        else
-        {
-            ++unexpected_requests;
-            response.status = 403;
-        }
-        return httplib::Server::HandlerResponse::Handled;
-    });
-    const auto port = server.bind_to_any_port("127.0.0.1");
-    REQUIRE(port > 0);
-    std::jthread worker([&](std::stop_token stop) {
-        std::stop_callback shutdown(stop, [&] { server.stop(); });
-        server.listen_after_bind();
-    });
-    server.wait_until_ready();
-    const auto endpoint = "http://127.0.0.1:" + std::to_string(port);
-    TemporaryEnvironment url("AWS_ENDPOINT_URL_S3", endpoint.c_str());
-    TemporaryEnvironment endpoints("AWS_IGNORE_CONFIGURED_ENDPOINT_URLS", "false");
-    TemporaryEnvironment access("AWS_ACCESS_KEY_ID", "test");
-    TemporaryEnvironment secret("AWS_SECRET_ACCESS_KEY", "test");
-    TemporaryEnvironment token("AWS_SESSION_TOKEN", "test-session");
-    PluginSession session;
-    if (!bucket && !unlisted)
-    {
-        WfxFindData data{};
-        const auto listing = s3cmd::find_first(u"\\work\\bucket", &data);
-        REQUIRE(listing != INVALID_HANDLE_VALUE);
-        s3cmd::find_close(listing);
-    }
-    bool checked{};
-    bool generated{};
-    PropertiesDriver driver([&](HWND dialog) {
-        if (cancel)
-        {
-            if (tag_requests > 0)
-            {
-                const auto details = dialog_text(dialog, IDC_PROPERTIES_DETAILS);
-                CHECK(details.find(u"42 bytes") != details.npos);
-                CHECK(details.find(u"2026-10-23T12:00:00Z") != details.npos);
-                CHECK(dialog_text(dialog, IDC_PROPERTIES_TAG_STATUS) == u"Loading tags...");
-                checked = true;
-                PropertiesDriver::finish(dialog);
-            }
-            return;
-        }
-        if (dialog_text(dialog, IDC_PROPERTIES_DETAILS) == u"Loading properties..." ||
-            dialog_text(dialog, IDC_PROPERTIES_TAG_STATUS) == u"Loading tags...")
-            return;
-        if (!checked)
-        {
-            checked = true;
-            const auto expected_address = bucket ? u"s3://bucket/" : uncached_file ?
-                u"s3://bucket/" + wide_key + u"/" : folder ?
-                u"s3://bucket/folder/" : u"s3://bucket/" + wide_key;
-            CHECK(dialog_text(dialog, IDC_PROPERTIES_ADDRESS) == expected_address);
-            CHECK(dialog_text(dialog, IDC_PROPERTIES_REGION) == u"eu-central-1");
-            CHECK(IsWindowVisible(GetDlgItem(dialog, IDC_PROPERTIES_LINK_GROUP)) == (!bucket && !folder));
-            CHECK(IsWindowVisible(GetDlgItem(dialog, IDC_PROPERTIES_TAG_GROUP)) == !folder);
-            const auto tags = dialog_text(dialog, IDC_PROPERTIES_TAG_STATUS);
-            if (tags_denied)
-                CHECK(tags.find(u"AccessDenied") != tags.npos);
-            else if (no_tags)
-                CHECK(tags == u"No tags.");
-            else if (!folder)
-                CHECK(ListView_GetItemCount(GetDlgItem(dialog, IDC_PROPERTIES_TAGS)) == 1);
-            if (!bucket && !folder)
-            {
-                const auto details = dialog_text(dialog, IDC_PROPERTIES_DETAILS);
-                CHECK(details.find(u"42 bytes") != details.npos);
-                CHECK(details.find(u"2026-10-23T12:00:00Z") != details.npos);
-                CHECK(details.find(u"STANDARD_IA") != details.npos);
-                CHECK(details.find(u"listed") != details.npos);
-                CHECK(IsWindowEnabled(GetDlgItem(dialog, IDC_PROPERTIES_GENERATE)));
-                SendMessageW(dialog, WM_COMMAND, IDC_PROPERTIES_GENERATE, 0);
-            }
-            else
-            {
-                CHECK_FALSE(IsWindowEnabled(GetDlgItem(dialog, IDC_PROPERTIES_GENERATE)));
-                PropertiesDriver::finish(dialog);
-            }
-        }
-        const auto link = s3cmd::to_utf8(dialog_text(dialog, IDC_PROPERTIES_URL));
-        if (!link.empty())
-        {
-            generated = true;
-            CHECK(link.starts_with(endpoint + "/bucket/r%C3%A9sum%C3%A9%20%23%3F.txt?"));
-            CHECK(link.find("X-Amz-Expires=3600") != link.npos);
-            CHECK(link.find("X-Amz-Security-Token=test-session") != link.npos);
-            CHECK(link.find("eu-central-1") != link.npos);
-            CHECK(link.find("X-Amz-Signature=") != link.npos);
-            PropertiesDriver::finish(dialog);
-        }
-    });
-    std::u16string path = u"\\work\\bucket";
-    if (!bucket)
-        path += u"\\" + (folder && !uncached_file ? std::u16string(u"folder") : wide_key);
-    CHECK(s3cmd::execute_file(path.data(), u"properties") == FS_EXEC_OK);
-    CHECK(driver.activated);
-    CHECK_FALSE(driver.timed_out);
-    CHECK(checked);
-    CHECK(generated == (!bucket && !folder && !cancel));
-    CHECK(tag_requests == (folder ? 0 : 1));
-    CHECK(unexpected_requests == 0);
 }
 
 TEST_CASE("Add existing bucket opens a local registration prompt", "[unit]")

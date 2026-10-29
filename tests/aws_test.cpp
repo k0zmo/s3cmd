@@ -1,12 +1,14 @@
 #include "s3.hpp"
 #include "config.hpp"
-#include "core.hpp"
 #include "utils.hpp"
+#include "platform.hpp"
+#include "test_helpers.hpp"
 
 #include <aws/core/Aws.h>
 #include <aws/core/auth/AWSCredentialsProviderChain.h>
 #include <aws/core/client/ClientConfiguration.h>
 #include <aws/core/http/HttpResponse.h>
+#include <aws/core/platform/Environment.h>
 #include <aws/core/utils/memory/AWSMemory.h>
 #include <aws/s3/S3Client.h>
 #include <aws/s3/S3ClientConfiguration.h>
@@ -14,18 +16,22 @@
 #include <catch2/catch_test_macros.hpp>
 
 #include <algorithm>
-#include <cstdlib>
 #include <filesystem>
-#include <fstream>
-#include <iterator>
 #include <optional>
-#include <stdexcept>
 #include <string>
 #include <string_view>
-#include <system_error>
 #include <vector>
 
+using s3cmd::test::PluginSession;
+using s3cmd::test::temporary_config;
+
 namespace {
+
+#ifdef _WIN32
+constexpr char16_t remote_separator = u'\\';
+#else
+constexpr char16_t remote_separator = u'/';
+#endif
 
 struct AwsSession
 {
@@ -33,50 +39,6 @@ struct AwsSession
     ~AwsSession() { Aws::ShutdownAPI(options); }
 
     Aws::SDKOptions options;
-};
-
-struct PluginSession
-{
-    PluginSession() { s3cmd::initialize(0, nullptr, nullptr, nullptr); }
-    ~PluginSession() { s3cmd::shutdown(); }
-};
-
-class TemporaryAppData
-{
-public:
-    TemporaryAppData()
-        : path_(std::filesystem::temp_directory_path() /
-                ("s3cmd-aws-" + std::to_string(GetCurrentProcessId()) + "-" +
-                 std::to_string(GetTickCount64())))
-    {
-        wchar_t* previous{};
-        std::size_t size{};
-        if (_wdupenv_s(&previous, &size, s3cmd::win32_string(u"APPDATA")) != 0)
-            throw std::runtime_error("Cannot read APPDATA");
-        if (previous)
-        {
-            old_ = s3cmd::utf16_string(previous);
-            std::free(previous);
-        }
-
-        std::filesystem::create_directories(path_);
-        if (_wputenv_s(s3cmd::win32_string(u"APPDATA"), path_.c_str()) != 0)
-            throw std::runtime_error("Cannot set APPDATA");
-        s3cmd::reset_config();
-    }
-
-    ~TemporaryAppData()
-    {
-        _wputenv_s(s3cmd::win32_string(u"APPDATA"), s3cmd::win32_string(old_.c_str()));
-        std::error_code ignored;
-        std::filesystem::remove_all(path_, ignored);
-    }
-
-    const std::filesystem::path& path() const { return path_; }
-
-private:
-    std::filesystem::path path_;
-    std::u16string old_;
 };
 
 Aws::S3::S3Client make_client(const char* profile, const char* region)
@@ -94,16 +56,10 @@ Aws::S3::S3Client make_client(const char* profile, const char* region)
 
 std::optional<std::string> environment(const char* name)
 {
-    const auto size = GetEnvironmentVariableA(name, nullptr, 0);
-    if (size <= 1)
+    const auto value = Aws::Environment::GetEnv(name);
+    if (value.empty())
         return std::nullopt;
-
-    std::string value(size, '\0');
-    const auto written = GetEnvironmentVariableA(name, value.data(), size);
-    if (written == 0 || written >= size)
-        throw std::runtime_error("Cannot read test environment");
-    value.resize(written);
-    return value;
+    return std::string{value.c_str()};
 }
 
 } // namespace
@@ -139,6 +95,7 @@ TEST_CASE("a bucket region can be discovered from its name", "[integration]")
     if (!profile || !bucket || !region)
         SKIP("Set S3CMD_TEST_PROFILE, S3CMD_TEST_BUCKET, and S3CMD_TEST_REGION");
 
+    temporary_config();
     PluginSession session;
     CHECK(s3cmd::discover_bucket_region(*profile, *bucket) == *region);
     CHECK(s3cmd::ProfileConfig(*profile).bucket_region(*bucket) == *region);
@@ -156,6 +113,7 @@ TEST_CASE("a bucket can be entered using its own region", "[integration]")
              "S3CMD_TEST_LIST_BUCKETS, and S3CMD_TEST_OBJECT");
 
     REQUIRE((*list_buckets == "allowed" || *list_buckets == "denied"));
+    temporary_config();
     PluginSession session;
 
     REQUIRE_FALSE(object->empty());
@@ -174,13 +132,12 @@ TEST_CASE("a bucket can be entered using its own region", "[integration]")
         remaining.remove_prefix(separator + 1);
     }
 
-    TemporaryAppData app_data;
     if (*list_buckets == "denied")
         REQUIRE(s3cmd::ProfileConfig(*profile).register_bucket(*bucket, *region));
 
-    auto profile_path = u"\\" + s3cmd::to_utf16(*profile);
+    auto profile_path = std::u16string(1, remote_separator) + s3cmd::to_utf16(*profile);
     const auto bucket_name = s3cmd::to_utf16(*bucket);
-    auto directory = profile_path + u"\\" + bucket_name;
+    auto directory = profile_path + remote_separator + bucket_name;
 
     // Total Commander may open a saved bucket path without listing its profile first.
     WfxFindData entry{};
@@ -221,7 +178,7 @@ TEST_CASE("a bucket can be entered using its own region", "[integration]")
         if (index + 1 < components.size())
         {
             REQUIRE((attributes & FILE_ATTRIBUTE_DIRECTORY) != 0);
-            directory += u"\\" + expected;
+            directory += remote_separator + expected;
         }
     }
 }
@@ -237,14 +194,16 @@ TEST_CASE("Get rejects an untracked partial local file", "[integration]")
         SKIP("Set S3CMD_TEST_PROFILE, S3CMD_TEST_BUCKET, S3CMD_TEST_REGION, "
              "S3CMD_TEST_LIST_BUCKETS, and S3CMD_TEST_OBJECT");
 
-    TemporaryAppData app_data;
+    auto& config = temporary_config();
     REQUIRE((*list_buckets == "allowed" || *list_buckets == "denied"));
     REQUIRE(s3cmd::ProfileConfig(*profile).register_bucket(*bucket, *region));
     PluginSession session;
 
-    auto remote = s3cmd::to_utf16("\\" + *profile + "\\" + *bucket + "\\" + *object);
-    std::replace(remote.begin(), remote.end(), u'/', u'\\');
-    const auto local = app_data.path() / u"resumed-download";
+    auto remote = std::u16string(1, remote_separator) + s3cmd::to_utf16(*profile) +
+                  remote_separator + s3cmd::to_utf16(*bucket) + remote_separator +
+                  s3cmd::to_utf16(*object);
+    std::replace(remote.begin(), remote.end(), u'/', remote_separator);
+    const auto local = config.root / "resumed-download";
     auto local_name = local.u16string();
 
     REQUIRE(s3cmd::get_file(remote.data(), local_name.data(), 0, nullptr) == FS_FILE_OK);

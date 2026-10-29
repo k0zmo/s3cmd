@@ -69,21 +69,23 @@ bool PluginHost::notify_message_box_result(message_box_type type,
 
 RemotePathView RemotePathView::make(std::u16string_view path) noexcept
 {
-    // Remove \ from the back and the front
-    while (!path.empty() && path.front() == u'\\')
+    constexpr std::u16string_view separators = u"\\/";
+
+    // Strip the root separator and any trailing directory separators.
+    while (!path.empty() && separators.find(path.front()) != separators.npos)
         path.remove_prefix(1);
-    while (!path.empty() && path.back() == u'\\')
+    while (!path.empty() && separators.find(path.back()) != separators.npos)
         path.remove_suffix(1);
 
     // Check for the profile
-    const auto profile_end = path.find(u'\\');
+    const auto profile_end = path.find_first_of(separators);
     const auto profile = path.substr(0, profile_end);
     if (profile_end == std::u16string_view::npos)
         return {profile, {}, {}};
 
     // Split the remaining into the bucket and the key
     path.remove_prefix(profile_end + 1);
-    const auto bucket_end = path.find(u'\\');
+    const auto bucket_end = path.find_first_of(separators);
     const auto bucket = path.substr(0, bucket_end);
     const auto key =
         bucket_end == std::u16string_view::npos ? std::u16string_view{} : path.substr(bucket_end + 1);
