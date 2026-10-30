@@ -48,6 +48,7 @@ add_library(s3cmd-core STATIC
     src/fsplugin.h
     src/prereq.hpp
     src/platform.hpp
+    src/bucket_creation.hpp        src/bucket_creation.cpp
     src/config.hpp                 src/config.cpp
     src/core.hpp                   src/core.cpp
     src/creds.hpp                  src/creds.cpp
@@ -93,6 +94,16 @@ if(WIN32)
     target_compile_definitions(s3cmd-core PUBLIC NOMINMAX WIN32_LEAN_AND_MEAN)
     target_link_libraries(s3cmd-core PUBLIC shell32 comctl32)
 else()
+    include(EmbedDialog)
+    s3cmd_embed_dialog(bucket_creation "${CMAKE_CURRENT_BINARY_DIR}/generated/bucket_creation_lfm.hpp")
+    target_sources(s3cmd-core PRIVATE
+        src/doublecmd/extension.hpp
+        src/doublecmd/extension.cpp
+        src/doublecmd/bucket_creation_dialog.hpp
+        src/doublecmd/bucket_creation_dialog.cpp
+        src/doublecmd/bucket_creation.lfm
+    )
+    target_include_directories(s3cmd-core PRIVATE "${CMAKE_CURRENT_BINARY_DIR}/generated")
     target_link_libraries(s3cmd-core PUBLIC Iconv::Iconv)
 endif()
 
@@ -147,6 +158,7 @@ if(BUILD_TESTING)
     find_package(Catch2 CONFIG REQUIRED)
 
     add_executable(s3cmd-test
+        tests/bucket_creation_test.cpp
         tests/core_test.cpp
         tests/test_helpers.hpp
         tests/aws_test.cpp
@@ -158,6 +170,8 @@ if(BUILD_TESTING)
             src/win32/bucket_creation_dialog.rc
             src/win32/properties_dialog.rc
         )
+    else()
+        target_sources(s3cmd-test PRIVATE tests/doublecmd_test.cpp)
     endif()
 
     target_link_libraries(s3cmd-test PRIVATE

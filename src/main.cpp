@@ -1,13 +1,27 @@
 #include "s3.hpp"
 #include "icons.hpp"
+
 #ifndef _WIN32
 #include "platform.hpp"
+#include "doublecmd/extension.hpp"
 #endif
 
 #ifdef _WIN32
 #define WFX_EXPORT extern "C"
 #else
 #define WFX_EXPORT extern "C" [[gnu::visibility("default")]]
+#endif
+
+#ifndef _WIN32
+WFX_EXPORT void DCPCALL ExtensionInitialize(s3cmd::dc::StartupInfo* info)
+{
+    s3cmd::dc::initialize_extension(info);
+}
+
+WFX_EXPORT void DCPCALL ExtensionFinalize(void*)
+{
+    s3cmd::dc::finalize_extension();
+}
 #endif
 
 // 32-bit Total Commander requires these ANSI exports even for Unicode plugins.

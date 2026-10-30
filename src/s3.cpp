@@ -14,6 +14,8 @@
 #ifdef _WIN32
 #  include "win32/bucket_creation_dialog.hpp"
 #  include "win32/properties_dialog.hpp"
+#else
+#  include "doublecmd/bucket_creation_dialog.hpp"
 #endif
 
 #include <aws/core/AmazonWebServiceRequest.h>
@@ -92,24 +94,6 @@ using namespace std::chrono_literals;
 namespace s3cmd {
 
 #ifndef _WIN32
-
-struct BucketCreationOptions
-{
-    std::string bucket_name;
-    std::string region;
-    bool account_regional{};
-    std::string account_id;
-};
-
-class BucketCreationDialog
-{
-public:
-    using AccountIdLookupFn = std::function<std::string(std::string_view)>;
-
-    BucketCreationDialog(std::string_view, std::string_view, AccountIdLookupFn) {}
-
-    std::optional<BucketCreationOptions> show() { return std::nullopt; }
-};
 
 enum class PropertiesKind
 {
