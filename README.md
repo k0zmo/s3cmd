@@ -1,6 +1,7 @@
 # s3cmd for Total Commander and Double Commander
 
 `s3cmd` is a WFX file-system plugin that puts Amazon S3 in Total Commander.
+Also works in Double Commander on both Linux and Windows.
 It uses standard AWS profiles, so it does not keep a separate copy of your credentials.
 
 The plugin has a simple path: AWS profile, S3 bucket, then object(s).

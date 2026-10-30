@@ -195,17 +195,16 @@ if(BUILD_TESTING)
     )
 endif()
 
-configure_file(pluginst.inf.in pluginst.inf @ONLY)
+if(WIN32)
+    configure_file(pluginst.inf.in pluginst.inf @ONLY)
+    install(FILES "${CMAKE_CURRENT_BINARY_DIR}/pluginst.inf" DESTINATION .)
+endif()
 
 install(TARGETS s3cmd
     LIBRARY DESTINATION .
     RUNTIME DESTINATION .
 )
-install(FILES
-    "${CMAKE_CURRENT_BINARY_DIR}/pluginst.inf"
-    README.md
-    DESTINATION .
-)
+install(FILES README.md DESTINATION .)
 install(FILES
     "${CMAKE_CURRENT_SOURCE_DIR}/icons/README.md"
     RENAME ICONS-LICENSES.md
