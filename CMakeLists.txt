@@ -98,14 +98,18 @@ endif()
 
 add_library(s3cmd MODULE
     src/main.cpp
+    src/icons.cpp src/icons.hpp
 )
 if(WIN32)
     target_sources(s3cmd PRIVATE
-        src/icons.cpp src/icons.hpp
         src/win32/s3cmd.rc
         src/win32/bucket_creation_dialog.rc
         src/win32/properties_dialog.rc
     )
+else()
+    include(EmbedIcons)
+    s3cmd_embed_icons("${CMAKE_CURRENT_BINARY_DIR}/generated/icons_data.hpp")
+    target_include_directories(s3cmd PRIVATE "${CMAKE_CURRENT_BINARY_DIR}/generated")
 endif()
 
 target_compile_features(s3cmd PRIVATE cxx_std_20)

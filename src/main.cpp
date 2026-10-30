@@ -1,14 +1,13 @@
 #include "s3.hpp"
-#ifdef _WIN32
-#  include "icons.hpp"
-#else
-#  include "platform.hpp"
+#include "icons.hpp"
+#ifndef _WIN32
+#include "platform.hpp"
 #endif
 
 #ifdef _WIN32
 #define WFX_EXPORT extern "C"
 #else
-#define WFX_EXPORT extern "C" [[gnu::visibility("default")]] 
+#define WFX_EXPORT extern "C" [[gnu::visibility("default")]]
 #endif
 
 // 32-bit Total Commander requires these ANSI exports even for Unicode plugins.
@@ -103,12 +102,11 @@ WFX_EXPORT void DCPCALL FsGetDefRootName(char* name, int max_length)
     s3cmd::get_default_root_name(name, max_length);
 }
 
-#ifdef _WIN32
-WFX_EXPORT int DCPCALL FsExtractCustomIconW(char16_t* remote_name, int extract_flags, HICON* icon)
+WFX_EXPORT int DCPCALL FsExtractCustomIconW(char16_t* remote_name, int extract_flags,
+                                            TWfxIcon* icon)
 {
     return s3cmd::extract_custom_icon(remote_name, extract_flags, icon);
 }
-#endif
 
 WFX_EXPORT int DCPCALL FsContentGetSupportedField(int field_index, char* field_name, char* units,
                                                   int max_length)

@@ -257,7 +257,7 @@ struct WfxFindData
 // Double Commander's custom icon formats.
 #define FS_ICON_FORMAT_HICON 0 // Windows icon handle.
 #define FS_ICON_FORMAT_FILE 1 // File name returned in RemoteName.
-#define FS_ICON_FORMAT_BINARY 2 // PNG or ICO bytes, released through Free.
+#define FS_ICON_FORMAT_BINARY 2 // PNG or ICO bytes; Free is used with FS_ICON_EXTRACTED_DESTROY.
 
 typedef void(DCPCALL* tFreeProc)(void* Pointer);
 
@@ -265,11 +265,15 @@ typedef void(DCPCALL* tFreeProc)(void* Pointer);
 typedef struct
 {
     void* Pointer;
-    uintptr_t Size;
+    uintptr_t Size; // Requested pixel size on entry; binary byte count on return.
     uintptr_t Format;
     tFreeProc Free;
 } TWfxIcon, *PWfxIcon;
 #pragma pack(pop)
+
+#else
+
+typedef HICON TWfxIcon;
 
 #endif
 
@@ -394,15 +398,10 @@ void DCPCALL FsStatusInfoW(char16_t* RemoteDir, int InfoStartEnd, int InfoOperat
 // Supplies the root name shown in Network Neighborhood. This is called during
 // installation, before FsInit, and the name is not included in plugin paths.
 void DCPCALL FsGetDefRootName(char* DefRootName, int maxlen);
-// Supplies a custom file/directory icon. The icon handle must be returned in
-// TheIcon; the function may return an icon name for Total Commander to cache.
-#ifdef _WIN32
-int DCPCALL FsExtractCustomIcon(char* RemoteName, int ExtractFlags, HICON* TheIcon);
-int DCPCALL FsExtractCustomIconW(char16_t* RemoteName, int ExtractFlags, HICON* TheIcon);
-#else
-int DCPCALL FsExtractCustomIcon(char* RemoteName, int ExtractFlags, PWfxIcon TheIcon);
-int DCPCALL FsExtractCustomIconW(char16_t* RemoteName, int ExtractFlags, PWfxIcon TheIcon);
-#endif
+// Supplies a custom file/directory icon: an HICON on Windows, or a TWfxIcon on
+// other platforms. RemoteName may receive an icon name for the host to cache.
+int DCPCALL FsExtractCustomIcon(char* RemoteName, int ExtractFlags, TWfxIcon* TheIcon);
+int DCPCALL FsExtractCustomIconW(char16_t* RemoteName, int ExtractFlags, TWfxIcon* TheIcon);
 // Receives the interface version and suggested settings-file location after
 // FsInit. Use a unique INI section because the file is shared by plugins.
 void DCPCALL FsSetDefaultParams(FsDefaultParamStruct* dps);

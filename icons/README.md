@@ -10,6 +10,10 @@ The plugin icons are generated from these SVG sources:
 - `profile.ico` is based on Lucide's [`user-round`][lucide] icon. Its ISC
   License notice appears below.
 
+The Linux build embeds `profile.ico` and `bucket.ico` directly in the plugin.
+Double Commander receives a PNG matching its requested size, or the next larger
+image when available.
+
 Amazon S3 and AWS are trademarks of Amazon Web Services, Inc. This plugin is
 not affiliated with or endorsed by Amazon Web Services. All other trademarks
 belong to their respective owners.
