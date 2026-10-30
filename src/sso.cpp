@@ -34,6 +34,11 @@
 
 #ifdef _WIN32
 #include <shellapi.h>
+#elif defined(__linux__)
+#include <cerrno>
+#include <spawn.h>
+#include <sys/wait.h>
+#include <unistd.h>
 #endif
 
 #include <algorithm>
@@ -179,9 +184,20 @@ bool open_url(std::string_view url)
                ShellExecuteW(nullptr, win32_string(u"open"), win32_string(wide_url.c_str()),
                              nullptr, nullptr, SW_SHOWNORMAL)) > 32;
 #else
-    // TODO: Use xdg-open?
-    (void)url;
-    return false;
+    std::string url_string(url);
+    char command[] = "xdg-open";
+    char* args[] = {command, url_string.data(), nullptr};
+    pid_t pid;
+    if (posix_spawnp(&pid, command, nullptr, nullptr, args, environ) != 0)
+        return false;
+
+    int status;
+    while (waitpid(pid, &status, 0) < 0)
+    {
+        if (errno != EINTR)
+            return false;
+    }
+    return WIFEXITED(status) && WEXITSTATUS(status) == 0;
 #endif
 }
 
