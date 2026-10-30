@@ -589,13 +589,15 @@ TEST_CASE("Double Commander S3 Properties uses cached metadata, loads tags, and 
     using s3cmd::test::TemporaryEnvironment;
     s3cmd::test::temporary_config();
     REQUIRE(s3cmd::ProfileConfig("work").register_bucket("bucket", "eu-central-1"));
-    bool bucket{}, folder{}, denied{}, no_tags{};
+    bool bucket{}, folder{}, denied{}, no_tags{}, nested_linux{};
     SECTION("object") {}
     SECTION("object with denied tags") { denied = true; }
     SECTION("bucket") { bucket = true; }
     SECTION("bucket with no tags") { bucket = no_tags = true; }
     SECTION("folder") { folder = true; }
-    const std::string object_key = "r\xc3\xa9sum\xc3\xa9 #?.txt";
+    SECTION("nested object with Linux separators") { nested_linux = true; }
+    const std::string object_prefix = nested_linux ? "one/two/" : "";
+    const std::string object_key = object_prefix + "r\xc3\xa9sum\xc3\xa9 #?.txt";
     std::atomic<unsigned> tag_requests{}, unexpected_requests{};
     httplib::Server server;
     server.set_pre_routing_handler([&](const httplib::Request& request, httplib::Response& response) {
@@ -648,7 +650,8 @@ TEST_CASE("Double Commander S3 Properties uses cached metadata, loads tags, and 
     if (!bucket)
     {
         WfxFindData data{};
-        const auto listing = s3cmd::find_first(u"\\work\\bucket", &data);
+        const auto listing = s3cmd::find_first(
+            nested_linux ? u"/work/bucket/one/two" : u"\\work\\bucket", &data);
         REQUIRE(listing != INVALID_HANDLE_VALUE);
         s3cmd::find_close(listing);
     }
@@ -680,7 +683,8 @@ TEST_CASE("Double Commander S3 Properties uses cached metadata, loads tags, and 
             host.event("GenerateButton", dc::dn_click);
             host.pump_until([&] { return !host.controls["PropertiesUrl"].text.empty(); });
             const auto& link = host.controls["PropertiesUrl"].text;
-            CHECK(link.starts_with(endpoint + "/bucket/r%C3%A9sum%C3%A9%20%23%3F.txt?"));
+            CHECK(link.starts_with(endpoint + "/bucket/" + object_prefix +
+                                   "r%C3%A9sum%C3%A9%20%23%3F.txt?"));
             CHECK(link.find("X-Amz-Expires=3600") != link.npos);
             CHECK(link.find("X-Amz-Security-Token=test-session") != link.npos);
             CHECK(link.find("eu-central-1") != link.npos);
@@ -689,7 +693,9 @@ TEST_CASE("Double Commander S3 Properties uses cached metadata, loads tags, and 
         host.event("CloseButton", dc::dn_click);
     });
     std::u16string path = u"\\work\\bucket";
-    if (!bucket)
+    if (nested_linux)
+        path = u"/work/bucket/one/two/r\u00e9sum\u00e9 #?.txt";
+    else if (!bucket)
         path += folder ? u"\\folder" : u"\\r\u00e9sum\u00e9 #?.txt";
     CHECK(s3cmd::execute_file(path.data(), u"properties") == FS_EXEC_OK);
     CHECK(driver.closed);

@@ -1270,6 +1270,7 @@ TEST_CASE("ListObjectsV2 metadata is exposed as content fields", "[unit]")
     httplib::Server server;
     server.Get("/owned-bucket", [&](const httplib::Request& request, httplib::Response& response) {
         ++list_requests;
+        const auto prefix = request.get_param_value("prefix");
         const auto mode = listing_mode.load();
         const auto second_page = request.has_param("continuation-token");
         if (second_page)
@@ -1308,13 +1309,13 @@ TEST_CASE("ListObjectsV2 metadata is exposed as content fields", "[unit]")
             R"xml(<?xml version="1.0" encoding="UTF-8"?>
 <ListBucketResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/">
   <Name>owned-bucket</Name>
-  <Prefix>folder/</Prefix>
+  <Prefix>)xml" + prefix + R"xml(</Prefix>
   <Delimiter>/</Delimiter>
   <KeyCount>1</KeyCount>
   <MaxKeys>1000</MaxKeys>
   <IsTruncated>false</IsTruncated>
   <Contents>
-    <Key>folder/file.txt</Key>
+    <Key>)xml" + prefix + R"xml(file.txt</Key>
     <LastModified>2026-09-13T00:00:00.000Z</LastModified>
     <ETag>&quot;abc123&quot;</ETag>
     <Size>3</Size>
@@ -1354,6 +1355,37 @@ TEST_CASE("ListObjectsV2 metadata is exposed as content fields", "[unit]")
     CHECK(std::u16string_view(value) == u"abc123");
     CHECK(list_requests == 1);
 
+    SECTION("long Windows paths keep normalized keys alive during lookup")
+    {
+        const auto directory = u"\\work\\owned-bucket\\" + std::u16string(80, u'a') + u"\\nested";
+        const auto long_listing = s3cmd::find_first(directory.c_str(), &entry);
+        REQUIRE(long_listing != INVALID_HANDLE_VALUE);
+        s3cmd::find_close(long_listing);
+        const auto object = directory + u"\\file.txt";
+        CHECK(s3cmd::content_get_value(object.c_str(), 1, value, sizeof(value)) == ft_stringw);
+        CHECK(std::u16string_view(value) == u"STANDARD");
+        CHECK(s3cmd::content_get_value(object.c_str(), 2, value, sizeof(value)) == ft_stringw);
+        CHECK(std::u16string_view(value) == u"abc123");
+        CHECK(list_requests == 2);
+    }
+    SECTION("Linux and mixed separators reuse nested object metadata")
+    {
+        for (const auto* name : {u"/work/owned-bucket/folder/file.txt",
+                                 u"/work/owned-bucket/folder\\file.txt",
+                                 u"\\work\\owned-bucket\\folder/file.txt"})
+        {
+            CHECK(s3cmd::content_get_value(name, 1, value, sizeof(value)) == ft_stringw);
+            CHECK(std::u16string_view(value) == u"STANDARD");
+            CHECK(s3cmd::content_get_value(name, 2, value, sizeof(value)) == ft_stringw);
+            CHECK(std::u16string_view(value) == u"abc123");
+        }
+        const auto linux_listing = s3cmd::find_first(u"/work/owned-bucket/folder", &entry);
+        REQUIRE(linux_listing != INVALID_HANDLE_VALUE);
+        s3cmd::find_close(linux_listing);
+        CHECK(s3cmd::content_get_value(object_path, 2, value, sizeof(value)) == ft_stringw);
+        CHECK(std::u16string_view(value) == u"abc123");
+        CHECK(list_requests == 2);
+    }
     SECTION("an empty listing removes previous metadata")
     {
         listing_mode = 1;

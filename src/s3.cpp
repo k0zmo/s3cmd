@@ -118,7 +118,17 @@ std::optional<ObjectMetadata> cached_object_metadata(RemotePathView path)
 {
     if (path.profile.empty() || path.bucket.empty() || path.key.empty())
         return std::nullopt;
-    const auto separator = path.key.rfind(u'\\');
+
+    // Cache prefixes use S3 separators. Host paths may use either separator.
+    // Keep the backing string alive until the lookup through path.key completes.
+    std::u16string normalized_key;
+    if (path.key.find(u'\\') != std::u16string_view::npos)
+    {
+        normalized_key = path.key;
+        std::replace(normalized_key.begin(), normalized_key.end(), u'\\', u'/');
+        path.key = normalized_key;
+    }
+    const auto separator = path.key.rfind(u'/');
     const auto name_start = separator == std::u16string_view::npos ? 0 : separator + 1;
     std::scoped_lock lock(object_metadata_mutex);
     if (const auto* found = object_metadata.find(
@@ -698,14 +708,6 @@ private:
             name.size() < MAX_PATH;
     }
 
-    // Convert S3-style path to totalcmd (windows forward slashes) style path
-    static std::u16string totalcmd_object_key(std::string_view key)
-    {
-        auto result = to_utf16(key);
-        std::replace(result.begin(), result.end(), u'/', u'\\');
-        return result;
-    }
-
     bool append_entry(std::string_view name, bool directory, std::uint64_t size = 0,
                       FILETIME modified = {})
     {
@@ -865,7 +867,7 @@ private:
         // Update metadata for this directory
         std::scoped_lock lock(object_metadata_mutex);
         object_metadata.add(
-            {to_utf16(path.profile), to_utf16(path.bucket), totalcmd_object_key(prefix)},
+            {to_utf16(path.profile), to_utf16(path.bucket), to_utf16(prefix)},
             std::move(metadata));
     }
 
