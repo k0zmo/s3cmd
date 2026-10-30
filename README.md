@@ -1,4 +1,4 @@
-# s3cmd for Total Commander
+# s3cmd for Total Commander and Double Commander
 
 `s3cmd` is a WFX file-system plugin that puts Amazon S3 in Total Commander.
 It uses standard AWS profiles, so it does not keep a separate copy of your credentials.
@@ -78,6 +78,7 @@ Select Properties for a bucket, object, or folder to copy its real `s3://` addre
 Bucket and object properties show their region and tags.
 Object properties also show size, modification time, storage class, and ETag.
 For an object, select an expiry duration and Generate link to create a presigned download URL.
+
 ## Features
 
 - Lists the default profile and named profiles from the AWS configuration and credentials files.

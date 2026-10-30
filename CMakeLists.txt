@@ -48,6 +48,7 @@ add_library(s3cmd-core STATIC
     src/fsplugin.h
     src/prereq.hpp
     src/platform.hpp
+    src/properties.hpp
     src/bucket_creation.hpp        src/bucket_creation.cpp
     src/config.hpp                 src/config.cpp
     src/core.hpp                   src/core.cpp
@@ -96,12 +97,16 @@ if(WIN32)
 else()
     include(EmbedDialog)
     s3cmd_embed_dialog(bucket_creation "${CMAKE_CURRENT_BINARY_DIR}/generated/bucket_creation_lfm.hpp")
+    s3cmd_embed_dialog(properties "${CMAKE_CURRENT_BINARY_DIR}/generated/properties_lfm.hpp")
     target_sources(s3cmd-core PRIVATE
         src/doublecmd/extension.hpp
         src/doublecmd/extension.cpp
         src/doublecmd/bucket_creation_dialog.hpp
         src/doublecmd/bucket_creation_dialog.cpp
         src/doublecmd/bucket_creation.lfm
+        src/doublecmd/properties_dialog.hpp
+        src/doublecmd/properties_dialog.cpp
+        src/doublecmd/properties.lfm
     )
     target_include_directories(s3cmd-core PRIVATE "${CMAKE_CURRENT_BINARY_DIR}/generated")
     target_link_libraries(s3cmd-core PUBLIC Iconv::Iconv)

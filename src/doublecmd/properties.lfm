@@ -1,0 +1,183 @@
+object Properties: TDialogBox
+  Caption = 'S3 Properties'
+  ClientWidth = 760
+  ClientHeight = 680
+  AutoSize = True
+  Constraints.MinWidth = 760
+  BorderIcons = [biSystemMenu]
+  BorderStyle = bsDialog
+  Position = poScreenCenter
+  KeyPreview = True
+  OnShow = DialogBoxShow
+  OnClose = DialogBoxClose
+  OnKeyDown = ButtonKeyDown
+  object HeaderPanel: TPanel
+    Align = alTop
+    Top = 0
+    Width = 736
+    Height = 180
+    BorderSpacing.Around = 8
+    BevelOuter = bvNone
+    TabOrder = 0
+    object AddressLabel: TLabel
+      Left = 0
+      Top = 6
+      Caption = 'S3 address:'
+    end
+    object PropertiesAddress: TEdit
+      Left = 92
+      Top = 0
+      Width = 644
+      Height = 30
+      Anchors = [akTop, akLeft, akRight]
+      ReadOnly = True
+      AutoSelect = True
+      TabOrder = 0
+    end
+    object RegionLabel: TLabel
+      Left = 0
+      Top = 46
+      Caption = 'Region:'
+    end
+    object PropertiesRegion: TEdit
+      Left = 92
+      Top = 40
+      Width = 644
+      Height = 30
+      Anchors = [akTop, akLeft, akRight]
+      ReadOnly = True
+      TabOrder = 1
+    end
+    object PropertiesDetails: TMemo
+      Left = 0
+      Top = 82
+      Width = 736
+      Height = 98
+      Anchors = [akTop, akLeft, akRight]
+      ReadOnly = True
+      ScrollBars = ssAutoVertical
+      TabOrder = 2
+    end
+  end
+  object TagsGroup: TGroupBox
+    Align = alTop
+    Top = 204
+    Width = 736
+    Height = 180
+    BorderSpacing.Around = 8
+    Caption = 'Tags'
+    TabOrder = 1
+    object PropertiesTags: TMemo
+      Left = 12
+      Top = 12
+      Width = 708
+      Height = 100
+      Anchors = [akTop, akLeft, akRight]
+      ReadOnly = True
+      ScrollBars = ssAutoBoth
+      WordWrap = False
+      TabOrder = 0
+    end
+    object TagStatus: TLabel
+      Left = 12
+      Top = 120
+      Width = 708
+      Height = 32
+      Anchors = [akTop, akLeft, akRight]
+      AutoSize = False
+      WordWrap = True
+    end
+  end
+  object ShareGroup: TGroupBox
+    Align = alTop
+    Top = 408
+    Width = 736
+    Height = 216
+    BorderSpacing.Around = 8
+    Caption = 'Share object'
+    TabOrder = 2
+    object ExpiryLabel: TLabel
+      Left = 12
+      Top = 18
+      Caption = 'Expires after:'
+    end
+    object LinkExpiry: TComboBox
+      Left = 112
+      Top = 12
+      Width = 140
+      Height = 30
+      Style = csDropDownList
+      Enabled = False
+      Items.Strings = (
+        '15 minutes'
+        '1 hour'
+        '24 hours'
+      )
+      TabOrder = 0
+      OnChange = ComboBoxChange
+    end
+    object GenerateButton: TButton
+      Left = 268
+      Top = 12
+      Width = 124
+      Height = 30
+      Caption = 'Generate link'
+      Enabled = False
+      TabOrder = 1
+      OnClick = ButtonClick
+    end
+    object PropertiesUrl: TEdit
+      Left = 12
+      Top = 54
+      Width = 708
+      Height = 30
+      Anchors = [akTop, akLeft, akRight]
+      ReadOnly = True
+      AutoSelect = True
+      TabOrder = 2
+    end
+    object LinkStatus: TLabel
+      Left = 12
+      Top = 94
+      Width = 708
+      Height = 44
+      Anchors = [akTop, akLeft, akRight]
+      AutoSize = False
+      WordWrap = True
+    end
+    object LinkWarning: TLabel
+      Left = 12
+      Top = 150
+      Width = 708
+      Height = 44
+      Anchors = [akTop, akLeft, akRight]
+      AutoSize = False
+      WordWrap = True
+      Caption = 'Anyone with this link can download the object. Temporary credentials can expire before the selected duration.'
+    end
+  end
+  object ButtonsPanel: TPanel
+    Align = alTop
+    Top = 648
+    Width = 736
+    Height = 32
+    BorderSpacing.Around = 8
+    BevelOuter = bvNone
+    TabOrder = 3
+    object CloseButton: TButton
+      Left = 632
+      Top = 0
+      Width = 104
+      Height = 30
+      Anchors = [akTop, akRight]
+      Caption = 'Close'
+      Default = True
+      TabOrder = 0
+      OnClick = ButtonClick
+    end
+  end
+  object PropertiesTimer: TTimer
+    Interval = 50
+    OnTimer = TimerTimer
+  end
+end

@@ -49,6 +49,7 @@ enum : std::intptr_t
     dm_get_text = 6,
     dm_redraw = 11,
     dm_set_text = 12,
+    dm_show_item = 15,
     dm_list_get_index = 19,
     dm_list_set_index = 20,
     dm_list_add_string = 23,
@@ -56,6 +57,9 @@ enum : std::intptr_t
     dn_change = 0x1003,
     dn_init_dialog = 0x1005,
     dn_kill_focus = 0x1006,
+    dn_timer = 0x1007,
+    dn_key_down = 7,
+    dn_close = dm_close,
     id_ok = 1,
     id_cancel = 2,
     db_lfm = 0

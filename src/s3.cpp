@@ -16,6 +16,7 @@
 #  include "win32/properties_dialog.hpp"
 #else
 #  include "doublecmd/bucket_creation_dialog.hpp"
+#  include "doublecmd/properties_dialog.hpp"
 #endif
 
 #include <aws/core/AmazonWebServiceRequest.h>
@@ -92,39 +93,6 @@
 using namespace std::chrono_literals;
 
 namespace s3cmd {
-
-#ifndef _WIN32
-
-enum class PropertiesKind
-{
-    bucket,
-    object,
-    prefix
-};
-
-struct S3Properties
-{
-    PropertiesKind kind{PropertiesKind::bucket};
-    std::string address;
-    std::string region;
-    std::string details{"Loading properties..."};
-    std::vector<std::pair<std::string, std::string>> tags;
-    std::string tag_status{"Loading tags..."};
-};
-
-class PropertiesDialog
-{
-public:
-    using PrepareFn = std::function<void(S3Properties&)>;
-    using LoadFn = std::function<S3Properties(S3Properties, const std::atomic<bool>&)>;
-    using PresignFn = std::function<std::string(unsigned)>;
-
-public:
-    PropertiesDialog(S3Properties, PrepareFn, LoadFn, PresignFn) {}
-    void show(HWND) {}
-};
-
-#endif
 
 namespace {
 
