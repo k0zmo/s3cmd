@@ -5,7 +5,11 @@
 #  include "platform.hpp"
 #endif
 
+#ifdef _WIN32
 #define WFX_EXPORT extern "C"
+#else
+#define WFX_EXPORT extern "C" [[gnu::visibility("default")]] 
+#endif
 
 // 32-bit Total Commander requires these ANSI exports even for Unicode plugins.
 // Actual operations use the W entry points on the supported Windows versions.
