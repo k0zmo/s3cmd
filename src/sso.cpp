@@ -49,6 +49,7 @@
 #include <filesystem>
 #include <ios>
 #include <fstream>
+#include <future>
 #include <mutex>
 #include <optional>
 #include <semaphore>
@@ -184,20 +185,31 @@ bool open_url(std::string_view url)
                ShellExecuteW(nullptr, win32_string(u"open"), win32_string(wide_url.c_str()),
                              nullptr, nullptr, SW_SHOWNORMAL)) > 32;
 #else
-    std::string url_string(url);
-    char command[] = "xdg-open";
-    char* args[] = {command, url_string.data(), nullptr};
-    pid_t pid;
-    if (posix_spawnp(&pid, command, nullptr, nullptr, args, environ) != 0)
-        return false;
-
-    int status;
-    while (waitpid(pid, &status, 0) < 0)
+    std::promise<bool> launched;
+    auto result = launched.get_future();
+    try
     {
-        if (errno != EINTR)
-            return false;
+        // Start the worker before spawning so a thread creation failure cannot leave a zombie.
+        std::thread([url_string = std::string(url), launched = std::move(launched)]() mutable {
+            char command[] = "xdg-open";
+            char* args[] = {command, url_string.data(), nullptr};
+            pid_t pid;
+            const auto error = posix_spawnp(&pid, command, nullptr, nullptr, args, environ);
+            launched.set_value(error == 0);
+            if (error != 0)
+                return;
+
+            // xdg-open may live as long as the browser; reap it without delaying SSO.
+            while (waitpid(pid, nullptr, 0) < 0 && errno == EINTR)
+            {
+            }
+        }).detach();
     }
-    return WIFEXITED(status) && WEXITSTATUS(status) == 0;
+    catch (const std::system_error&)
+    {
+        return false;
+    }
+    return result.get(); // Wait only for launch, never for the URL handler to exit.
 #endif
 }
 
