@@ -18,12 +18,12 @@ namespace s3cmd {
 struct ObjectMetadata
 {
     Aws::S3::Model::ObjectStorageClass storage_class{};
-    std::wstring etag;
+    std::u16string etag;
     std::uint64_t size{};
     Aws::Utils::DateTime modified{};
 };
 
-template <typename String = std::wstring>
+template <typename String = std::u16string>
 struct MetadataDirectory
 {
     String profile;
@@ -39,7 +39,7 @@ bool operator<(const MetadataDirectory<L>& left,
            std::tie(right.profile, right.bucket, right.prefix);
 }
 
-using ObjectMetadataMap = std::map<std::wstring, ObjectMetadata, std::less<>>;
+using ObjectMetadataMap = std::map<std::u16string, ObjectMetadata, std::less<>>;
 
 // Cache for object metadata with a configurable maximum size. The cache groups entries by
 // directory as listing discover them together. It evicts one complete directory at a time.
@@ -75,7 +75,7 @@ public:
 
     template <typename String>
     const ObjectMetadata* find(const MetadataDirectory<String>& key,
-                               std::wstring_view name)
+                               std::u16string_view name)
     {
         const auto directory = directories_.find(key);
         if (directory == directories_.end())

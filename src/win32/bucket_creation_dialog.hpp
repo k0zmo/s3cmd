@@ -1,5 +1,7 @@
 #pragma once
 
+#include "bucket_creation.hpp"
+
 #include <Windows.h>
 
 #include <functional>
@@ -8,14 +10,6 @@
 #include <string_view>
 
 namespace s3cmd {
-
-struct BucketCreationOptions
-{
-    std::string bucket_name;
-    std::string region;
-    bool account_regional{};
-    std::string account_id;
-};
 
 class BucketCreationDialog
 {

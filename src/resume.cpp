@@ -67,11 +67,7 @@ bool write_resume_document(const toml::table& document)
 std::string resume_key(const std::filesystem::path& path)
 {
     const auto normalized = std::filesystem::absolute(path).lexically_normal();
-#ifdef _WIN32
-    return to_utf8(normalized.native());
-#else
-    return normalized.native();
-#endif
+    return to_utf8(normalized.u16string());
 }
 
 } // namespace
@@ -103,7 +99,7 @@ try
             try
             {
 #ifdef _WIN32
-                std::filesystem::path download{to_wide(key.str())};
+                std::filesystem::path download{to_utf16(key.str())};
 #else
                 std::filesystem::path download{key.str()};
 #endif

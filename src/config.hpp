@@ -2,17 +2,12 @@
 
 #include "fsplugin.h" // FILETIME
 
+#include <filesystem>
 #include <functional>
 #include <map>
 #include <string>
 #include <string_view>
 #include <utility>
-
-// Forward declarations
-namespace std::filesystem {
-
-class path;
-} // namespace std::filesystem
 
 namespace s3cmd {
 

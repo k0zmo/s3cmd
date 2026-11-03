@@ -5,6 +5,6 @@
 namespace s3cmd {
 
 inline constexpr const std::string_view plugin_name = "S3";
-inline constexpr const wchar_t* title = L"s3cmd";
+inline constexpr const char16_t* title = u"s3cmd";
 
 } // namespace s3cmd

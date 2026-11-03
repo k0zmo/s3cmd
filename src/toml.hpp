@@ -2,12 +2,8 @@
 
 #include <toml++/toml.hpp>
 
+#include <filesystem>
 #include <optional>
-
-namespace std::filesystem {
-
-class path;
-} // namespace std::filesystem
 
 namespace s3cmd {
 

@@ -9,7 +9,7 @@ set(CXX_FLAGS
 )
 set(CXX_FLAGS_DEBUG
     -O0
-    -g
+    -g2
     # Consider adding -gsplit-dwarf
 )
 set(CXX_FLAGS_RELEASE

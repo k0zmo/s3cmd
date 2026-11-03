@@ -12,6 +12,10 @@ endif()
 set(CMAKE_MODULE_PATH "${s3cmd_SOURCE_DIR}/cmake;${CMAKE_MODULE_PATH}")
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
+set(CMAKE_CXX_EXTENSIONS OFF)
+set(CMAKE_POSITION_INDEPENDENT_CODE ON)
+set(CMAKE_CXX_VISIBILITY_PRESET hidden)
+set(CMAKE_VISIBILITY_INLINES_HIDDEN ON)
 
 if(S3CMD_USING_CONAN)
     # Sadly, conan package uses different naming scheme
@@ -35,14 +39,19 @@ endif()
 
 find_package(tomlplusplus CONFIG REQUIRED)
 find_package(httplib CONFIG REQUIRED)
+find_package(fmt CONFIG REQUIRED)
+if(NOT WIN32)
+    find_package(Iconv REQUIRED)
+endif()
 
 add_library(s3cmd-core STATIC
     src/fsplugin.h
-    src/prereq.h
+    src/prereq.hpp
+    src/platform.hpp
+    src/properties.hpp
+    src/bucket_creation.hpp        src/bucket_creation.cpp
     src/config.hpp                 src/config.cpp
     src/core.hpp                   src/core.cpp
-    src/bucket_creation_dialog.hpp src/bucket_creation_dialog.cpp
-    src/properties_dialog.hpp      src/properties_dialog.cpp
     src/creds.hpp                  src/creds.cpp
     src/log.cpp                    src/log.hpp
     src/resume.cpp                 src/resume.hpp
@@ -52,11 +61,13 @@ add_library(s3cmd-core STATIC
     src/utils.hpp                  src/utils.cpp
 )
 target_compile_features(s3cmd-core PUBLIC cxx_std_20)
-target_compile_definitions(s3cmd-core PUBLIC NOMINMAX WIN32_LEAN_AND_MEAN)
 target_include_directories(s3cmd-core PUBLIC "${s3cmd_SOURCE_DIR}/src")
-target_link_libraries(s3cmd-core PRIVATE
-    httplib::httplib
-    tomlplusplus::tomlplusplus
+target_link_libraries(s3cmd-core
+    PRIVATE
+        httplib::httplib
+        tomlplusplus::tomlplusplus
+    PUBLIC
+        fmt::fmt
 )
 
 if(TARGET AWS::aws-sdk-cpp-s3)
@@ -73,23 +84,57 @@ else()
         aws-cpp-sdk-sts
     )
 endif()
+
 if(WIN32)
+    target_sources(s3cmd-core PRIVATE
+        src/win32/bucket_creation_dialog.hpp
+        src/win32/bucket_creation_dialog.cpp
+        src/win32/properties_dialog.hpp
+        src/win32/properties_dialog.cpp
+    )
+    target_compile_definitions(s3cmd-core PUBLIC NOMINMAX WIN32_LEAN_AND_MEAN)
     target_link_libraries(s3cmd-core PUBLIC shell32 comctl32)
+else()
+    include(EmbedDialog)
+    s3cmd_embed_dialog(bucket_creation "${CMAKE_CURRENT_BINARY_DIR}/generated/bucket_creation_lfm.hpp")
+    s3cmd_embed_dialog(properties "${CMAKE_CURRENT_BINARY_DIR}/generated/properties_lfm.hpp")
+    target_sources(s3cmd-core PRIVATE
+        src/doublecmd/extension.hpp
+        src/doublecmd/extension.cpp
+        src/doublecmd/bucket_creation_dialog.hpp
+        src/doublecmd/bucket_creation_dialog.cpp
+        src/doublecmd/bucket_creation.lfm
+        src/doublecmd/properties_dialog.hpp
+        src/doublecmd/properties_dialog.cpp
+        src/doublecmd/properties.lfm
+    )
+    target_include_directories(s3cmd-core PRIVATE "${CMAKE_CURRENT_BINARY_DIR}/generated")
+    target_link_libraries(s3cmd-core PUBLIC Iconv::Iconv)
 endif()
 
 add_library(s3cmd MODULE
     src/main.cpp
     src/icons.cpp src/icons.hpp
-    src/s3cmd.def
 )
 if(WIN32)
-    target_sources(s3cmd PRIVATE src/s3cmd.rc src/bucket_creation_dialog.rc src/properties_dialog.rc)
+    target_sources(s3cmd PRIVATE
+        src/win32/s3cmd.rc
+        src/win32/bucket_creation_dialog.rc
+        src/win32/properties_dialog.rc
+    )
+else()
+    include(EmbedIcons)
+    s3cmd_embed_icons("${CMAKE_CURRENT_BINARY_DIR}/generated/icons_data.hpp")
+    target_include_directories(s3cmd PRIVATE "${CMAKE_CURRENT_BINARY_DIR}/generated")
 endif()
+
 target_compile_features(s3cmd PRIVATE cxx_std_20)
 target_compile_definitions(s3cmd PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
 target_link_libraries(s3cmd PRIVATE s3cmd-core)
 math(EXPR S3CMD_BITS "${CMAKE_SIZEOF_VOID_P} * 8")
-if(CMAKE_SIZEOF_VOID_P EQUAL 8)
+if(NOT WIN32)
+    set(S3CMD_PLUGIN_SUFFIX ".wfx")
+elseif(CMAKE_SIZEOF_VOID_P EQUAL 8)
     set(S3CMD_PLUGIN_SUFFIX ".wfx64")
 else()
     set(S3CMD_PLUGIN_SUFFIX ".wfx")
@@ -99,6 +144,8 @@ set_target_properties(s3cmd PROPERTIES
     SUFFIX "${S3CMD_PLUGIN_SUFFIX}"
 )
 if(WIN32)
+    target_sources(s3cmd PRIVATE src/win32/s3cmd.def)
+
     include(VersionInfo)
     # Kinda useless since these embedded information are not displayed for files
     # with extensions other than .dll - but let's still embed them
@@ -116,12 +163,22 @@ if(BUILD_TESTING)
     find_package(Catch2 CONFIG REQUIRED)
 
     add_executable(s3cmd-test
-        tests/aws_test.cpp
+        tests/bucket_creation_test.cpp
         tests/core_test.cpp
+        tests/test_helpers.hpp
+        tests/aws_test.cpp
     )
+
     if(WIN32)
-        target_sources(s3cmd-test PRIVATE src/bucket_creation_dialog.rc src/properties_dialog.rc)
+        target_sources(s3cmd-test PRIVATE
+            tests/win32_test.cpp
+            src/win32/bucket_creation_dialog.rc
+            src/win32/properties_dialog.rc
+        )
+    else()
+        target_sources(s3cmd-test PRIVATE tests/doublecmd_test.cpp)
     endif()
+
     target_link_libraries(s3cmd-test PRIVATE
         s3cmd-core
         Catch2::Catch2WithMain
@@ -138,17 +195,16 @@ if(BUILD_TESTING)
     )
 endif()
 
-configure_file(pluginst.inf.in pluginst.inf @ONLY)
+if(WIN32)
+    configure_file(pluginst.inf.in pluginst.inf @ONLY)
+    install(FILES "${CMAKE_CURRENT_BINARY_DIR}/pluginst.inf" DESTINATION .)
+endif()
 
 install(TARGETS s3cmd
     LIBRARY DESTINATION .
     RUNTIME DESTINATION .
 )
-install(FILES
-    "${CMAKE_CURRENT_BINARY_DIR}/pluginst.inf"
-    README.md
-    DESTINATION .
-)
+install(FILES README.md DESTINATION .)
 install(FILES
     "${CMAKE_CURRENT_SOURCE_DIR}/icons/README.md"
     RENAME ICONS-LICENSES.md
@@ -158,6 +214,10 @@ install(FILES
 set(CPACK_GENERATOR ZIP)
 set(CPACK_INCLUDE_TOPLEVEL_DIRECTORY OFF)
 set(CPACK_PACKAGE_VERSION "${S3CMD_VERSION}")
-set(CPACK_SYSTEM_NAME "win${S3CMD_BITS}")
+if(WIN32)
+    set(CPACK_SYSTEM_NAME "win${S3CMD_BITS}")
+else()
+    set(CPACK_SYSTEM_NAME "linux${S3CMD_BITS}")
+endif()
 set(CPACK_PROJECT_CONFIG_FILE "${s3cmd_SOURCE_DIR}/cmake/PackageVersion.cmake")
 include(CPack)
