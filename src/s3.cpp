@@ -194,14 +194,12 @@ struct ClientEntry
     std::shared_ptr<Aws::Auth::AWSCredentialsProvider> credentials;
     std::shared_ptr<Aws::S3::S3Client> client;
     bool uses_sso{};
-    std::uint64_t sso_generation{};
 };
 
 std::mutex client_mutex;
 using ClientKey = std::pair<std::string, std::string>; // (profile, region)
 std::map<ClientKey, std::shared_ptr<ClientEntry>> clients;
 std::mutex sso_login_mutex;
-std::atomic<std::uint64_t> sso_generation{};
 
 // AwsLease has two jobs:
 // 1. Verify the SDK is initialized.
@@ -228,7 +226,6 @@ struct AwsLease
 std::shared_ptr<ClientEntry> make_client(const Aws::S3::S3ClientConfiguration& configuration,
                                          const RemotePath& path)
 {
-    const auto generation = sso_generation.load(std::memory_order_relaxed);
     auto credentials_configuration = configuration;
     credentials_configuration.credentialProviderConfig.profile = path.profile;
     credentials_configuration.credentialProviderConfig.region = configuration.region;
@@ -240,7 +237,7 @@ std::shared_ptr<ClientEntry> make_client(const Aws::S3::S3ClientConfiguration& c
         credentials,
         Aws::MakeShared<Aws::S3::S3Client>(/*allocationTag*/ "s3cmd", credentials, nullptr,
                                            configuration),
-        uses_sso, generation);
+        uses_sso);
 }
 
 std::shared_ptr<ClientEntry> get_client_entry(const RemotePath& path,
@@ -281,22 +278,13 @@ std::shared_ptr<ClientEntry> get_client_entry(const RemotePath& path,
         entry = clients.try_emplace(key, std::move(candidate)).first->second;
     }
 
-    if (entry->uses_sso && entry->credentials->GetAWSCredentials().IsEmpty())
+    if (entry->uses_sso && entry->credentials->GetAWSCredentials().IsExpiredOrEmpty())
     {
-        // Profile is SSO based but the credentials are expired and couldn't be refreshed
         std::scoped_lock login_lock(sso_login_mutex);
 
-        // While this thread waits for sso_login_mutex another one might've
-        // completed login and refreshed the shared SSO token (very uncommon situation).
-        // Recreate a fresh client if a login completed since this entry was created.
-        const bool login_required = [&] {
-            if (entry->sso_generation == sso_generation.load(std::memory_order_relaxed))
-                return true;
-            // There was a succesful login after `entry` client was created
-            entry = make_client(configuration, path);
-            return entry->credentials->GetAWSCredentials().IsEmpty();
-        }();
-        if (login_required)
+        // Use a fresh provider to pick up a token cached by another client or AWS CLI.
+        entry = make_client(configuration, path);
+        if (entry->credentials->GetAWSCredentials().IsExpiredOrEmpty())
         {
             const auto profile = Aws::Config::GetCachedConfigProfile(path.profile);
             if (!profile.IsSsoSessionSet())
@@ -314,15 +302,13 @@ std::shared_ptr<ClientEntry> get_client_entry(const RemotePath& path,
                 throw SsoLoginFailed(message);
             }
             perform_sso_login(*plugin_host, profile, prefer_sso_device_code());
-            sso_generation.fetch_add(1, std::memory_order_relaxed);
 
-            auto refreshed = make_client(configuration, path);
-            if (refreshed->credentials->GetAWSCredentials().IsEmpty())
+            entry = make_client(configuration, path);
+            if (entry->credentials->GetAWSCredentials().IsExpiredOrEmpty())
             {
                 throw SsoLoginFailed(fmt::format(
                     "AWS SSO login for profile '{}' did not produce credentials", path.profile));
             }
-            entry = std::move(refreshed);
         }
         std::scoped_lock lock(client_mutex);
         clients.insert_or_assign(key, entry);
