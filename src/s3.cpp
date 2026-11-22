@@ -398,6 +398,12 @@ public:
             [this](const Aws::Http::HttpRequest*, long long bytes) { add(bytes); });
     }
 
+    TransferProgress(const char16_t* source, const char16_t* target,
+                     Aws::S3::Model::HeadObjectRequest& request)
+        : TransferProgress{source, target, 0, request}
+    {
+    }
+
     bool is_canceled() const { return canceled_.load(); }
     bool has_response_error() const { return response_error_; }
     bool has_invalid_range() const { return invalid_range_; }
@@ -504,14 +510,19 @@ bool register_existing_bucket(const RemotePath& path)
     return profile.register_bucket(path.bucket, region);
 }
 
-// Checks whether an object at `path` exists
-bool remote_exists(Aws::S3::S3Client& client, const RemotePath& path)
+Aws::S3::Model::HeadObjectRequest head_object_request(const RemotePath& path)
 {
     log_operation("HeadObject", path);
     Aws::S3::Model::HeadObjectRequest request;
     request.SetBucket(path.bucket);
     request.SetKey(path.key);
-    const auto outcome = client.HeadObject(request);
+    return request;
+}
+
+// Checks whether an object at `path` exists
+bool remote_exists(Aws::S3::S3Client& client, const RemotePath& path)
+{
+    const auto outcome = client.HeadObject(head_object_request(path));
     if (outcome.IsSuccess())
         return true;
     if (outcome.GetError().GetResponseCode() == Aws::Http::HttpResponseCode::NOT_FOUND)
@@ -1331,11 +1342,21 @@ try
     if (path.profile.empty() || path.bucket.empty() || path.key.empty())
         return FS_FILE_WRITEERROR;
 
-    log_operation("PutObject", path);
-
+    const bool overwrite = (copy_flags & FS_COPYFLAGS_OVERWRITE) != 0;
     {
         AwsLease lease;
         auto client = get_client(path);
+
+        if (!overwrite)
+        {
+            auto request = head_object_request(path);
+            TransferProgress progress{local_name, remote_name, request};
+            const auto outcome = progress.wait(client->HeadObjectCallable(request));
+            if (progress.is_canceled())
+                return FS_FILE_USERABORT;
+            if (outcome.IsSuccess())
+                return FS_FILE_EXISTS;
+        }
 
         auto body = Aws::MakeShared<std::fstream>("s3cmd", std::filesystem::path(local_name),
                                                   std::ios::in | std::ios::binary);
@@ -1347,9 +1368,11 @@ try
         request.SetKey(path.key);
         request.SetBody(body);
         request.SetContentLength(static_cast<long long>(size));
-        if ((copy_flags & FS_COPYFLAGS_OVERWRITE) == 0)
+        // Keep the upload conditional even if HEAD failed or the destination changed afterward.
+        if (!overwrite)
             request.SetIfNoneMatch("*");
 
+        log_operation("PutObject", path);
         TransferProgress progress{local_name, remote_name, request};
         const auto outcome = progress.wait(client->PutObjectCallable(request));
         if (!outcome.IsSuccess())

@@ -221,7 +221,11 @@ TEST_CASE("Get discards HTTP error bodies before retry", "[unit]")
     httplib::Server server;
     const auto respond = [&](const httplib::Request& request, httplib::Response& response) {
         if (request.method == "HEAD")
+        {
             ++head_requests;
+            response.status = 404;
+            return;
+        }
         if (probe_duplicate.exchange(false))
             duplicate_result =
                 s3cmd::get_file(u"\\resume-test\\bucket\\object", duplicate_local.u16string().c_str(),
@@ -245,9 +249,7 @@ TEST_CASE("Get discards HTTP error bodies before retry", "[unit]")
             response.set_content(object, "application/octet-stream");
             return;
         }
-        if (request.method == "HEAD")
-            response.set_content(object, "application/octet-stream");
-        else if (reject)
+        if (reject)
         {
             response.status = 412;
             response.set_content("<Error><Code>PreconditionFailed</Code></Error>",
@@ -415,6 +417,86 @@ TEST_CASE("Get discards HTTP error bodies before retry", "[unit]")
                             nullptr) == FS_FILE_OK);
     CHECK(read_file(local) == object);
     CHECK_FALSE(std::filesystem::exists(download));
+}
+
+TEST_CASE("Put checks for overwrite conflicts before sending the file", "[unit]")
+{
+    auto& config = temporary_config();
+    const auto local = config.root / u"upload";
+    const auto local_name = local.u16string();
+    constexpr auto remote = u"\\upload-test\\bucket\\object";
+    std::ofstream(local, std::ios::binary) << "upload contents";
+
+    std::atomic<int> head_status{200}, put_status{200};
+    std::atomic<int> head_requests{}, get_requests{}, conditional_puts{}, overwrite_puts{};
+    httplib::Server server;
+    server.Get("/bucket/object", [&](const httplib::Request& request, httplib::Response& response) {
+        if (request.method == "HEAD")
+            ++head_requests;
+        else
+            ++get_requests;
+        response.status = head_status;
+    });
+    server.Put("/bucket/object", [&](const httplib::Request& request, httplib::Response& response) {
+        if (request.get_header_value("If-None-Match") == "*")
+            ++conditional_puts;
+        else
+            ++overwrite_puts;
+        response.status = put_status;
+        if (put_status == 412)
+            response.set_content("<Error><Code>PreconditionFailed</Code></Error>", "application/xml");
+    });
+    const auto port = server.bind_to_any_port("127.0.0.1");
+    REQUIRE(port > 0);
+    std::jthread worker([&](std::stop_token stop) {
+        std::stop_callback shutdown(stop, [&] { server.stop(); });
+        server.listen_after_bind();
+    });
+    server.wait_until_ready();
+    const auto endpoint = "http://127.0.0.1:" + std::to_string(port);
+    TemporaryEnvironment url("AWS_ENDPOINT_URL_S3", endpoint.c_str());
+    TemporaryEnvironment endpoints("AWS_IGNORE_CONFIGURED_ENDPOINT_URLS", "false");
+    TemporaryEnvironment access("AWS_ACCESS_KEY_ID", "test");
+    TemporaryEnvironment secret("AWS_SECRET_ACCESS_KEY", "test");
+    TemporaryEnvironment region("AWS_DEFAULT_REGION", "us-east-1");
+    TemporaryEnvironment checksum("AWS_REQUEST_CHECKSUM_CALCULATION", "when_required");
+    PluginSession session;
+
+    SECTION("existing destination reports a conflict without a transfer")
+    {
+        put_status = 412;
+        REQUIRE(s3cmd::put_file(local_name.c_str(), remote, FS_COPYFLAGS_MOVE) == FS_FILE_EXISTS);
+        CHECK(head_requests == 1);
+        CHECK(conditional_puts == 0);
+        CHECK(overwrite_puts == 0);
+        CHECK(read_file(local) == "upload contents");
+    }
+    SECTION("confirmed overwrite uploads once and skips the check")
+    {
+        REQUIRE(s3cmd::put_file(local_name.c_str(), remote, FS_COPYFLAGS_OVERWRITE) == FS_FILE_OK);
+        CHECK(head_requests == 0);
+        CHECK(conditional_puts == 0);
+        CHECK(overwrite_puts == 1);
+    }
+    SECTION("the conditional upload catches a destination created after the check")
+    {
+        head_status = 404;
+        put_status = 412;
+        REQUIRE(s3cmd::put_file(local_name.c_str(), remote, FS_COPYFLAGS_MOVE) == FS_FILE_EXISTS);
+        CHECK(head_requests == 1);
+        CHECK(conditional_puts == 1);
+        CHECK(overwrite_puts == 0);
+        CHECK(read_file(local) == "upload contents");
+    }
+    SECTION("write access works when HEAD is forbidden")
+    {
+        head_status = 403;
+        REQUIRE(s3cmd::put_file(local_name.c_str(), remote, 0) == FS_FILE_OK);
+        CHECK(head_requests == 1);
+        CHECK(conditional_puts == 1);
+        CHECK(overwrite_puts == 0);
+    }
+    CHECK(get_requests == 0);
 }
 
 TEST_CASE("Get resume state survives restart and rejects a changed object", "[unit]")
